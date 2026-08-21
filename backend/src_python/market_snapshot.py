@@ -35,6 +35,9 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import config
+from providers.jin10 import get_jin10_provider
+
 # ---------------------------------------------------------------------------
 # ccxt — must be installed (pip install ccxt)
 # ---------------------------------------------------------------------------
@@ -67,6 +70,44 @@ _LOUD = False
 def _debug(msg: str) -> None:
     if _LOUD:
         print(msg)
+
+
+def _fetch_jin10_xau_sync() -> Optional[Dict[str, Any]]:
+    """Return the authorized Jin10 XAU quote, or None without changing fallback behavior."""
+    try:
+        provider = get_jin10_provider()
+        if not provider.configured:
+            return None
+        for quote in provider.fetch_quotes(
+            asset_type=config.JIN10_MARKET_TYPE,
+            codes=config.JIN10_MARKET_CODES,
+        ):
+            if quote.asset == "XAU":
+                return quote.to_dict()
+    except Exception as exc:
+        _debug(f"  [SNAPSHOT:DEBUG] Jin10 XAU unavailable: {type(exc).__name__}")
+    return None
+
+
+def _apply_jin10_xau(assets: Dict[str, Dict[str, Any]], quote: Optional[Dict[str, Any]]) -> None:
+    """Overlay Jin10's spot quote while preserving ccxt-derived trend fields."""
+    if not quote or "XAU" not in assets:
+        return
+    price = _safe_float(quote.get("price"))
+    if price <= 0:
+        return
+    entry = assets["XAU"]
+    change = quote.get("change_pct")
+    entry.update({
+        "symbol": quote.get("symbol") or "XAUUSD",
+        "price": round(price, 4),
+        "price_str": _format_price(price, 2),
+        "change_24h_pct": round(_safe_float(change), 2) if change is not None else entry.get("change_24h_pct", 0.0),
+        "change_24h_str": _format_pct(_safe_float(change)) if change is not None else entry.get("change_24h_str", "N/A"),
+        "source": "金十",
+        "status": "ok",
+        "status_note": "金十现货报价；趋势/资金费率仍沿用交易所回退数据",
+    })
 
 # 代理 — ccxt 直连 Binance 在某些地区受限 (HTTP 451)
 # 懒加载: exchange 创建时才读取环境变量, 避免模块导入时 env 未就绪
@@ -513,6 +554,10 @@ async def get_snapshot() -> Dict[str, Any]:
 
     _debug(f"  [SNAPSHOT:DEBUG] ccxt version={ccxt.__version__}, "
           f"async_ccxt version={ccxt_async.__version__ if ccxt_async else 'None'}")
+    jin10_task = (
+        asyncio.create_task(asyncio.to_thread(_fetch_jin10_xau_sync))
+        if getattr(config, "JIN10_ENABLED", False) else None
+    )
     ex = _get_exchange_async()
     _debug(f"  [SNAPSHOT:DEBUG] exchange={type(ex).__name__}, "
           f"urls.api={ex.urls.get('api', 'N/A') if hasattr(ex, 'urls') else 'N/A'}")
@@ -623,6 +668,9 @@ async def get_snapshot() -> Dict[str, Any]:
         assets[asset_id] = asset_entry
         ok_count += 1
 
+    jin10_quote = await jin10_task if jin10_task is not None else None
+    _apply_jin10_xau(assets, jin10_quote)
+
     # ── 整体状态 ──
     total = len(_CORE_SYMBOLS)
     if ok_count == total:
@@ -726,6 +774,11 @@ def get_snapshot_sync() -> Dict[str, Any]:
             "stats_7d": stats_7d,
         }
         ok_count += 1
+
+    _apply_jin10_xau(
+        assets,
+        _fetch_jin10_xau_sync() if getattr(config, "JIN10_ENABLED", False) else None,
+    )
 
     macro = {
         "dxy":   {"value": 0.0, "change_24h_str": "N/A", "status": "unavailable",

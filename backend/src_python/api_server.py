@@ -50,6 +50,7 @@ import paper_trading
 import news_sources
 import quick_sim
 import backtest
+from providers.jin10 import get_jin10_provider
 from realtime_filter import evaluate_news
 from engine.prices import _fetch_eastmoney_xau, _fetch_sina_xau, _get_current_price
 
@@ -132,6 +133,29 @@ _SSE_QUEUES: List[asyncio.Queue] = []
 
 def _now() -> str:
     return datetime.now(TZ_SHANGHAI).isoformat(timespec="seconds")
+
+
+def _external_timestamp(value: Any) -> tuple[str, int] | None:
+    """Normalize provider timestamps while preserving Beijing-time feeds."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        raw = float(value)
+        if raw > 10_000_000_000:
+            raw /= 1000.0
+        dt = datetime.fromtimestamp(raw, tz=timezone.utc).astimezone(TZ_SHANGHAI)
+        return dt.isoformat(timespec="seconds"), int(raw)
+    text = str(value).strip()
+    if text.isdigit() and len(text) in (10, 13):
+        return _external_timestamp(int(text))
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ_SHANGHAI)
+    dt = dt.astimezone(TZ_SHANGHAI)
+    return dt.isoformat(timespec="seconds"), int(dt.timestamp())
 
 def _format_time(iso_ts):
     if not iso_ts:
@@ -791,6 +815,7 @@ _MARKET_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
 _TECHFLOW_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
 _EASTMONEY_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
 _BLOCKBEATS_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
+_JIN10_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
 _NEWS_CACHE_TTL = 20.0
 
 
@@ -1036,6 +1061,39 @@ def _fetch_blockbeats_sync() -> Dict[str, Any]:
     return value
 
 
+def _fetch_jin10_sync() -> Dict[str, Any]:
+    """Fetch authorized Jin10 flash data and project it to legacy news items."""
+    now = time.monotonic()
+    if _JIN10_CACHE["value"] is not None and now < _JIN10_CACHE["expires"]:
+        return _JIN10_CACHE["value"]
+    provider = get_jin10_provider()
+    if not provider.configured:
+        value = {"status": "disabled", "items": [], "error": "Jin10 provider is disabled or missing API key"}
+    else:
+        try:
+            events = provider.fetch_news(category=config.JIN10_FLASH_CATEGORIES)
+            value = {
+                "status": "ok",
+                "items": [event.to_legacy() for event in events],
+                "error": "",
+                "provider": provider.health(),
+            }
+        except Exception as exc:
+            value = {
+                "status": "unavailable",
+                "items": [],
+                "error": f"Jin10 unavailable: {type(exc).__name__}",
+                "provider": provider.health(),
+            }
+    _JIN10_CACHE.update({"value": value, "expires": now + _NEWS_CACHE_TTL})
+    return value
+
+
+@app.get("/api/news/jin10")
+async def get_jin10_news():
+    return await asyncio.to_thread(_fetch_jin10_sync)
+
+
 @app.get("/api/news/blockbeats")
 async def get_blockbeats_news():
     return await asyncio.to_thread(_fetch_blockbeats_sync)
@@ -1043,10 +1101,11 @@ async def get_blockbeats_news():
 
 async def _news_report() -> Dict[str, Any]:
     """汇总外部新闻源、入库状态、AI 信号和模拟交易结果。"""
-    techflow, eastmoney, blockbeats, events, quick_evaluation = await asyncio.gather(
+    techflow, eastmoney, blockbeats, jin10, events, quick_evaluation = await asyncio.gather(
         get_techflow_news(),
         get_eastmoney_news(),
         get_blockbeats_news(),
+        get_jin10_news(),
         _fetch_event_rows(limit=200),
         asyncio.to_thread(quick_sim.snapshot),
     )
@@ -1096,11 +1155,12 @@ async def _news_report() -> Dict[str, Any]:
             "techflow": techflow,
             "eastmoney": eastmoney,
             "blockbeats": blockbeats,
+            "jin10": jin10,
         },
         "pipeline": {
             "source_items": sum(
                 len(payload.get("items", []))
-                for payload in (techflow, eastmoney, blockbeats)
+                for payload in (techflow, eastmoney, blockbeats, jin10)
                 if isinstance(payload, dict)
             ),
             "stored_reports": len(report_items),
@@ -1129,7 +1189,7 @@ def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
     try:
         for item in items:
             title = str(item.get("title") or "").strip()
-            summary = str(item.get("summary") or "").strip()
+            summary = str(item.get("summary") or item.get("body") or "").strip()
             if not title:
                 continue
             source = str(item.get("source") or "External")
@@ -1143,12 +1203,13 @@ def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
             if not news_sources.allow_ingest(source, conn):
                 continue
             filtered = evaluate_news(title, summary)
-            ts_epoch = int(time.time())
+            normalized_ts = _external_timestamp(item.get("published_at") or item.get("time"))
+            timestamp, ts_epoch = normalized_ts or (_now(), int(time.time()))
             news_id = db.insert_raw_news(
                 conn,
                 source=source,
                 content=content[:1000],
-                timestamp=_now(),
+                timestamp=timestamp,
                 status="PENDING",
                 is_noise=int(filtered["is_noise"]),
                 relevance_score=float(filtered["relevance_score"]),
@@ -1187,6 +1248,8 @@ async def news_source_watcher() -> None:
                     jobs.append(asyncio.to_thread(_fetch_eastmoney_news_sync))
                 if sources.get("blockbeats", True):
                     jobs.append(asyncio.to_thread(_fetch_blockbeats_sync))
+                if config.JIN10_ENABLED and sources.get("jin10", True):
+                    jobs.append(asyncio.to_thread(_fetch_jin10_sync))
             payloads = await asyncio.gather(*jobs, return_exceptions=True) if jobs else []
             items: List[Dict[str, Any]] = []
             for payload in payloads:
@@ -1198,7 +1261,10 @@ async def news_source_watcher() -> None:
             raise
         except Exception as exc:
             print(f"[NEWS-SOURCES] {type(exc).__name__}: {exc}")
-        await asyncio.sleep(config.NEWS_SOURCE_POLL_SECONDS)
+        poll_seconds = config.NEWS_SOURCE_POLL_SECONDS
+        if config.JIN10_ENABLED:
+            poll_seconds = min(poll_seconds, config.JIN10_POLL_SECONDS)
+        await asyncio.sleep(poll_seconds)
 
 
 def _market_price_from_cache(asset: str) -> float | None:

@@ -182,6 +182,26 @@ BLOCKBEATS_NEWS_URL = os.getenv(
     "BLOCKBEATS_NEWS_URL",
     "https://api.theblockbeats.news/v1/open-api/open-flash?size=50&page=1&type=push&lang=cn",
 ).strip()
+# Jin10 Open Data (requires an authorized secret-key; disabled by default).
+JIN10_ENABLED = _env_bool("JIN10_ENABLED", False)
+JIN10_API_KEY = os.getenv("JIN10_API_KEY", "").strip()
+JIN10_FLASH_URL = os.getenv(
+    "JIN10_FLASH_URL", "https://open-data-api.jin10.com/data-api/flash"
+).strip()
+JIN10_QUOTE_URL = os.getenv(
+    "JIN10_QUOTE_URL", "https://open-data-api.jin10.com/data-api/quotes"
+).strip()
+JIN10_SYMBOLS_URL = os.getenv(
+    "JIN10_SYMBOLS_URL", "https://open-data-api.jin10.com/data-api/symbols"
+).strip()
+# The calendar route varies by Jin10 entitlement/version, so require an
+# explicit URL instead of guessing and silently querying the wrong endpoint.
+JIN10_CALENDAR_URL = os.getenv("JIN10_CALENDAR_URL", "").strip()
+JIN10_FLASH_CATEGORIES = os.getenv("JIN10_FLASH_CATEGORIES", "1,2,3,4,5").strip()
+JIN10_MARKET_TYPE = os.getenv("JIN10_MARKET_TYPE", "GOODS").strip()
+JIN10_MARKET_CODES = os.getenv("JIN10_MARKET_CODES", "XAUUSD").strip()
+JIN10_REQUEST_TIMEOUT = max(1.0, float(os.getenv("JIN10_REQUEST_TIMEOUT", "5")))
+JIN10_POLL_SECONDS = max(10, int(os.getenv("JIN10_POLL_SECONDS", "15")))
 NEWS_SOURCE_POLL_SECONDS = max(10, int(os.getenv("NEWS_SOURCE_POLL_SECONDS", "15")))
 NEWS_SOURCE_PAGES = max(1, int(os.getenv("NEWS_SOURCE_PAGES", "6")))
 EVENTS_LIST_MAX = max(200, int(os.getenv("EVENTS_LIST_MAX", "10000")))

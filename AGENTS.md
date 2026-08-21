@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`backend/src_python/` contains the FastAPI service, configuration, database layer, and the real-time news engine; engine tasks live in `backend/src_python/engine/`. Backend tests are in `backend/tests/`, while one-off utilities belong in `backend/scripts/`. `frontend/` is a Next.js 14 application organized into `app/`, `components/`, `hooks/`, and `lib/`. `dashboard/` is a separate Streamlit replay tool. Deployment examples live in `deploy/`, and design notes live in `docs/`.
+`backend/src_python/` contains the FastAPI service, configuration, database layer, and the real-time news engine; provider contracts/adapters live in `backend/src_python/providers/`, and engine tasks live in `backend/src_python/engine/`. Backend tests are in `backend/tests/`, while one-off utilities belong in `backend/scripts/`. `frontend/` is a Next.js 14 application organized into `app/`, `components/`, `hooks/`, and `lib/`. `dashboard/` is a separate Streamlit replay tool. Deployment examples live in `deploy/`, and design notes live in `docs/`.
 
 ## Build, Test, and Development Commands
 
@@ -27,4 +27,4 @@ This snapshot has no Git history, so use concise imperative commits such as `fix
 
 ## Security & Data Rules
 
-Never commit API keys or populated `.env` files. Make schema changes only in `backend/src_python/db.py`; migrations must be idempotent and must not swallow errors.
+Never commit API keys or populated `.env` files; Jin10 access must use an authorized `JIN10_API_KEY` supplied through the environment. Make schema changes only in `backend/src_python/db.py`; migrations must be idempotent and must not swallow errors.

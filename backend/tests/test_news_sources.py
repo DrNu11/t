@@ -37,9 +37,15 @@ def test_news_sources_default_all_on(temp_db):
         "techflow": True,
         "eastmoney": True,
         "blockbeats": True,
+        "jin10": True,
     }
     assert settings["today_count"] == 0
     assert settings["remaining"] == 300
+
+
+def test_jin10_source_aliases_are_normalized():
+    assert news_sources._normalize_source("金十") == "jin10"
+    assert news_sources._normalize_source("Jin10 Open Data") == "jin10"
 
 
 def test_news_sources_toggle_and_quota(temp_db):

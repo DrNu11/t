@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 import config
 import db
 
-SOURCE_KEYS = ("financialjuice", "tree_news", "techflow", "eastmoney", "blockbeats")
+SOURCE_KEYS = ("financialjuice", "tree_news", "techflow", "eastmoney", "blockbeats", "jin10")
 DEFAULT_DAILY_TARGET = 300
 
 _DEFAULT_SOURCES = {key: True for key in SOURCE_KEYS}
@@ -26,6 +26,8 @@ def _today() -> str:
 
 def _normalize_source(source: str) -> Optional[str]:
     value = (source or "").lower()
+    if "jin10" in value or "金十" in (source or ""):
+        return "jin10"
     if "techflow" in value or "深潮" in (source or ""):
         return "techflow"
     if "eastmoney" in value or "东方财富" in (source or ""):

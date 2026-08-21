@@ -9,6 +9,9 @@ from typing import Any, Callable, Dict
 
 import requests
 
+import config
+from providers.jin10 import get_jin10_provider
+
 ASSETS = ("BTC", "ETH", "SOL")
 SOURCES = ("Binance", "OKX", "Bitget", "Gate.io")
 TIMEOUT = 1.5
@@ -100,6 +103,29 @@ def fetch_market_prices() -> Dict[str, Any]:
                 "updated_at": updated_at,
             })
 
+    # Optional Jin10 spot gold projection. It is additive: existing
+    # BTC/ETH/SOL median behavior and the market_ticks schema stay unchanged.
+    jin10_error = ""
+    if getattr(config, "JIN10_ENABLED", False):
+        try:
+            provider = get_jin10_provider()
+            if provider.configured:
+                quote = next((item for item in provider.fetch_quotes(
+                    asset_type=config.JIN10_MARKET_TYPE,
+                    codes=config.JIN10_MARKET_CODES,
+                ) if item.asset == "XAU"), None)
+                if quote is not None:
+                    items.append({
+                        "asset": "XAU",
+                        "price": quote.price,
+                        "change24h": quote.change_pct or 0.0,
+                        "source": "金十",
+                        "sourceCount": 1,
+                        "updated_at": updated_at,
+                    })
+        except Exception as exc:
+            jin10_error = f"XAU: {type(exc).__name__}"
+
     sources = {
         source: {
             "status": "ok" if len(values) == len(ASSETS) else ("partial" if values else "unavailable"),
@@ -108,6 +134,13 @@ def fetch_market_prices() -> Dict[str, Any]:
         }
         for source, values in source_values.items()
     }
+    if getattr(config, "JIN10_ENABLED", False):
+        has_xau = any(item.get("source") == "金十" for item in items)
+        sources["Jin10"] = {
+            "status": "ok" if has_xau else "unavailable",
+            "assets": ["XAU"] if has_xau else [],
+            "error": jin10_error,
+        }
     return {
         "status": "ok" if len(items) == len(ASSETS) else ("partial" if items else "unavailable"),
         "items": items,

@@ -144,6 +144,19 @@ def test_ingest_external_news_survives_missing_ts(tmp_path, monkeypatch):
     check.close()
 
 
+def test_ingest_external_news_preserves_provider_timestamp(temp_db, monkeypatch):
+    monkeypatch.setattr(api_server, "evaluate_news", lambda *args: {"is_noise": 0, "relevance_score": 0.9})
+    assert api_server._ingest_external_news_sync([{
+        "id": "jin-1",
+        "title": "金十快讯",
+        "summary": "黄金波动",
+        "published_at": "2026-08-21 10:18:00",
+        "source": "金十",
+    }]) == 1
+    timestamp = temp_db.execute("SELECT timestamp FROM raw_news").fetchone()[0]
+    assert timestamp.startswith("2026-08-21T10:18:00+08:00")
+
+
 def test_get_events_does_not_cap_at_50(temp_db, monkeypatch):
     rows = [
         (f"src-{i}", f"news {i}", f"2026-08-16 10:{i:02d}:00", "PENDING", 0)
