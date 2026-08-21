@@ -1,0 +1,3110 @@
+#!/usr/bin/env python3
+"""
+Trident Agent MVP — FastAPI Backend Server (SSE Edition)
+=========================================================
+
+Usage:
+  cd backend/src_python
+  python api_server.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import hashlib
+import io
+import json
+import math
+import os
+import sqlite3
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Literal, Optional
+
+import aiosqlite
+import requests
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+
+import config
+import db
+import evidence
+import macro_context
+import decision_guard
+import market_feeds
+import timeseries
+import strategy_store
+import paper_trading
+import news_sources
+import quick_sim
+import backtest
+from realtime_filter import evaluate_news
+from engine.prices import _fetch_eastmoney_xau, _fetch_sina_xau, _get_current_price
+
+BASE_DIR = config.BASE_DIR
+DB_PATH = config.DB_PATH
+
+TZ_SHANGHAI = config.TZ_SHANGHAI
+
+
+class TradingProcessManager:
+    def __init__(self, script_path: str, cwd: str, log_path: str, popen_factory=subprocess.Popen):
+        self.script_path = script_path
+        self.cwd = cwd
+        self.log_path = log_path
+        self.popen_factory = popen_factory
+        self._process = None
+        self._log_stream = None
+        self._lock = threading.Lock()
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            running = self._process is not None and self._process.poll() is None
+            return {
+                "running": running,
+                "pid": self._process.pid if running else None,
+                "mode": "testnet" if config.BINANCE_USE_TESTNET else "live",
+            }
+
+    def start(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._process is not None and self._process.poll() is None:
+                return {"started": False, "reason": "already_running", "pid": self._process.pid}
+            os.makedirs(os.path.dirname(os.path.abspath(self.log_path)), exist_ok=True)
+            self._process = self.popen_factory(
+                [sys.executable, self.script_path], cwd=self.cwd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return {"started": True, "pid": self._process.pid}
+
+    def stop(self, timeout: float = 8.0) -> Dict[str, Any]:
+        with self._lock:
+            process = self._process
+            if process is None or process.poll() is not None:
+                self._close_log()
+                return {"stopped": False, "reason": "not_running"}
+            process.terminate()
+        killed = False
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+            killed = True
+        with self._lock:
+            self._process = None
+            self._close_log()
+        return {"stopped": True, "killed": killed}
+
+    def logs(self, tail: int = 200) -> list[str]:
+        count = min(max(int(tail), 1), 2000)
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as stream:
+                return stream.readlines()[-count:]
+        except FileNotFoundError:
+            return []
+
+    def _close_log(self) -> None:
+        if self._log_stream is not None:
+            self._log_stream.close()
+            self._log_stream = None
+
+
+_TRADING_MANAGER = TradingProcessManager(
+    os.path.join(config.PROJECT_DIR, "NewsTrading.py"),
+    config.PROJECT_DIR,
+    config.BINANCE_LOG_PATH,
+)
+
+_SSE_QUEUES: List[asyncio.Queue] = []
+
+def _now() -> str:
+    return datetime.now(TZ_SHANGHAI).isoformat(timespec="seconds")
+
+def _format_time(iso_ts):
+    if not iso_ts:
+        return "——"
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        return dt.astimezone(TZ_SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return (iso_ts or "")[:19] or "——"
+
+def _safe(row, key, default=None):
+    """sqlite3.Row safe access — no .get() method."""
+    return row[key] if key in row.keys() else default
+
+def _normalize_analysis_status(status: Any, has_decision: bool) -> str:
+    if has_decision:
+        return "DONE"
+    normalized = str(status or "PENDING").upper()
+    if normalized == "DONE":
+        return "PENDING"
+    return normalized if normalized in ("PENDING", "PROCESSING", "FAILED") else "PENDING"
+
+
+def _row_to_event(row) -> Dict[str, Any]:
+    """Map a raw-news row with an optional decision to the frontend ApiEvent shape."""
+    decision_id = _safe(row, "decision_id")
+    analysis_status = _normalize_analysis_status(_safe(row, "analysis_status"), decision_id is not None)
+    reason = _safe(row, "reason") or ""
+    reason = re.sub(r"^\[.*?\]\s*", "", reason)
+    if decision_id is None:
+        reason = "AI 分析失败" if analysis_status == "FAILED" else "待 AI 分析"
+    market = (_safe(row, "market_category") or "OTHER").upper()
+    if market not in ("CRYPTO", "GOLD", "OIL", "MACRO", "OTHER"):
+        market = "OTHER"
+    # ── Parse extra_models_consensus JSON → individual model fields ──
+    raw_consensus = _safe(row, "extra_models_consensus") or ""
+    if isinstance(raw_consensus, str):
+        raw_consensus = raw_consensus.strip()
+    try:
+        consensus = json.loads(raw_consensus) if raw_consensus else {}
+    except (json.JSONDecodeError, TypeError):
+        consensus = {}
+    if not isinstance(consensus, dict):
+        consensus = {}
+
+    news_id = _safe(row, "news_id", _safe(row, "id"))
+    return {
+        "id": news_id,
+        "news_id": news_id,
+        "decision_id": decision_id,
+        "analysis_status": analysis_status,
+        "paper_trading_run_id": _safe(row, "paper_trading_run_id"),
+        "strategy_id": _safe(row, "strategy_id"),
+        "strategy_version_id": _safe(row, "strategy_version_id"),
+        "agent_model_id": _safe(row, "agent_model_id"),
+        "evidence_confidence": _safe(row, "evidence_confidence"),
+        "evidence_action": (_safe(row, "evidence_action") or "HOLD").upper(),
+        "trade_gate_reason": _safe(row, "trade_gate_reason") or "",
+        "timestamp": _format_time(_safe(row, "timestamp")),
+        "ai_time": _format_time(_safe(row, "created_at")) if decision_id is not None else "——",
+        "source": _safe(row, "source") or "FinancialJuice",
+        "news_text": re.sub(r'\[hash:[a-fA-F0-9]+\]\s*', '', (_safe(row, "news_text") or "")[:200]),
+        "action": (_safe(row, "action") or "HOLD").upper(),
+        "score": round(_safe(row, "score"), 2) if _safe(row, "score") is not None else 0.0,
+        "reason": reason[:80],
+        "market_category": market,
+        "target_asset": (_safe(row, "target_asset") or "NONE").upper(),
+        "parent_id": _safe(row, "parent_id"),
+        "child_count": _safe(row, "child_count") or 0,
+        "reasoning_path": (_safe(row, "reasoning_path") or "")[:200],
+        "vip_tag": _safe(row, "vip_tag") or "",
+        "entry_price": _safe(row, "entry_price"),
+        "exit_price": _safe(row, "exit_price"),
+        "max_price": _safe(row, "max_price"),
+        "min_price": _safe(row, "min_price"),
+        "max_price_time": _safe(row, "max_price_time") or 0,
+        "min_price_time": _safe(row, "min_price_time") or 0,
+        "entry_time": _safe(row, "entry_time") or "",
+        "is_correct": _safe(row, "is_correct") or "",
+        "settled": _safe(row, "settled") or 0,
+        "doubao_action": _safe(row, "doubao_action") or "HOLD",
+        "doubao_reasoning": _safe(row, "doubao_reasoning") or "",
+        "deepseek_action": (consensus.get("DeepSeek", {}) if isinstance(consensus.get("DeepSeek"), dict) else {}).get("action") or _safe(row, "deepseek_action") or "HOLD",
+        "deepseek_reasoning": (consensus.get("DeepSeek", {}) if isinstance(consensus.get("DeepSeek"), dict) else {}).get("reasoning") or _safe(row, "deepseek_reasoning") or "",
+        "gemini_action": (consensus.get("Gemini", {}) if isinstance(consensus.get("Gemini"), dict) else {}).get("action") or _safe(row, "gemini_action") or "HOLD",
+        "gemini_reasoning": (consensus.get("Gemini", {}) if isinstance(consensus.get("Gemini"), dict) else {}).get("reasoning") or _safe(row, "gemini_reasoning") or "",
+        "grok_action": (consensus.get("Grok", {}) if isinstance(consensus.get("Grok"), dict) else {}).get("action") or _safe(row, "grok_action") or "HOLD",
+        "grok_reasoning": (consensus.get("Grok", {}) if isinstance(consensus.get("Grok"), dict) else {}).get("reasoning") or _safe(row, "grok_reasoning") or "",
+        # ── Phase 0: 元数据字段 ──
+        "prediction_type": _safe(row, "prediction_type") or "continuation",
+        "event_phase": _safe(row, "event_phase") or "mid",
+        "market_confirmation": _safe(row, "market_confirmation") or "unknown",
+        "expected_horizon": _safe(row, "expected_horizon") or "1-3d",
+        "invalidation_condition": _safe(row, "invalidation_condition") or "",
+        "decision_context": _safe(row, "decision_context") or "{}",
+        # ── Phase 0.5: 结果追踪指标 ──
+        "mfe_pct": _safe(row, "mfe_pct"),
+        "mae_pct": _safe(row, "mae_pct"),
+        "forward_pnl": _safe(row, "forward_pnl"),
+        "mfe_time_mins": _safe(row, "mfe_time_mins"),
+        "chatgpt_action": (consensus.get("ChatGPT", {}) if isinstance(consensus.get("ChatGPT"), dict) else {}).get("action") or _safe(row, "chatgpt_action") or "HOLD",
+        "chatgpt_reasoning": (consensus.get("ChatGPT", {}) if isinstance(consensus.get("ChatGPT"), dict) else {}).get("reasoning") or _safe(row, "chatgpt_reasoning") or "",
+        "cluster_size": _safe(row, "cluster_size") or 1,
+    }
+
+# -- SSE helpers -----------------------------------------------------------
+
+async def _broadcast_sse(data: Dict[str, Any]) -> None:
+    payload = {**data, "server_emitted_at_ms": int(time.time() * 1000)}
+    text = json.dumps(payload, ensure_ascii=False)
+    dead = []
+    for q in _SSE_QUEUES:
+        try:
+            q.put_nowait(text)
+        except asyncio.QueueFull:
+            dead.append(q)
+    for q in dead:
+        try:
+            _SSE_QUEUES.remove(q)
+        except ValueError:
+            pass
+
+_EVENT_SELECT = """
+    SELECT
+        rn.id AS news_id,
+        rn.timestamp,
+        rn.source,
+        rn.content AS news_text,
+        rn.status AS analysis_status,
+        ad.id AS decision_id,
+        ad.paper_trading_run_id,
+        ad.strategy_id,
+        ad.strategy_version_id,
+        ad.agent_model_id,
+        ad.evidence_confidence,
+        ad.evidence_action,
+        ad.trade_gate_reason,
+        UPPER(ad.suggested_action) AS action,
+        ad.sentiment_score AS score,
+        ad.reasoning AS reason,
+        ad.market_category,
+        ad.target_asset,
+        ad.created_at,
+        ad.parent_id,
+        ad.child_count,
+        ad.reasoning_path,
+        ad.vip_tag,
+        ad.entry_price,
+        ad.exit_price,
+        ad.max_price,
+        ad.min_price,
+        ad.max_price_time,
+        ad.min_price_time,
+        ad.is_correct,
+        ad.settled,
+        ad.doubao_action,
+        ad.doubao_reasoning,
+        ad.extra_models_consensus,
+        ad.entry_time,
+        ad.cluster_size,
+        ad.prediction_type,
+        ad.event_phase,
+        ad.market_confirmation,
+        ad.expected_horizon,
+        ad.invalidation_condition,
+        ad.decision_context,
+        ad.mfe_pct,
+        ad.mae_pct,
+        ad.forward_pnl,
+        ad.mfe_time_mins
+    FROM raw_news rn
+    LEFT JOIN ai_decisions ad ON ad.id = (
+        SELECT MAX(latest.id) FROM ai_decisions latest WHERE latest.news_id = rn.id
+    )
+"""
+
+
+async def _fetch_event_rows(news_ids: List[int] | None = None, limit: int | None = None) -> List[Dict[str, Any]]:
+    params: List[Any] = []
+    where = "WHERE rn.is_noise = 0"
+    if news_ids is not None:
+        if not news_ids:
+            return []
+        where += f" AND rn.id IN ({','.join('?' for _ in news_ids)})"
+        params.extend(news_ids)
+    sql = f"{_EVENT_SELECT} {where} ORDER BY rn.id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    async with aiosqlite.connect(DB_PATH) as connection:
+        connection.row_factory = aiosqlite.Row
+        cursor = await connection.execute(sql, params)
+        rows = await cursor.fetchall()
+        await cursor.close()
+    return [_row_to_event(row) for row in rows]
+
+
+async def _fetch_change_cursors() -> tuple[int, int]:
+    async with aiosqlite.connect(DB_PATH) as connection:
+        cursor = await connection.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM raw_news"
+        )
+        raw_id = int((await cursor.fetchone())[0])
+        await cursor.close()
+        cursor = await connection.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM ai_decisions"
+        )
+        decision_id = int((await cursor.fetchone())[0])
+        await cursor.close()
+    return raw_id, decision_id
+
+
+async def _fetch_incremental_news_ids(raw_after: int, decision_after: int) -> List[int]:
+    async with aiosqlite.connect(DB_PATH) as connection:
+        cursor = await connection.execute(
+            """
+            SELECT id AS news_id FROM raw_news WHERE id > ? AND is_noise = 0
+            UNION
+            SELECT news_id FROM ai_decisions WHERE id > ?
+            """,
+            (raw_after, decision_after),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+    return [int(row[0]) for row in rows]
+
+
+async def _fetch_event_snapshot() -> Dict[int, tuple[str, int | None]]:
+    async with aiosqlite.connect(DB_PATH) as connection:
+        cursor = await connection.execute(
+            """
+            SELECT rn.id, rn.status, MAX(ad.id)
+            FROM raw_news rn
+            LEFT JOIN ai_decisions ad ON ad.news_id = rn.id
+            WHERE rn.is_noise = 0
+            GROUP BY rn.id, rn.status
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+    return {row[0]: (str(row[1] or "PENDING").upper(), row[2]) for row in rows}
+
+
+# -- Gold price helpers ----------------------------------------------------
+
+_last_gold_price: float | None = None
+
+class _MT5State:
+    def __init__(self):
+        self.ok = False
+        self.init_done = False
+
+_mt5 = _MT5State()
+
+def _mt5_init() -> None:
+    if _mt5.init_done:
+        return
+    _mt5.init_done = True
+    try:
+        import MetaTrader5 as mt5_mod
+        if not mt5_mod.initialize():
+            print("[MT5] initialize() returned False")
+            return
+        _mt5.ok = True
+        print("[MT5] connected — XAUUSD + WTIUSD — tick streaming active")
+    except ImportError:
+        print("[MT5] MetaTrader5 package not installed")
+    except Exception as e:
+        print(f"[MT5] init error: {type(e).__name__}: {e}")
+
+def _mt5_read_tick() -> float | None:
+    try:
+        import MetaTrader5 as mt5_mod
+        tick = mt5_mod.symbol_info_tick("XAUUSD")
+        if tick and tick.bid and 500 < tick.bid < 10000:
+            return tick.bid
+        return None
+    except Exception:
+        return None
+
+def _mt5_recheck() -> None:
+    _mt5.ok = False
+    try:
+        import MetaTrader5 as mt5_mod
+        tick = mt5_mod.symbol_info_tick("XAUUSD")
+        if tick and tick.bid:
+            _mt5.ok = True
+    except Exception:
+        pass
+
+# _fetch_sina_xau / _fetch_eastmoney_xau 统一由 engine.prices 提供（见文件头 import）。
+# 注意：engine.prices 版本超时 5s 且内部吞异常返回 None，与本模块 _http_fetch_gold 的
+# try/except + 500<p<10000 过滤组合后行为等价。
+def _http_fetch_gold() -> tuple[float | None, str]:
+    for name, fn in [("Sina", _fetch_sina_xau), ("EastMoney", _fetch_eastmoney_xau)]:
+        try:
+            p = fn()
+            if p is not None and 500 < p < 10000:
+                return p, name
+        except Exception:
+            pass
+    return None, ""
+
+async def _broadcast_gold(price: float, src: str):
+    global _last_gold_price
+    if _last_gold_price is None or abs(price - _last_gold_price) >= 0.01:
+        _last_gold_price = price
+        await _broadcast_sse({
+            "type": "price_update",
+            "asset": "XAU",
+            "price": round(price, 2),
+            "ts": time.time(),
+        })
+
+async def gold_http_watcher():
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            price, src = await loop.run_in_executor(None, _http_fetch_gold)
+            if price is not None:
+                await _broadcast_gold(price, src)
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+
+async def gold_mt5_watcher():
+    print("[GOLD] MT5 watcher started")
+    while True:
+        try:
+            if _mt5.ok:
+                price = _mt5_read_tick()
+                if price is not None and 500 < price < 10000:
+                    await _broadcast_gold(price, "MT5")
+                    await asyncio.sleep(0.1)
+                    continue
+                _mt5_recheck()
+                if not _mt5.ok:
+                    print("[GOLD] MT5 terminal unreachable — HTTP only")
+                await asyncio.sleep(1.0)
+                continue
+            if not _mt5.init_done:
+                _mt5_init()
+            if not _mt5.ok:
+                _mt5.init_done = False
+                await asyncio.sleep(30)
+                continue
+        except Exception as e:
+            print(f"[GOLD] MT5 error: {type(e).__name__}: {e}")
+            await asyncio.sleep(5)
+
+
+# -- WTI price helpers ----------------------------------------------------
+
+_last_wti_price: float | None = None
+
+def _mt5_read_wti_tick() -> float | None:
+    try:
+        import MetaTrader5 as mt5_mod
+        tick = mt5_mod.symbol_info_tick("WTIUSD")
+        if tick and tick.bid and 30 < tick.bid < 200:
+            return tick.bid
+        return None
+    except Exception:
+        return None
+
+# 注意：WTI 抓取与 engine.prices._fetch_wti_price 不同源（EastMoney secid=113.USDWTI、
+# 有效区间 30–200、超时 8s、异常向上抛由 _http_fetch_wti 捕获）——为保持行为不变，
+# 这两个函数保留在本模块，不做去重。
+def _fetch_sina_wti() -> float | None:
+    req = urllib.request.Request(
+        "https://hq.sinajs.cn/list=hf_CL",
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+    )
+    resp = urllib.request.urlopen(req, timeout=8)
+    text = resp.read().decode("gbk", errors="replace")
+    if '="' in text:
+        return float(text.split('="')[1].split(",")[0])
+    return None
+
+def _fetch_eastmoney_wti() -> float | None:
+    req = urllib.request.Request(
+        "https://push2.eastmoney.com/api/qt/stock/get?secid=113.USDWTI&fields=f43",
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+    )
+    resp = urllib.request.urlopen(req, timeout=8)
+    body = json.loads(resp.read().decode("utf-8"))
+    return float(body["data"]["f43"]) / 100.0
+
+def _http_fetch_wti() -> tuple[float | None, str]:
+    for name, fn in [("Sina", _fetch_sina_wti), ("EastMoney", _fetch_eastmoney_wti)]:
+        try:
+            p = fn()
+            if p is not None and 30 < p < 200:
+                return p, name
+        except Exception:
+            pass
+    return None, ""
+
+async def _broadcast_wti(price: float, src: str):
+    global _last_wti_price
+    if _last_wti_price is None or abs(price - _last_wti_price) >= 0.01:
+        _last_wti_price = price
+        await _broadcast_sse({
+            "type": "price_update",
+            "asset": "WTI",
+            "price": round(price, 2),
+            "ts": time.time(),
+        })
+
+async def wti_http_watcher():
+    print("[WTI] HTTP watcher started (Sina -> EastMoney)")
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            price, src = await loop.run_in_executor(None, _http_fetch_wti)
+            if price is not None:
+                await _broadcast_wti(price, src)
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+
+async def wti_mt5_watcher():
+    print("[WTI] MT5 watcher started")
+    while True:
+        try:
+            if _mt5.ok:
+                price = _mt5_read_wti_tick()
+                if price is not None and 30 < price < 200:
+                    await _broadcast_wti(price, "MT5")
+                    await asyncio.sleep(0.1)
+                    continue
+                await asyncio.sleep(1.0)
+                continue
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f"[WTI] MT5 error: {type(e).__name__}: {e}")
+            await asyncio.sleep(5)
+
+
+# -- DB watcher ------------------------------------------------------------
+
+async def db_watcher() -> None:
+    snapshot = await _fetch_event_snapshot()
+    raw_cursor, decision_cursor = await _fetch_change_cursors()
+    interval = config.NEWS_WATCH_INTERVAL_MS / 1000.0
+    next_reconcile = time.monotonic() + 5.0
+    while True:
+        try:
+            current_raw, current_decision = await _fetch_change_cursors()
+            changed_ids = await _fetch_incremental_news_ids(raw_cursor, decision_cursor)
+            if changed_ids:
+                events = await _fetch_event_rows(changed_ids)
+                for event in reversed(events):
+                    await _broadcast_sse(event)
+                    snapshot[event["news_id"]] = (
+                        str(event["analysis_status"]).upper(),
+                        event["decision_id"],
+                    )
+            raw_cursor = max(raw_cursor, current_raw)
+            decision_cursor = max(decision_cursor, current_decision)
+
+            # 状态更新没有独立递增 ID；低频全量对账用于恢复丢失通知并保持最终一致。
+            if time.monotonic() >= next_reconcile:
+                current = await _fetch_event_snapshot()
+                reconciled_ids = [
+                    news_id for news_id, state in current.items()
+                    if snapshot.get(news_id) != state
+                ]
+                if reconciled_ids:
+                    events = await _fetch_event_rows(reconciled_ids)
+                    for event in reversed(events):
+                        await _broadcast_sse(event)
+                snapshot = current
+                next_reconcile = time.monotonic() + 5.0
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
+
+# -- Kline helpers ---------------------------------------------------------
+
+def _mock_klines(limit: int, *, base: float, seed: int):
+    import random
+    result = []
+    now = datetime.now(TZ_SHANGHAI)
+    rng = random.Random(seed)
+    jitter = base * 0.015
+    for i in range(limit):
+        t = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=limit - i)
+        ts = int(t.timestamp())
+        o = base + rng.uniform(-jitter, jitter)
+        h = o + rng.uniform(0, jitter * 0.5)
+        l = o - rng.uniform(0, jitter * 0.5)
+        c = l + rng.uniform(0, h - l)
+        result.append({
+            "time": ts,
+            "open": round(o, 2),
+            "high": round(h, 2),
+            "low": round(l, 2),
+            "close": round(c, 2),
+            "volume": int(rng.uniform(5000, 30000)),
+        })
+    return result
+
+
+# -- Schema migration ------------------------------------------------------
+
+def _migrate_schema() -> None:
+    """Add any missing columns to ai_decisions. Safe to call repeatedly."""
+    conn = db.get_connection()
+    try:
+        db.migrate(conn)
+    finally:
+        conn.close()
+
+
+# -- Lifespan --------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _migrate_schema()
+    tasks = [
+        asyncio.create_task(db_watcher(), name="db_watcher"),
+        asyncio.create_task(gold_http_watcher(), name="gold_http"),
+        asyncio.create_task(gold_mt5_watcher(), name="gold_mt5"),
+        asyncio.create_task(wti_http_watcher(), name="wti_http"),
+        asyncio.create_task(wti_mt5_watcher(), name="wti_mt5"),
+        asyncio.create_task(news_source_watcher(), name="news_sources"),
+        asyncio.create_task(quick_sim_watcher(), name="quick_sim"),
+    ]
+    yield
+    await asyncio.to_thread(_TRADING_MANAGER.stop)
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# -- FastAPI app definition ------------------------------------------------
+
+app = FastAPI(title="Trident Agent API", version="4.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# -- SSE stream route ------------------------------------------------------
+
+@app.get("/api/events/stream")
+async def sse_stream(request: Request):
+    q: asyncio.Queue = asyncio.Queue(maxsize=256)
+    _SSE_QUEUES.append(q)
+
+    async def event_generator():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=1.0)
+                    yield f"data: {msg}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                _SSE_QUEUES.remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# -- REST routes -----------------------------------------------------------
+
+class AIModelSelection(BaseModel):
+    model_id: str
+
+
+def _ai_models_response() -> Dict[str, Any]:
+    return {
+        "models": [dict(model) for model in config.AI_MODEL_ROSTER],
+        "selected": config.get_selected_ai_model_id(),
+    }
+
+
+@app.get("/api/ai/models")
+async def get_ai_models():
+    return _ai_models_response()
+
+
+@app.put("/api/ai/models")
+async def select_ai_model(selection: AIModelSelection):
+    try:
+        await asyncio.to_thread(config.write_selected_ai_model_id, selection.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="unsupported AI model") from exc
+    return _ai_models_response()
+
+
+@app.get("/api/events")
+async def get_events(limit: int = 2000) -> List[Dict[str, Any]]:
+    """Return the latest non-noise news rows with their latest decision."""
+    try:
+        return await _fetch_event_rows(limit=max(1, min(int(limit), config.EVENTS_LIST_MAX)))
+    except aiosqlite.OperationalError:
+        return []
+
+
+@app.get("/api/events/today")
+async def get_today_events() -> Dict[str, Any]:
+    """上海日真实计数，避免前端用列表截断条数当「今日信号」。"""
+    today = datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%d")
+    try:
+        async with aiosqlite.connect(DB_PATH) as connection:
+            cursor = await connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS news_count,
+                    COALESCE(SUM(CASE WHEN status = 'DONE' THEN 1 ELSE 0 END), 0) AS analyzed_count
+                FROM raw_news
+                WHERE is_noise = 0 AND substr(timestamp, 1, 10) = ?
+                """,
+                (today,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            cursor = await connection.execute(
+                "SELECT COUNT(*) FROM raw_news WHERE is_noise = 0"
+            )
+            total_row = await cursor.fetchone()
+            await cursor.close()
+    except aiosqlite.OperationalError:
+        return {"today": today, "news_count": 0, "analyzed_count": 0, "total_count": 0}
+    return {
+        "today": today,
+        "news_count": int(row[0] or 0),
+        "analyzed_count": int(row[1] or 0),
+        "total_count": int(total_row[0] or 0),
+    }
+
+
+_MARKET_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
+_TECHFLOW_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
+_EASTMONEY_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
+_BLOCKBEATS_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
+_NEWS_CACHE_TTL = 20.0
+
+
+def _cached_market_prices() -> Dict[str, Any]:
+    now = time.monotonic()
+    if _MARKET_CACHE["value"] is None or now >= _MARKET_CACHE["expires"]:
+        payload = market_feeds.fetch_market_prices()
+        _MARKET_CACHE["value"] = payload
+        _MARKET_CACHE["expires"] = now + 2.0
+        timeseries.record_market_snapshot(payload)
+    return _MARKET_CACHE["value"]
+
+
+@app.get("/api/market/prices")
+async def get_market_prices():
+    return await asyncio.to_thread(_cached_market_prices)
+
+
+@app.get("/api/timeseries/ticks/{symbol}")
+async def get_timeseries_ticks(symbol: str, limit: int = 500):
+    items = await asyncio.to_thread(timeseries.query_ticks, symbol, None, None, limit)
+    return {"symbol": symbol.upper(), "count": len(items), "items": items}
+
+
+@app.get("/api/timeseries/ohlc/{symbol}")
+async def get_timeseries_ohlc(symbol: str, interval: str = "1m", limit: int = 200):
+    if interval not in timeseries.BUCKET_SECONDS:
+        raise HTTPException(status_code=400, detail=f"interval must be one of {sorted(timeseries.BUCKET_SECONDS)}")
+    items = await asyncio.to_thread(timeseries.resample_ohlc, symbol, interval, limit)
+    return {"symbol": symbol.upper(), "interval": interval, "count": len(items), "items": items}
+
+
+@app.get("/api/timeseries/factors")
+async def get_timeseries_factors(asset: str | None = None, limit: int = 100):
+    items = await asyncio.to_thread(timeseries.query_factor_history, asset, limit)
+    return {"asset": (asset or "ALL").upper(), "count": len(items), "items": items}
+
+
+@app.get("/api/timeseries/news")
+async def get_timeseries_news(asset: str | None = None, limit: int = 2000):
+    items = await asyncio.to_thread(timeseries.query_news_events, None, None, asset, limit)
+    return {"asset": (asset or "ALL").upper(), "count": len(items), "items": items}
+
+
+@app.get("/api/timeseries/winrate")
+async def get_timeseries_winrate(asset: str | None = None, window: int = 20):
+    return await asyncio.to_thread(timeseries.rolling_winrate, asset, window)
+
+
+def _techflow_value(item: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if item.get(key) not in (None, ""):
+            return item[key]
+    return ""
+
+
+def _paged_url(url: str, page: int, page_keys: tuple[str, ...] = ("page", "page_index")) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    for key in page_keys:
+        if key in query:
+            query[key] = [str(page)]
+    if not any(key in query for key in page_keys):
+        query["page"] = [str(page)]
+    return urllib.parse.urlunsplit((
+        parsed.scheme, parsed.netloc, parsed.path,
+        urllib.parse.urlencode(query, doseq=True), parsed.fragment,
+    ))
+
+
+def _extract_news_rows(payload: Any, list_keys: tuple[str, ...]) -> list:
+    container = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(container, dict):
+        nested = container.get("data")
+        if isinstance(nested, dict):
+            container = nested
+        rows = next((container[k] for k in list_keys if isinstance(container.get(k), list)), [])
+        return rows if isinstance(rows, list) else []
+    return container if isinstance(container, list) else []
+
+
+def _fetch_paged_json(
+    url: str,
+    *,
+    referer: str,
+    timeout: int,
+    pages: int,
+) -> Any:
+    for page in range(1, max(1, pages) + 1):
+        response = requests.get(
+            _paged_url(url, page),
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; TridentNewsReader/1.0)",
+                "Referer": referer,
+                "Accept": "application/json, text/plain, */*",
+            },
+        )
+        response.raise_for_status()
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "html" in content_type:
+            raise ValueError("non-json response")
+        yield response.json()
+
+
+def _fetch_techflow_sync() -> Dict[str, Any]:
+    now = time.monotonic()
+    if _TECHFLOW_CACHE["value"] is not None and now < _TECHFLOW_CACHE["expires"]:
+        return _TECHFLOW_CACHE["value"]
+    try:
+        items = []
+        seen: set[str] = set()
+        for payload in _fetch_paged_json(
+            config.TECHFLOW_NEWS_URL,
+            referer="https://www.techflowpost.com/",
+            timeout=4,
+            pages=config.NEWS_SOURCE_PAGES,
+        ):
+            if isinstance(payload, dict) and payload.get("data") is not None:
+                content_hint = str(payload.get("message") or "")
+                if "html" in content_hint.lower():
+                    raise ValueError("non-json response")
+            for row in _extract_news_rows(payload, ("list", "items", "data", "newsflashes")):
+                if not isinstance(row, dict):
+                    continue
+                title = str(_techflow_value(row, "title", "name", "content") or "").strip()
+                if not title:
+                    continue
+                item_id = str(_techflow_value(row, "id", "newsflash_id", "uuid") or title)
+                if item_id in seen:
+                    continue
+                seen.add(item_id)
+                summary = str(_techflow_value(row, "summary", "description", "digest", "content") or "").strip()
+                url = str(_techflow_value(row, "url", "link", "share_url") or "").strip()
+                if url.startswith("/"):
+                    url = "https://www.techflowpost.com" + url
+                items.append({
+                    "id": item_id,
+                    "title": title,
+                    "summary": summary if summary != title else "",
+                    "url": url,
+                    "published_at": str(_techflow_value(row, "published_at", "publish_time", "created_at", "createdAt") or ""),
+                    "source": "TechFlow 深潮",
+                })
+        value = {"status": "ok", "items": items, "error": ""}
+    except Exception as exc:
+        value = {"status": "unavailable", "items": [], "error": f"TechFlow unavailable: {type(exc).__name__}"}
+    _TECHFLOW_CACHE.update({"value": value, "expires": now + _NEWS_CACHE_TTL})
+    return value
+
+
+@app.get("/api/news/techflow")
+async def get_techflow_news():
+    return await asyncio.to_thread(_fetch_techflow_sync)
+
+
+def _fetch_eastmoney_news_sync() -> Dict[str, Any]:
+    now = time.monotonic()
+    if _EASTMONEY_CACHE["value"] is not None and now < _EASTMONEY_CACHE["expires"]:
+        return _EASTMONEY_CACHE["value"]
+    try:
+        items = []
+        seen: set[str] = set()
+        for payload in _fetch_paged_json(
+            config.EASTMONEY_NEWS_URL,
+            referer="https://www.eastmoney.com/",
+            timeout=5,
+            pages=config.NEWS_SOURCE_PAGES,
+        ):
+            for row in _extract_news_rows(payload, ("list", "items", "data", "result")):
+                if not isinstance(row, dict):
+                    continue
+                title = str(_techflow_value(row, "title", "newsTitle", "Art_Title", "content", "digest") or "").strip()
+                if not title:
+                    continue
+                item_id = str(_techflow_value(row, "id", "newsId", "code", "uniqueUrl", "Art_UniqueUrl") or title)
+                if item_id in seen:
+                    continue
+                seen.add(item_id)
+                summary = str(_techflow_value(row, "summary", "digest", "description", "Art_Summary", "content") or "").strip()
+                url = str(_techflow_value(row, "url", "uniqueUrl", "link", "newsUrl", "Art_Url") or "").strip()
+                if url.startswith("/"):
+                    url = "https://www.eastmoney.com" + url
+                items.append({
+                    "id": item_id,
+                    "title": title,
+                    "summary": summary if summary != title else "",
+                    "url": url,
+                    "published_at": str(_techflow_value(row, "published_at", "showTime", "publishTime", "Art_ShowTime", "date") or ""),
+                    "source": "东方财富",
+                })
+        value = {"status": "ok", "items": items, "error": ""}
+    except Exception as exc:
+        value = {"status": "unavailable", "items": [], "error": f"EastMoney unavailable: {type(exc).__name__}"}
+    _EASTMONEY_CACHE.update({"value": value, "expires": now + _NEWS_CACHE_TTL})
+    return value
+
+
+@app.get("/api/news/eastmoney")
+async def get_eastmoney_news():
+    return await asyncio.to_thread(_fetch_eastmoney_news_sync)
+
+
+def _fetch_blockbeats_sync() -> Dict[str, Any]:
+    now = time.monotonic()
+    if _BLOCKBEATS_CACHE["value"] is not None and now < _BLOCKBEATS_CACHE["expires"]:
+        return _BLOCKBEATS_CACHE["value"]
+    try:
+        items = []
+        seen: set[str] = set()
+        for payload in _fetch_paged_json(
+            config.BLOCKBEATS_NEWS_URL,
+            referer="https://www.theblockbeats.info/",
+            timeout=5,
+            pages=config.NEWS_SOURCE_PAGES,
+        ):
+            if isinstance(payload, dict) and payload.get("status") not in (0, "0", None, "ok", 200):
+                continue
+            for row in _extract_news_rows(payload, ("data", "list", "items")):
+                if not isinstance(row, dict):
+                    continue
+                title = str(_techflow_value(row, "title", "name", "content") or "").strip()
+                if not title:
+                    continue
+                item_id = str(_techflow_value(row, "id", "flash_id", "uuid") or title)
+                if item_id in seen:
+                    continue
+                seen.add(item_id)
+                summary = str(_techflow_value(row, "content", "summary", "description", "digest") or "").strip()
+                url = str(_techflow_value(row, "link", "url", "share_url") or "").strip()
+                items.append({
+                    "id": item_id,
+                    "title": title,
+                    "summary": summary if summary != title else "",
+                    "url": url,
+                    "published_at": str(_techflow_value(row, "create_time", "published_at", "created_at", "add_time") or ""),
+                    "source": "律动 BlockBeats",
+                })
+        value = {"status": "ok", "items": items, "error": ""}
+    except Exception as exc:
+        value = {"status": "unavailable", "items": [], "error": f"BlockBeats unavailable: {type(exc).__name__}"}
+    _BLOCKBEATS_CACHE.update({"value": value, "expires": now + _NEWS_CACHE_TTL})
+    return value
+
+
+@app.get("/api/news/blockbeats")
+async def get_blockbeats_news():
+    return await asyncio.to_thread(_fetch_blockbeats_sync)
+
+
+async def _news_report() -> Dict[str, Any]:
+    """汇总外部新闻源、入库状态、AI 信号和模拟交易结果。"""
+    techflow, eastmoney, blockbeats, events, quick_evaluation = await asyncio.gather(
+        get_techflow_news(),
+        get_eastmoney_news(),
+        get_blockbeats_news(),
+        _fetch_event_rows(limit=200),
+        asyncio.to_thread(quick_sim.snapshot),
+    )
+    report_items = []
+    for event in events:
+        report_items.append({
+            "news_id": event.get("news_id"),
+            "source": event.get("source", ""),
+            "timestamp": event.get("timestamp", ""),
+            "content": event.get("news_text", ""),
+            "status": event.get("analysis_status", "PENDING"),
+            "decision_id": event.get("decision_id"),
+            "paper_trading_run_id": event.get("paper_trading_run_id"),
+            "strategy_id": event.get("strategy_id"),
+            "strategy_version_id": event.get("strategy_version_id"),
+            "agent_model_id": event.get("agent_model_id"),
+            "asset": event.get("target_asset", "NONE"),
+            "action": event.get("action", "HOLD"),
+            "score": event.get("score"),
+            "evidence_confidence": event.get("evidence_confidence"),
+            "evidence_action": event.get("evidence_action", "HOLD"),
+            "trade_gate_reason": event.get("trade_gate_reason", ""),
+            "entry_price": event.get("entry_price"),
+            "settled": bool(event.get("settled")),
+            "is_correct": event.get("is_correct", ""),
+            "forward_pnl": event.get("forward_pnl"),
+            "reason": event.get("reason", ""),
+        })
+    directional = [item for item in report_items if item["action"] in ("BUY", "SELL")]
+    evidence_passed = [
+        item for item in directional
+        if item["evidence_action"] == item["action"]
+        and item["trade_gate_reason"] == "证据充分，允许输出方向性结论"
+    ]
+    completed_directional = [
+        item for item in directional if item["status"] not in ("PENDING", "PROCESSING")
+    ]
+    gate_reasons: Dict[str, int] = {}
+    for item in completed_directional:
+        if item in evidence_passed:
+            continue
+        reason_key = item["trade_gate_reason"] or "尚未写入闸门结论"
+        gate_reasons[reason_key] = gate_reasons.get(reason_key, 0) + 1
+    return {
+        "generated_at_ms": int(time.time() * 1000),
+        "sources": {
+            "techflow": techflow,
+            "eastmoney": eastmoney,
+            "blockbeats": blockbeats,
+        },
+        "pipeline": {
+            "source_items": sum(
+                len(payload.get("items", []))
+                for payload in (techflow, eastmoney, blockbeats)
+                if isinstance(payload, dict)
+            ),
+            "stored_reports": len(report_items),
+            "analyzed": sum(item["decision_id"] is not None for item in report_items),
+            "signals": len(directional),
+            "evidence_passed": len(evidence_passed),
+            "evidence_rejected": len(completed_directional) - len(evidence_passed),
+            "executed": sum(item["entry_price"] is not None for item in report_items),
+            "open_trades": sum(item["entry_price"] is not None and not item["settled"] for item in report_items),
+            "settled_trades": sum(item["settled"] for item in report_items),
+        },
+        "gate_reasons": gate_reasons,
+        "quick_sim": quick_evaluation,
+        "reports": report_items,
+    }
+
+
+@app.get("/api/news/report")
+async def get_news_report():
+    return await _news_report()
+
+
+def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
+    inserted = 0
+    conn = db.get_connection()
+    try:
+        for item in items:
+            title = str(item.get("title") or "").strip()
+            summary = str(item.get("summary") or "").strip()
+            if not title:
+                continue
+            source = str(item.get("source") or "External")
+            external_key = f"{source}:{item.get('id') or title}"
+            marker = hashlib.sha256(external_key.encode("utf-8")).hexdigest()[:24]
+            if conn.execute("SELECT 1 FROM raw_news WHERE content LIKE ? LIMIT 1", (f"[hash:{marker}]%",)).fetchone():
+                continue
+            content = f"[hash:{marker}] {title}"
+            if summary and summary not in title:
+                content += f"\n{summary}"
+            if not news_sources.allow_ingest(source, conn):
+                continue
+            filtered = evaluate_news(title, summary)
+            ts_epoch = int(time.time())
+            news_id = db.insert_raw_news(
+                conn,
+                source=source,
+                content=content[:1000],
+                timestamp=_now(),
+                status="PENDING",
+                is_noise=int(filtered["is_noise"]),
+                relevance_score=float(filtered["relevance_score"]),
+                ts=ts_epoch,
+            )
+            try:
+                timeseries.record_news_event(
+                    news_id,
+                    source=source,
+                    is_noise=int(filtered["is_noise"]),
+                    status="PENDING",
+                    ts=ts_epoch,
+                    connection=conn,
+                )
+            except sqlite3.OperationalError as exc:
+                print(f"[NEWS-SOURCES] timeseries skip: {exc}")
+            inserted += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return inserted
+
+
+async def news_source_watcher() -> None:
+    while True:
+        try:
+            settings = await asyncio.to_thread(news_sources.get_settings)
+            sources = settings.get("sources") or {}
+            remaining = int(settings.get("remaining") or 0)
+            enabled = bool(settings.get("enabled", True))
+            jobs = []
+            if enabled and remaining > 0:
+                if sources.get("techflow", True):
+                    jobs.append(asyncio.to_thread(_fetch_techflow_sync))
+                if sources.get("eastmoney", True):
+                    jobs.append(asyncio.to_thread(_fetch_eastmoney_news_sync))
+                if sources.get("blockbeats", True):
+                    jobs.append(asyncio.to_thread(_fetch_blockbeats_sync))
+            payloads = await asyncio.gather(*jobs, return_exceptions=True) if jobs else []
+            items: List[Dict[str, Any]] = []
+            for payload in payloads:
+                if isinstance(payload, dict) and payload.get("status") == "ok":
+                    items.extend(payload.get("items") or [])
+            if remaining > 0 and items:
+                await asyncio.to_thread(_ingest_external_news_sync, items[:remaining])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[NEWS-SOURCES] {type(exc).__name__}: {exc}")
+        await asyncio.sleep(config.NEWS_SOURCE_POLL_SECONDS)
+
+
+def _market_price_from_cache(asset: str) -> float | None:
+    """只读多源行情缓存，避免在 quick_sim 写库时再次打开同一 SQLite。"""
+    payload = _MARKET_CACHE.get("value") or {}
+    for item in payload.get("items") or []:
+        if str(item.get("asset") or "").upper() != (asset or "").upper():
+            continue
+        price = item.get("price")
+        if isinstance(price, (int, float)) and price > 0:
+            return float(price)
+    return None
+
+
+def _quick_sim_price(asset: str) -> float | None:
+    """快速模拟与前端看板共用行情：优先多源缓存，再回退到引擎价格源。"""
+    return _market_price_from_cache(asset) or _get_current_price(asset)
+
+
+async def quick_sim_watcher() -> None:
+    """快速模拟评测循环：新方向性信号按真实行情建仓，到期按真实行情结算。"""
+    while True:
+        try:
+            await asyncio.to_thread(_cached_market_prices)
+            result = await asyncio.to_thread(quick_sim.run_cycle, _quick_sim_price)
+            for trade in result["opened"]:
+                print(f"[QUICK-SIM] OPEN #{trade['decision_id']} {trade['action']} {trade['asset']} @ {trade['entry_price']}")
+            for trade in result["settled"]:
+                print(f"[QUICK-SIM] SETTLE #{trade['id']} {trade['action']} {trade['asset']} {trade['pnl_pct']:+.4f}% -> {trade['verdict']}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[QUICK-SIM] {type(exc).__name__}: {exc}")
+        await asyncio.sleep(config.QUICK_SIM_POLL_SECONDS)
+
+
+def _clamp(value: Any, low: float = -1.0, high: float = 1.0) -> float:
+    try:
+        return max(low, min(high, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _context_asset(context: Dict[str, Any], asset: str) -> Dict[str, Any]:
+    assets = context.get("assets") if isinstance(context.get("assets"), dict) else {}
+    value = assets.get(asset) or assets.get("BTC") or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _factor_result(row: Dict[str, Any]) -> Dict[str, Any]:
+    return decision_guard.evaluate_decision(row)
+
+
+async def _news_analysis(news_id: int) -> Dict[str, Any]:
+    async with aiosqlite.connect(DB_PATH) as connection:
+        connection.row_factory = aiosqlite.Row
+        cursor = await connection.execute(
+            """
+            SELECT rn.id AS news_id, rn.source, rn.content, rn.timestamp,
+                   ad.id AS decision_id, ad.created_at, ad.sentiment_score,
+                   UPPER(ad.suggested_action) AS suggested_action, ad.reasoning,
+                   ad.reasoning_path, ad.market_category, ad.target_asset,
+                   ad.market_confirmation, ad.decision_context, ad.cluster_size,
+                   (SELECT COUNT(*) FROM ai_decisions h WHERE h.settled=1 AND UPPER(h.target_asset)=UPPER(ad.target_asset)) AS history_total,
+                   (SELECT COUNT(*) FROM ai_decisions h WHERE h.settled=1 AND h.is_correct='WIN' AND UPPER(h.target_asset)=UPPER(ad.target_asset)) AS history_wins
+            FROM raw_news rn
+            LEFT JOIN ai_decisions ad ON ad.id=(SELECT MAX(x.id) FROM ai_decisions x WHERE x.news_id=rn.id)
+            WHERE rn.id=?
+            """,
+            (news_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="news not found")
+    data = dict(row)
+    analysis = _factor_result(data)
+    await asyncio.to_thread(timeseries.record_factor_snapshot, news_id,
+                            str(data.get("target_asset") or "NONE"), analysis)
+    return {
+        "news": {"id": data["news_id"], "source": data["source"], "content": re.sub(r'\[hash:[a-fA-F0-9]+\]\s*', '', data["content"] or ""), "published_at": data["timestamp"]},
+        "decision": None if data["decision_id"] is None else {key: data[key] for key in ("decision_id", "created_at", "sentiment_score", "suggested_action", "reasoning", "reasoning_path", "market_category", "target_asset", "market_confirmation")},
+        "analysis": analysis,
+        "strategy": {
+            "action": analysis["action"],
+            "raw_action": analysis["raw_action"],
+            "confidence": analysis["confidence"],
+            "passed_gate": analysis["confidence_detail"]["passed_gate"],
+            "verdict": analysis["verdict"],
+            "note": "仅供策略研究，不执行交易",
+        },
+    }
+
+
+@app.get("/api/news/{news_id}/analysis")
+async def get_news_analysis(news_id: int):
+    return await _news_analysis(news_id)
+
+
+def _settled_stats_sync(asset: str) -> Dict[str, Any]:
+    connection = db.get_connection()
+    connection.row_factory = __import__("sqlite3").Row
+    try:
+        sample = evidence.collect_settled_sample(asset, connection=connection)
+        tokens = evidence.query_assets(sample["assets"]) if sample["assets"] else ()
+        if tokens:
+            placeholders = ",".join("?" * len(tokens))
+            row = connection.execute(
+                f"""SELECT AVG(forward_pnl) avg_pnl FROM ai_decisions
+                    WHERE settled=1 AND UPPER(is_correct) IN ('WIN','LOSS')
+                      AND UPPER(target_asset) IN ({placeholders})""",
+                tokens,
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """SELECT AVG(forward_pnl) avg_pnl FROM ai_decisions
+                   WHERE settled=1 AND UPPER(is_correct) IN ('WIN','LOSS')"""
+            ).fetchone()
+        return {
+            "total": sample["total"],
+            "wins": sample["wins"],
+            "avg_pnl": None if row is None else row["avg_pnl"],
+            "scope": sample["scope"],
+            "supplemented": sample["supplemented"],
+        }
+    finally:
+        connection.close()
+
+
+_ADVICE_BOUNDS = {
+    "signal_threshold": (0.3, 0.9),
+    "notional_multiplier": (0.25, 1.5),
+    "trailing_callback_rate": (0.1, 5.0),
+    "holding_horizon_minutes": (15, 240),
+}
+
+
+def _rule_advice(analysis: Dict[str, Any], stats: Dict[str, Any]) -> Dict[str, Any]:
+    confidence = analysis["analysis"]["confidence"] / 100.0
+    winrate = (stats.get("wins") or 0) / max(stats.get("total") or 1, 1)
+    contradictions = len(analysis["analysis"]["contradictions"])
+    significance = analysis["analysis"]["significance"]
+    return {
+        "signal_threshold": round(_clamp(0.65 - confidence * 0.2 + contradictions * 0.05, 0.3, 0.9), 2),
+        "notional_multiplier": round(_clamp(0.5 + confidence * 0.6 + max(winrate - 0.5, 0) - contradictions * 0.15, 0.25, 1.5), 2),
+        "trailing_callback_rate": round(_clamp(0.5 + (1 - confidence) * 0.5, 0.1, 5), 2),
+        "holding_horizon_minutes": int(_clamp(60 + confidence * 120, 15, 240)),
+        "reason": f"统一置信度 {analysis['analysis']['confidence']}/100，卡方 p={significance['p_value']}，矛盾项 {contradictions} 个",
+        "risk_notes": "样本不足、p 值过大或因子冲突时维持较高阈值和较低仓位倍率",
+        "rollback_condition": "连续 3 条已结算信号亏损或滚动胜率低于 45% 时回滚",
+    }
+
+
+def _llm_strategy_advice_sync(analysis: Dict[str, Any], stats: Dict[str, Any]) -> Dict[str, Any]:
+    response = _agent_llm_client().chat.completions.create(
+        model=_agent_llm_model(), temperature=0.0, max_tokens=700,
+        extra_body=config.AIPING_EXTRA_BODY, response_format=({"type": "json_object"} if config.AIPING_JSON_MODE else None),
+        messages=[
+            {"role": "system", "content": "你是策略参数顾问。只输出严格 JSON，不交易、不修改配置。只能引用输入 JSON 中已有的证据（evidence 为 0-10 归一分、significance 为卡方检验结果、contradictions 为矛盾项），禁止凭空假设任何未给出的数据。p_value 越大或 contradictions 越多，参数越保守。字段只能是 signal_threshold, notional_multiplier, trailing_callback_rate, holding_horizon_minutes, reason, risk_notes, rollback_condition。"},
+            {"role": "user", "content": json.dumps({"bounds": _ADVICE_BOUNDS, "analysis": analysis["analysis"], "settled_performance": stats}, ensure_ascii=False)},
+        ],
+    )
+    result = json.loads(response.choices[0].message.content)
+    allowed = set(_ADVICE_BOUNDS) | {"reason", "risk_notes", "rollback_condition"}
+    if not isinstance(result, dict) or set(result) - allowed or not all(key in result for key in allowed):
+        raise ValueError("invalid advice JSON")
+    for key, (low, high) in _ADVICE_BOUNDS.items():
+        result[key] = _clamp(result[key], low, high)
+    result["holding_horizon_minutes"] = int(result["holding_horizon_minutes"])
+    return result
+
+
+@app.post("/api/news/{news_id}/strategy-advice")
+async def get_strategy_advice(news_id: int):
+    analysis = await _news_analysis(news_id)
+    asset = (analysis.get("decision") or {}).get("target_asset") or "NONE"
+    stats = await asyncio.to_thread(_settled_stats_sync, asset)
+    try:
+        advice = await asyncio.to_thread(_llm_strategy_advice_sync, analysis, stats)
+        mode = "llm"
+    except Exception:
+        advice = _rule_advice(analysis, stats)
+        mode = "rules"
+    current_values = {
+        "signal_threshold": config.BINANCE_SIGNAL_THRESHOLD,
+        "notional_multiplier": 1.0,
+        "trailing_callback_rate": config.BINANCE_TRAILING_CALLBACK_RATE,
+        "holding_horizon_minutes": 60,
+    }
+    return {"mode": mode, "current_values": current_values, "advice": advice, "bounds": {key: {"min": value[0], "max": value[1]} for key, value in _ADVICE_BOUNDS.items()}, "settled_performance": stats, "validation": {"confidence": analysis["analysis"]["confidence"], "significance": analysis["analysis"]["significance"], "contradictions": analysis["analysis"]["contradictions"], "gated_action": analysis["analysis"]["action"], "verdict": analysis["analysis"]["verdict"]}, "applied": False}
+
+
+@app.get("/api/klines/{symbol}")
+async def get_klines(symbol: str, limit: int = 72):
+    ticker_map = {
+        "BTCUSDT": ("BTC-USD", 80000),
+        "XAUUSD":  ("GC=F",    2500),
+        "WTIUSD":  ("CL=F",      70),
+    }
+    yf_sym, mock_base = ticker_map.get(symbol.upper(), (None, None))
+    if yf_sym is None:
+        return _mock_klines(limit, base=80000, seed=1)
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(yf_sym)
+        hist = ticker.history(period="3d", interval="1h")
+        if hist.empty:
+            return _mock_klines(limit, base=mock_base, seed=1)
+        result = []
+        for idx, row in hist.iterrows():
+            ts = idx.to_pydatetime()
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=TZ_SHANGHAI)
+            result.append({
+                "time": int(ts.timestamp()),
+                "open": round(float(row["Open"]), 2),
+                "high": round(float(row["High"]), 2),
+                "low": round(float(row["Low"]), 2),
+                "close": round(float(row["Close"]), 2),
+                "volume": int(row["Volume"]) if not math.isnan(float(row["Volume"])) else 0,
+            })
+        if result:
+            return result[:limit]
+    except Exception:
+        pass
+    return _mock_klines(limit, base=mock_base, seed=1)
+
+
+@app.get("/api/export/signals")
+async def export_paper_signals():
+    """导出全部信号分析记录（含 BUY/SELL/HOLD 观望）。"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                ad.id,
+                rn.timestamp AS news_time,
+                rn.content AS news_text,
+                UPPER(ad.target_asset) AS asset,
+                UPPER(ad.suggested_action) AS action,
+                ad.sentiment_score AS score,
+                ad.entry_price,
+                ad.reasoning_path,
+                ad.reasoning,
+                ad.prediction_type,
+                ad.event_strength,
+                ad.expected_horizon
+            FROM ai_decisions ad
+            LEFT JOIN raw_news rn ON rn.id = ad.news_id
+            ORDER BY ad.id DESC
+            LIMIT 2000
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+    import xlsxwriter
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output)
+    worksheet = workbook.add_worksheet("信号分析")
+    headers = ["时间", "新闻内容", "品种", "方向", "评分", "入场价", "预测类型", "影响强度", "时间维度", "大模型归因"]
+    for column, header in enumerate(headers):
+        worksheet.write(0, column, header)
+    for index, row in enumerate(rows, start=1):
+        action = row["action"]
+        direction = "多" if action == "BUY" else ("空" if action == "SELL" else "观望")
+        worksheet.write(index, 0, row["news_time"] or "")
+        worksheet.write(index, 1, row["news_text"] or "")
+        asset = "XAU" if row["asset"] == "GOLD" else row["asset"]
+        worksheet.write(index, 2, asset or "")
+        worksheet.write(index, 3, direction)
+        worksheet.write_number(index, 4, round(float(row["score"] or 0), 4))
+        if row["entry_price"] is not None and row["entry_price"] > 0:
+            worksheet.write_number(index, 5, float(row["entry_price"]))
+        worksheet.write(index, 6, row["prediction_type"] or "")
+        worksheet.write(index, 7, row["event_strength"] or "")
+        worksheet.write(index, 8, row["expected_horizon"] or "")
+        worksheet.write(index, 9, row["reasoning_path"] or row["reasoning"] or "")
+    worksheet.set_column(0, 0, 20)
+    worksheet.set_column(1, 1, 64)
+    worksheet.set_column(2, 8, 12)
+    worksheet.set_column(9, 9, 60)
+    workbook.close()
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=paper_signals.xlsx"},
+    )
+
+
+@app.get("/api/export/excel")
+async def export_excel():
+    """Export today's buy/sell signals as Excel."""
+    try:
+        return await _do_export_excel()
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return StreamingResponse(
+            io.BytesIO(f"Export error: {exc}".encode("utf-8")),
+            media_type="text/plain; charset=utf-8",
+            status_code=500,
+        )
+
+
+async def _do_export_excel():
+    """Core Excel export logic, separated for clean error handling."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                ad.id,
+                rn.timestamp,
+                rn.source,
+                rn.content AS news_text,
+                UPPER(ad.suggested_action) AS action,
+                ad.sentiment_score AS score,
+                ad.reasoning_path,
+                ad.reasoning,
+                ad.extra_models_consensus,
+                ad.target_asset,
+                ad.vip_tag,
+                ad.entry_price, ad.exit_price, ad.max_price, ad.min_price,
+                ad.max_price_time, ad.min_price_time,
+                ad.entry_time,
+                ad.is_correct,
+                ad.cluster_size,
+                ad.prediction_type,
+                ad.event_phase,
+                ad.market_confirmation,
+                ad.expected_horizon,
+                ad.invalidation_condition,
+                ad.decision_context,
+                ad.mfe_pct,
+                ad.mae_pct,
+                ad.forward_pnl,
+                ad.mfe_time_mins
+            FROM ai_decisions ad
+            INNER JOIN raw_news rn ON rn.id = ad.news_id
+            WHERE date(ad.created_at) >= date('now', 'localtime', '-5 days')
+            ORDER BY ad.id DESC
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+    import xlsxwriter
+    output = io.BytesIO()
+    wb = xlsxwriter.Workbook(output)
+    ws = wb.add_worksheet("Signals")
+    headers = [
+        "ID", "时间", "新闻内容", "品种", "方向", "评分", "入场价", "最高价", "最低价", "出场价",
+        "最大浮盈%", "最大浮亏%", "到达极值(min)", "强影响", "胜负", "标签", "主模型归因", "extra_models_consensus",
+    ]
+    for c, h in enumerate(headers):
+        ws.write(0, c, h)
+
+    # Impact thresholds: MFE must exceed asset-specific percentage
+    IMPACT_THRESHOLDS = {"BTC": 2.0, "XAU": 1.0, "GOLD": 1.0, "WTI": 1.5}
+
+    for r, row in enumerate(rows, start=1):
+        asset = (row["target_asset"] or "").upper()
+        action_raw = (row["action"] or "").upper()
+        entry = row["entry_price"]
+        exit_p = row["exit_price"]
+        max_p = row["max_price"]
+        min_p = row["min_price"]
+        max_ptime = row["max_price_time"] or 0
+        min_ptime = row["min_price_time"] or 0
+        entry_time_str = row["entry_time"] or ""
+        raw_verdict = (row["is_correct"] or "").strip().upper()
+        if raw_verdict == "WIN":
+            verdict = "正确"
+        elif raw_verdict == "LOSS":
+            verdict = "错误"
+        else:
+            verdict = raw_verdict or "—"
+        # ── Derived impact metrics (defensive against div-by-zero) ──
+        mfe_str = "—"
+        mae_str = "—"
+        time_to_extreme = "—"
+        high_impact = "否"
+
+        if entry and entry > 0:
+            try:
+                if action_raw == "BUY":
+                    if max_p is not None and max_p > 0:
+                        mfe_val = (max_p - entry) / entry * 100
+                        mfe_str = f"{mfe_val:+.2f}%"
+                    if min_p is not None and min_p > 0:
+                        mae_val = (min_p - entry) / entry * 100
+                        mae_str = f"{mae_val:+.2f}%"
+                    if max_ptime > 0:
+                        try:
+                            et_dt = datetime.fromisoformat(entry_time_str.replace("Z", "+00:00"))
+                            et_unix = int(et_dt.timestamp())
+                            minutes = round((max_ptime - et_unix) / 60, 1)
+                            if minutes >= 0:
+                                time_to_extreme = f"{minutes}"
+                        except (ValueError, TypeError, OSError):
+                            pass
+                elif action_raw == "SELL":
+                    if entry > 0:
+                        if min_p is not None and min_p > 0:
+                            mfe_val = (entry - min_p) / entry * 100
+                            mfe_str = f"{mfe_val:+.2f}%"
+                        if max_p is not None and max_p > 0:
+                            mae_val = (entry - max_p) / entry * 100
+                            mae_str = f"{mae_val:+.2f}%"
+                    if min_ptime > 0:
+                        try:
+                            et_dt = datetime.fromisoformat(entry_time_str.replace("Z", "+00:00"))
+                            et_unix = int(et_dt.timestamp())
+                            minutes = round((min_ptime - et_unix) / 60, 1)
+                            if minutes >= 0:
+                                time_to_extreme = f"{minutes}"
+                        except (ValueError, TypeError, OSError):
+                            pass
+
+                if mfe_str != "—":
+                    mfe_number = float(mfe_str.replace("%", "").replace("+", ""))
+                    threshold = IMPACT_THRESHOLDS.get(asset, 2.0)
+                    if mfe_number > threshold:
+                        high_impact = "是"
+            except Exception:
+                pass
+
+        ws.write(r, 0, row["id"])
+        ws.write(r, 1, _format_time(row["timestamp"]))
+        ws.write(r, 2, re.sub(r'\[hash:[a-fA-F0-9]+\]\s*', '', (row["news_text"] or "")[:200]))
+        ws.write(r, 3, asset)
+        action_display = "多" if action_raw == "BUY" else ("空" if action_raw == "SELL" else "观望")
+        ws.write(r, 4, action_display)
+        ws.write(r, 5, round(row["score"], 2) if row["score"] else 0)
+        ws.write(r, 6, entry)
+        ws.write(r, 7, max_p)
+        ws.write(r, 8, min_p)
+        ws.write(r, 9, exit_p)
+        ws.write(r, 10, mfe_str)
+        ws.write(r, 11, mae_str)
+        ws.write(r, 12, time_to_extreme)
+        ws.write(r, 13, high_impact)
+        ws.write(r, 14, verdict)
+        ws.write(r, 15, (row["vip_tag"] or "").replace("[", "").replace("]", ""))
+        # 主模型归因: 优先完整推导链，回退到短结论
+        ws.write(r, 16, ((row["reasoning_path"] or row["reasoning"] or "")[:2000]).strip())
+        # ── extra_models_consensus: 直接从 DB 列写入，已经是合法 JSON ──
+        raw_consensus = _safe(row, "extra_models_consensus") or ""
+        if isinstance(raw_consensus, str):
+            raw_consensus = raw_consensus.strip()
+        if raw_consensus:
+            # 校验是否为合法 JSON，非法则写入原始字符串
+            try:
+                parsed = json.loads(raw_consensus) if isinstance(raw_consensus, str) else raw_consensus
+                ws.write(r, 17, json.dumps(parsed, ensure_ascii=False))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                ws.write(r, 17, str(raw_consensus)[:2000])
+        else:
+            ws.write(r, 17, "")
+    wb.close()
+    data = output.getvalue()
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=trident_signals.xlsx"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# File Upload — Agent Chat attachments
+# ---------------------------------------------------------------------------
+
+@app.post("/api/agent_chat/upload")
+async def agent_chat_upload(
+    file: UploadFile = File(...),
+):
+    """Upload an attachment for Data Copilot conversations."""
+    # Validate size
+    content = await file.read()
+    size = len(content)
+    if size > config.MAX_UPLOAD_SIZE_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"error": f"File too large ({size} bytes, max {config.MAX_UPLOAD_SIZE_BYTES})"},
+        )
+
+    # Validate type
+    if file.content_type and file.content_type not in config.ALLOWED_UPLOAD_TYPES:
+        return JSONResponse(
+            status_code=415,
+            content={"error": f"Unsupported file type: {file.content_type}"},
+        )
+
+    # Save file
+    os.makedirs(config.UPLOAD_DIR, exist_ok=True)
+    import uuid
+    ext = ""
+    if "." in file.filename or file.filename is None:
+        pass  # keep original extension
+    else:
+        # Infer extension from content type
+        ext_map = {
+            "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+            "image/webp": ".webp", "application/pdf": ".pdf",
+            "text/plain": ".txt", "text/csv": ".csv", "text/html": ".html",
+        }
+        ext = ext_map.get(file.content_type, "")
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    dest_path = os.path.join(config.UPLOAD_DIR, safe_name)
+
+    with open(dest_path, "wb") as f:
+        f.write(content)
+
+    return JSONResponse(content={
+        "url": f"/uploads/{safe_name}",
+        "filename": file.filename or safe_name,
+        "size": size,
+        "content_type": file.content_type or "",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Agent Chat (Data Copilot) — Text-to-SQL + DB query
+# ---------------------------------------------------------------------------
+
+class AgentChatRequest(BaseModel):
+    user_message: str
+    active_market: str = "ALL"
+    context: Dict[str, Any] = {}
+
+class AgentChatResponse(BaseModel):
+    reply: str
+    sql: str = ""
+    rows: List[Dict[str, Any]] = []
+    error: str = ""
+
+# ── Agent LLM config: Aiping OpenAI-compatible endpoint ──
+
+def _agent_llm_client():
+    """Return the Aiping OpenAI-compatible client."""
+    import openai
+
+    if not config.AIPING_API_KEY:
+        raise RuntimeError("Aiping API key is not configured.")
+    return openai.OpenAI(
+        base_url=config.AIPING_BASE_URL,
+        api_key=config.AIPING_API_KEY,
+    )
+
+
+def _agent_llm_model() -> str:
+    return config.AIPING_MODEL
+
+# ── DB Schema description for the Agent LLM ──
+
+_SCHEMA_TEXT = """
+You are Trident Data Copilot, an expert quant trading analyst with read-only SQLite access.
+
+Tables & columns:
+
+  ai_decisions: id, news_id(FK→raw_news.id), created_at, suggested_action(BUY|SELL|HOLD),
+    sentiment_score(-1..+1), reasoning(short), reasoning_path(full chain-of-thought), market_category,
+    target_asset, vip_tag, entry_price, exit_price, max_price, min_price, max_price_time,
+    min_price_time, entry_time, is_correct(WIN|LOSS|""), settled(0|1), parent_id, child_count,
+    cluster_size, doubao_action(HOLD), doubao_reasoning,
+    extra_models_consensus(JSON: {"DeepSeek":{"action":"BUY","reasoning":"..."}, ...})
+
+  raw_news: id, timestamp, source, content(full news text), status(NEW|PROCESSING|DONE|FAILED)
+
+One ai_decisions row = one primary model decision + JSON-packed sub-model votes.
+Use date(ad.created_at) for date filters. LIKE is case-insensitive.
+json_extract(extra_models_consensus, '$.DeepSeek.action') pulls sub-model data.
+Default LIMIT 20 if not specified.
+
+Respond with a single valid JSON: {"sql": "<SELECT only or empty string>", "reply": "<Chinese explanation>"}
+
+IMPORTANT — when to return empty sql:
+- If the user is just greeting, chatting, saying thanks, or asking a question that does NOT require database access, set sql to "" and reply with a friendly Chinese greeting or acknowledgement.
+- Only populate sql when the user is explicitly asking about trading signals, positions, win/loss stats, model votes, news events, or anything that requires querying ai_decisions or raw_news.
+
+SQL rules:
+- SELECT queries ONLY. Never INSERT/UPDATE/DELETE/DROP/ALTER.
+- ORDER BY ad.id DESC for recent data.
+- GROUP BY/COUNT/AVG/SUM for stats.
+- NEVER access system tables or sqlite_master.
+"""
+
+# ── LLM-powered Text-to-SQL ──
+
+def _time_context() -> str:
+    """Return current system time for injection into LLM prompts."""
+    now = datetime.now()
+    return (
+        f"【重要上下文】当前系统精准时间是: {now.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"(星期{['一','二','三','四','五','六','日'][now.weekday()]})。"
+        f"当用户提到'今天'、'最近'、'昨天'、'本周'或省略年份的日期时，"
+        f"请务必以此时间为基准来计算SQL的时间范围，切勿自行猜测年份！"
+    )
+
+def _llm_text_to_sql_sync(user_message: str, active_market: str) -> tuple[str, str]:
+    """Call the LLM synchronously (runs in a thread via asyncio.to_thread)."""
+    client = _agent_llm_client()
+    model = _agent_llm_model()
+
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0.0,
+        max_tokens=800,
+        extra_body=config.AIPING_EXTRA_BODY,
+        messages=[
+            {"role": "system", "content": _SCHEMA_TEXT},
+            {"role": "system", "content": _time_context()},
+            {
+                "role": "user",
+                "content": (
+                    f"当前活跃市场: {active_market}\n"
+                    f"用户提问: {user_message}\n\n"
+                    f"请根据表结构生成SQL查询，返回JSON。"
+                ),
+            },
+        ],
+        response_format=({"type": "json_object"} if config.AIPING_JSON_MODE else None),
+    )
+
+    raw = resp.choices[0].message.content.strip()
+    result = json.loads(raw)
+    return result.get("reply", "查询完成"), result.get("sql", "")
+
+# ── Data-to-Text: second LLM pass for natural-language summary ──
+
+_SUMMARIZE_PROMPT = """You are a professional quantitative trader writing a concise internal briefing.
+
+Given the user's original question and a JSON array of database query results, produce a short, insightful answer in Chinese (≤150 characters).
+
+Rules:
+- Do NOT list every row. Extract the key pattern, trend, or answer.
+- Mention counts, dominant assets, price ranges, and win/loss when relevant.
+- Use professional but plain language. No markdown, no bullet points.
+- If results are empty, say so honestly.
+- Format: just the summary text, nothing else."""
+
+def _clean_rows_for_frontend(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip verbose/text-heavy columns so the frontend table stays compact."""
+    _STRIP_COLS = {
+        "reasoning", "reasoning_path", "extra_models_consensus",
+        "news_text", "content", "doubao_reasoning", "doubao_action",
+    }
+    cleaned = []
+    for r in rows:
+        cleaned.append({k: v for k, v in r.items() if k not in _STRIP_COLS})
+    return cleaned
+
+def _summarize_results_sync(user_message: str, rows: List[Dict[str, Any]]) -> str:
+    """Second LLM call: data → natural-language insight."""
+    # Only send first 5 rows to keep tokens low
+    sample = rows[:5]
+    # Also strip verbose fields from the sample sent to LLM
+    _STRIP_FOR_LLM = {"reasoning_path", "extra_models_consensus", "doubao_reasoning"}
+    sample_clean = [
+        {k: v for k, v in r.items() if k not in _STRIP_FOR_LLM}
+        for r in sample
+    ]
+    data_json = json.dumps(sample_clean, ensure_ascii=False, default=str)
+
+    client = _agent_llm_client()
+    model = _agent_llm_model()
+
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0.0,
+        max_tokens=300,
+        extra_body=config.AIPING_EXTRA_BODY,
+        messages=[
+            {"role": "system", "content": _SUMMARIZE_PROMPT},
+            {"role": "system", "content": _time_context()},
+            {
+                "role": "user",
+                "content": (
+                    f"用户提问: {user_message}\n"
+                    f"共 {len(rows)} 条结果，以下是前 {len(sample)} 条:\n"
+                    f"{data_json}"
+                ),
+            },
+        ],
+    )
+
+    return resp.choices[0].message.content.strip()
+
+@app.post("/api/agent_chat", response_model=AgentChatResponse)
+async def agent_chat_endpoint(req: AgentChatRequest):
+    """
+    Data Copilot — Two-pass LLM:
+      1. Text-to-SQL → execute → get rows
+      2. Data-to-Text → natural-language insight summary
+    """
+    # ── Step 1: LLM Text-to-SQL ──
+    try:
+        explanation, sql = await asyncio.to_thread(
+            _llm_text_to_sql_sync, req.user_message, req.active_market
+        )
+    except Exception as e:
+        return AgentChatResponse(
+            reply="抱歉，LLM 调用失败，请稍后重试或换个问法。",
+            error=f"LLM error: {type(e).__name__}",
+        )
+
+    # ── Step 2: Empty SQL = chitchat ──
+    if not sql or not sql.strip():
+        return AgentChatResponse(reply=explanation, sql="", rows=[])
+
+    # ── Step 3: Safety gate ──
+    stripped = sql.strip().upper()
+    if not stripped.startswith("SELECT"):
+        return AgentChatResponse(
+            reply="出于安全考虑，我只执行 SELECT 查询。请重新描述你的需求。",
+            sql=sql.strip(),
+            error="Non-SELECT statement blocked",
+        )
+
+    if any(bad in stripped for bad in ("SQLITE_MASTER", "PRAGMA", "ATTACH", "DETACH")):
+        return AgentChatResponse(
+            reply="不允许访问系统表或执行管理命令。",
+            sql=sql.strip(),
+            error="Forbidden system access blocked",
+        )
+
+    # ── Step 4: Execute SQL ──
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(sql)
+            rows_raw = await cursor.fetchall()
+            await cursor.close()
+
+        rows = [dict(r) for r in rows_raw]
+
+        if not rows:
+            return AgentChatResponse(
+                reply="没有找到匹配的数据。换个条件试试？",
+                sql=sql.strip(),
+                rows=[],
+            )
+
+        # ── Step 5: Second LLM pass — data → natural-language insight ──
+        try:
+            summary = await asyncio.to_thread(
+                _summarize_results_sync, req.user_message, rows
+            )
+        except Exception:
+            summary = f"查询返回 {len(rows)} 条记录，详见下方表格。"
+
+        # ── Step 6: Clean rows for compact frontend table ──
+        clean_rows = _clean_rows_for_frontend(rows)
+
+        return AgentChatResponse(
+            reply=summary,
+            sql=sql.strip(),
+            rows=clean_rows,
+        )
+
+    except Exception as e:
+        return AgentChatResponse(
+            reply=f"SQL 执行出错，请换个问法试试。",
+            sql=sql.strip(),
+            error=str(e),
+        )
+
+
+@app.get("/uploads/{filename:path}")
+async def serve_upload(filename: str):
+    """Serve uploaded files from the uploads directory."""
+    import mimetypes
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(config.UPLOAD_DIR, safe_name)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    content_type, _ = mimetypes.guess_type(safe_name)
+    content_type = content_type or "application/octet-stream"
+    with open(file_path, "rb") as f:
+        content = f.read()
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=content_type,
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
+
+
+@app.get("/api/macro/context")
+async def get_macro_context(refresh: int = 0):
+    """盘面结构 / 舆情 / 加息预期 / 资金流向。refresh=1 才打外部源。"""
+    if refresh:
+        pack = await asyncio.to_thread(macro_context.build_context)
+        return pack
+    latest = await asyncio.to_thread(macro_context.latest_snapshot, 80)
+    if not latest:
+        return {"status": "empty", "items": [], "note": "尚无沉淀，带 refresh=1 拉取"}
+    return {"status": "ok", "items": latest}
+
+
+@app.get("/api/health")
+async def health_check():
+    """Liveness probe."""
+    return {
+        "status": "ok",
+        "db_path": DB_PATH,
+        "db_exists": os.path.exists(DB_PATH),
+        "sse_clients": len(_SSE_QUEUES),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trading System API — 精简接口供外部交易系统对接
+# ---------------------------------------------------------------------------
+
+@app.get("/api/trading/signals")
+async def get_trading_signals(
+    asset: str = "",
+    action: str = "",
+    limit: int = 20,
+    settled: int = -1,  # -1=全部, 0=未结算, 1=已结算
+):
+    """
+    交易系统对接接口 — 返回精简版信号数据。
+
+    Query params:
+      asset   — 品种过滤，如 BTC / XAU / WTI / ETH（留空=全部）
+      action  — 方向过滤，BUY / SELL / HOLD（留空=全部）
+      limit   — 返回条数，默认 20，最大 200
+      settled — 结算状态，0=未结算 / 1=已结算 / -1=全部（默认）
+
+    返回字段:
+      signal_id, news_time, asset, action, score, reasoning, reasoning_path,
+      market_category, event_strength, direct_catalyst, prediction_type,
+      market_confirmation, entry_price, exit_price, is_correct, settled, created_at
+    """
+    limit = min(max(limit, 1), 200)
+
+    where_clauses = []
+    params: List[Any] = []
+
+    if asset:
+        where_clauses.append("UPPER(ad.target_asset) = ?")
+        params.append(asset.upper())
+    if action:
+        where_clauses.append("UPPER(ad.suggested_action) = ?")
+        params.append(action.upper())
+    if settled >= 0:
+        where_clauses.append("ad.settled = ?")
+        params.append(settled)
+
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""
+            SELECT
+                ad.id,
+                rn.timestamp AS news_time,
+                UPPER(ad.target_asset) AS asset,
+                UPPER(ad.suggested_action) AS action,
+                ad.sentiment_score AS score,
+                ad.reasoning,
+                ad.reasoning_path,
+                ad.market_category,
+                ad.event_strength,
+                ad.direct_catalyst,
+                ad.prediction_type,
+                ad.market_confirmation,
+                ad.entry_price,
+                ad.exit_price,
+                ad.is_correct,
+                ad.settled,
+                ad.created_at
+            FROM ai_decisions ad
+            INNER JOIN raw_news rn ON rn.id = ad.news_id
+            WHERE {where_sql}
+            ORDER BY ad.id DESC
+            LIMIT ?
+            """,
+            params + [limit],
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/trading/latest")
+async def get_latest_signals():
+    """
+    交易系统对接接口 — 每个品种的最新一条信号。
+
+    返回: 按品种分组的最近信号，含 score/action/reasoning。
+    覆盖品种: BTC, ETH, XAU, WTI, SOL
+    """
+    assets = ("BTC", "ETH", "XAU", "WTI", "SOL")
+    result: Dict[str, Any] = {}
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        for a in assets:
+            cursor = await db.execute(
+                """
+                SELECT
+                    ad.id,
+                    rn.timestamp AS news_time,
+                    UPPER(ad.target_asset) AS asset,
+                    UPPER(ad.suggested_action) AS action,
+                    ad.sentiment_score AS score,
+                    ad.reasoning,
+                    ad.reasoning_path,
+                    ad.market_category,
+                    ad.event_strength,
+                    ad.direct_catalyst,
+                    ad.prediction_type,
+                    ad.market_confirmation,
+                    ad.entry_price,
+                    ad.created_at
+                FROM ai_decisions ad
+                INNER JOIN raw_news rn ON rn.id = ad.news_id
+                WHERE UPPER(ad.target_asset) = ?
+                ORDER BY ad.id DESC
+                LIMIT 1
+                """,
+                (a,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            result[a] = dict(row) if row else None
+    return result
+
+
+def _authorize_trading_manager(token: str | None) -> None:
+    expected = config.TRADING_MANAGER_TOKEN
+    if expected and token != expected:
+        raise HTTPException(status_code=401, detail="invalid X-Trading-Token")
+
+
+@app.post("/api/trading/manager/start")
+async def start_trading_manager(x_trading_token: str | None = Header(default=None)):
+    _authorize_trading_manager(x_trading_token)
+    if not config.BINANCE_API_KEY or not config.BINANCE_API_SECRET:
+        raise HTTPException(status_code=400, detail="BINANCE_API_KEY / BINANCE_API_SECRET 未配置")
+    return await asyncio.to_thread(_TRADING_MANAGER.start)
+
+
+@app.post("/api/trading/manager/stop")
+async def stop_trading_manager(x_trading_token: str | None = Header(default=None)):
+    _authorize_trading_manager(x_trading_token)
+    return await asyncio.to_thread(_TRADING_MANAGER.stop)
+
+
+@app.get("/api/trading/manager/status")
+async def trading_manager_status(x_trading_token: str | None = Header(default=None)):
+    _authorize_trading_manager(x_trading_token)
+    return _TRADING_MANAGER.status()
+
+
+@app.get("/api/trading/manager/logs")
+async def trading_manager_logs(tail: int = 200, x_trading_token: str | None = Header(default=None)):
+    _authorize_trading_manager(x_trading_token)
+    lines = await asyncio.to_thread(_TRADING_MANAGER.logs, tail)
+    return {"lines": [line.rstrip("\r\n") for line in lines]}
+
+
+# -- Replay endpoints (信号复盘看板 · 模拟盘) ----------------------------
+
+def _build_simulated_klines(
+    *,
+    entry_time_ts: int,
+    entry_price: float,
+    max_price: float | None,
+    min_price: float | None,
+    exit_price: float | None,
+    asset: str,
+    hours_before: int = 6,
+    hours_after: int = 6,
+) -> list[dict]:
+    """
+    Build a simulated 1-hour K-line series around the signal's entry_time.
+
+    The series is anchored on ``entry_price`` and shaped so that the bar
+    covering the entry moment has open == entry_price, and the highest /
+    lowest extreme prices in the post-entry window match the recorded
+    ``max_price`` / ``min_price`` (if available). This is a *paper-trading*
+    visual reconstruction — it is NOT real market data, and the frontend
+    surfaces a "模拟盘" badge next to the chart.
+    """
+    import math
+    import random
+
+    if entry_price <= 0:
+        entry_price = 100.0
+
+    asset_upper = (asset or "").upper()
+    base_jitter = max(entry_price * 0.0035, 0.01)
+
+    bars_before = max(hours_before, 1)
+    bars_after = max(hours_after, 1)
+    total = bars_before + 1 + bars_after  # +1 for the entry bar
+
+    # Anchor on the entry hour (drop minutes/seconds)
+    entry_dt = datetime.fromtimestamp(entry_time_ts, TZ_SHANGHAI).replace(
+        minute=0, second=0, microsecond=0
+    )
+    start_dt = entry_dt - timedelta(hours=bars_before)
+
+    rng = random.Random(int(entry_time_ts) ^ hash(asset_upper) & 0xFFFFFFFF)
+
+    # Walk forward and let max/min guide the post-entry path
+    bars: list[dict] = []
+    last_close = entry_price
+    # Pre-entry path: gentle mean-reversion around entry_price
+    for i in range(bars_before):
+        ts = int((start_dt + timedelta(hours=i)).timestamp())
+        drift = rng.uniform(-base_jitter, base_jitter)
+        o = last_close + drift * 0.3
+        c = o + drift * 0.7
+        h = max(o, c) + rng.uniform(0, base_jitter * 0.4)
+        lo = min(o, c) - rng.uniform(0, base_jitter * 0.4)
+        bars.append({
+            "time": ts,
+            "open": round(o, 4),
+            "high": round(h, 4),
+            "low": round(lo, 4),
+            "close": round(c, 4),
+            "volume": int(rng.uniform(2000, 12000)),
+        })
+        last_close = c
+
+    # Entry bar (the trigger bar) — open at entry_price, bias close toward
+    # the action direction so the chart visually "moves" on the signal.
+    o = entry_price
+    direction_bias = 1.0 if asset_upper in {"XAU", "GOLD"} else 1.0
+    c = o + rng.uniform(-base_jitter * 0.6, base_jitter * 0.6) * direction_bias
+    bars.append({
+        "time": int(entry_dt.timestamp()),
+        "open": round(o, 4),
+        "high": round(max(o, c) + base_jitter * 0.3, 4),
+        "low":  round(min(o, c) - base_jitter * 0.3, 4),
+        "close": round(c, 4),
+        "volume": int(rng.uniform(8000, 25000)),
+    })
+    last_close = c
+
+    # Post-entry path: force the high/low extremes (if recorded) to appear.
+    target_high = max_price if (max_price and max_price > 0) else None
+    target_low = min_price if (min_price and min_price > 0) else None
+    ext_pos = rng.randrange(1, bars_after + 1)  # where the high lives
+    ext_low_pos = rng.randrange(1, bars_after + 1)  # where the low lives
+
+    for i in range(1, bars_after + 1):
+        ts = int((entry_dt + timedelta(hours=i)).timestamp())
+        o = last_close
+        # Determine this bar's high/low targets
+        this_high = None
+        this_low = None
+        if target_high is not None and i == ext_pos:
+            this_high = target_high
+        if target_low is not None and i == ext_low_pos:
+            this_low = target_low
+
+        if this_high is not None or this_low is not None:
+            # Build an extreme bar that respects both bounds.
+            hi = this_high if this_high is not None else (o + base_jitter * 0.5)
+            lo = this_low if this_low is not None else (o - base_jitter * 0.5)
+            # Make sure high >= low
+            if hi < lo:
+                hi, lo = lo, hi
+            c = (hi + lo) / 2 + rng.uniform(-base_jitter * 0.2, base_jitter * 0.2)
+        else:
+            drift = rng.uniform(-base_jitter, base_jitter)
+            c = o + drift
+            hi = max(o, c) + rng.uniform(0, base_jitter * 0.4)
+            lo = min(o, c) - rng.uniform(0, base_jitter * 0.4)
+
+        bars.append({
+            "time": ts,
+            "open": round(o, 4),
+            "high": round(hi, 4),
+            "low": round(lo, 4),
+            "close": round(c, 4),
+            "volume": int(rng.uniform(3000, 18000)),
+        })
+        last_close = c
+
+    return bars
+
+
+@app.get("/api/replay/signals")
+async def get_replay_signals(
+    asset: str = "",
+    action: str = "",
+    settled: int = 1,  # 0=未结算 1=已结算 -1=全部（默认只看已结算，便于复盘）
+    limit: int = 100,
+):
+    """
+    复盘看板列表接口：返回所有 EXECUTED 已结算的信号，含完整复盘字段。
+
+    关键字段：entry_price, exit_price, max_price, min_price, max_price_time,
+    min_price_time, mfe_pct, mae_pct, forward_pnl, event_strength,
+    extra_models_consensus, reasoning, reasoning_path, is_correct。
+
+    Query params:
+      asset   — 品种过滤，如 BTC / XAU / WTI / ETH
+      action  — 方向 BUY/SELL/HOLD
+      settled — 0=未结算 1=已结算 -1=全部
+      limit   — 返回条数，默认 100，最大 500
+    """
+    limit = min(max(limit, 1), 500)
+
+    where_clauses = []
+    params: List[Any] = []
+
+    if asset:
+        where_clauses.append("UPPER(ad.target_asset) = ?")
+        params.append(asset.upper())
+    if action:
+        where_clauses.append("UPPER(ad.suggested_action) = ?")
+        params.append(action.upper())
+    if settled >= 0:
+        where_clauses.append("ad.settled = ?")
+        params.append(settled)
+    # 模拟盘只看有 entry_price 的已结算信号
+    where_clauses.append("ad.entry_price IS NOT NULL AND ad.entry_price > 0")
+
+    where_sql = " AND ".join(where_clauses)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""
+            SELECT
+                ad.id,
+                ad.news_id,
+                rn.timestamp AS news_time,
+                rn.source,
+                rn.content AS news_text,
+                UPPER(ad.target_asset) AS asset,
+                UPPER(ad.suggested_action) AS action,
+                ad.sentiment_score AS score,
+                ad.reasoning,
+                ad.reasoning_path,
+                ad.market_category,
+                ad.event_strength,
+                ad.direct_catalyst,
+                ad.prediction_type,
+                ad.market_confirmation,
+                ad.event_phase,
+                ad.expected_horizon,
+                ad.invalidation_condition,
+                ad.decision_context,
+                ad.entry_price,
+                ad.exit_price,
+                ad.max_price,
+                ad.min_price,
+                ad.max_price_time,
+                ad.min_price_time,
+                ad.entry_time,
+                ad.is_correct,
+                ad.settled,
+                ad.mfe_pct,
+                ad.mae_pct,
+                ad.forward_pnl,
+                ad.mfe_time_mins,
+                ad.extra_models_consensus,
+                ad.doubao_action,
+                ad.doubao_reasoning,
+                ad.cluster_size,
+                ad.timeframe_match,
+                ad.created_at,
+                ad.strategy_id,
+                ad.strategy_version_id,
+                s.name AS strategy_name,
+                sv.version AS strategy_version,
+                sv.params AS strategy_params
+            FROM ai_decisions ad
+            INNER JOIN raw_news rn ON rn.id = ad.news_id
+            LEFT JOIN strategies s ON s.id = ad.strategy_id
+            LEFT JOIN strategy_versions sv ON sv.id = ad.strategy_version_id
+            WHERE {where_sql}
+            ORDER BY ad.id DESC
+            LIMIT ?
+            """,
+            params + [limit],
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+    # JSON-serialize the consensus field if present (it's stored as TEXT JSON)
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        for json_field in ("extra_models_consensus", "strategy_params"):
+            value = d.get(json_field)
+            if value and isinstance(value, str):
+                try:
+                    d[json_field] = json.loads(value)
+                except Exception:
+                    pass
+        # Ensure news_time / entry_time are ISO strings
+        for k in ("news_time", "entry_time", "created_at"):
+            v = d.get(k)
+            if v is None:
+                continue
+            if hasattr(v, "isoformat"):
+                d[k] = v.isoformat()
+            elif not isinstance(v, str):
+                d[k] = str(v)
+        out.append(d)
+    return out
+
+
+def _paper_metrics(signal: Dict[str, Any], current_price: Optional[float]) -> Dict[str, Any]:
+    entry = float(signal.get("entry_price") or 0.0)
+    action = str(signal.get("action") or "").upper()
+    high = float(signal.get("max_price") or entry)
+    low = float(signal.get("min_price") or entry)
+    if current_price is not None and current_price > 0:
+        high = max(high, current_price)
+        low = min(low, current_price)
+    pnl: Optional[float] = None
+    mfe = 0.0
+    mae = 0.0
+    if entry > 0:
+        if action == "BUY":
+            if current_price is not None:
+                pnl = (current_price - entry) / entry * 100
+            mfe = (high - entry) / entry * 100
+            mae = (entry - low) / entry * 100
+        elif action == "SELL":
+            if current_price is not None:
+                pnl = (entry - current_price) / entry * 100
+            mfe = (entry - low) / entry * 100
+            mae = (high - entry) / entry * 100
+    params = signal.get("strategy_params") or strategy_store.default_params()
+    notional = float(params.get("notional_usdt") or 0.0)
+    leverage = float(params.get("leverage") or 1.0)
+    return {
+        **signal,
+        "current_price": current_price,
+        "current_pnl_pct": round(pnl, 4) if pnl is not None else None,
+        "current_pnl_usdt": round(notional * leverage * pnl / 100, 4) if pnl is not None else None,
+        "live_mfe_pct": round(max(0.0, mfe), 4),
+        "live_mae_pct": round(max(0.0, mae), 4),
+        "pricing_status": "LIVE" if current_price is not None else "UNAVAILABLE",
+        "paper_status": "SETTLED" if int(signal.get("settled") or 0) else "TRACKING",
+    }
+
+
+class PaperTradingBody(BaseModel):
+    is_running: Optional[bool] = None
+    tracks: Optional[List[str]] = None
+    gate_enabled: Optional[bool] = None
+    news_enabled: Optional[bool] = None
+    news_daily_target: Optional[int] = None
+    news_sources: Optional[Dict[str, bool]] = None
+
+
+def _combined_replay_settings() -> Dict[str, Any]:
+    trading = paper_trading.get_settings()
+    news = news_sources.get_settings()
+    return {**trading, "news_settings": news}
+
+
+def _apply_replay_settings(body: PaperTradingBody) -> Dict[str, Any]:
+    current = paper_trading.get_settings()
+    next_running = current["is_running"] if body.is_running is None else bool(body.is_running)
+    next_tracks = current["tracks"] if body.tracks is None else list(body.tracks)
+    if body.is_running is not None or body.tracks is not None or body.gate_enabled is not None:
+        paper_trading.set_settings(
+            next_running,
+            next_tracks,
+            gate_enabled=body.gate_enabled,
+        )
+    if body.news_enabled is not None or body.news_daily_target is not None or body.news_sources is not None:
+        news_sources.set_settings(
+            enabled=body.news_enabled,
+            daily_target=body.news_daily_target,
+            sources=body.news_sources,
+        )
+    return _combined_replay_settings()
+
+
+@app.get("/api/replay/settings")
+async def get_replay_settings():
+    return await asyncio.to_thread(_combined_replay_settings)
+
+
+@app.post("/api/replay/settings")
+async def update_replay_settings(body: PaperTradingBody):
+    try:
+        return await asyncio.to_thread(_apply_replay_settings, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class NewsSourceBody(BaseModel):
+    enabled: Optional[bool] = None
+    daily_target: Optional[int] = None
+    sources: Optional[Dict[str, bool]] = None
+
+
+@app.get("/api/news/sources")
+async def get_news_sources():
+    return await asyncio.to_thread(news_sources.get_settings)
+
+
+@app.post("/api/news/sources")
+async def update_news_sources(body: NewsSourceBody):
+    return await asyncio.to_thread(
+        news_sources.set_settings,
+        enabled=body.enabled,
+        daily_target=body.daily_target,
+        sources=body.sources,
+    )
+
+
+def _replay_pairs(settings: Dict[str, Any], market: Dict[str, Any]) -> list[Dict[str, Any]]:
+    item_map = {str(item.get("asset") or "").upper(): item for item in market.get("items", [])}
+    symbols = {
+        "crypto": (("BTC", "BTC/USDT"), ("ETH", "ETH/USDT"), ("SOL", "SOL/USDT")),
+        "gold": (("XAU", "XAU/USD"),),
+        "oil": (("WTI", "WTI/USD"),),
+    }
+    pairs: list[Dict[str, Any]] = []
+    for track in settings.get("tracks", []):
+        for asset, symbol in symbols.get(track, ()):
+            item = item_map.get(asset)
+            price = item.get("price") if item else _get_current_price(asset)
+            pairs.append({
+                "asset": asset,
+                "symbol": symbol,
+                "track": track,
+                "price": round(float(price), 6) if isinstance(price, (int, float)) and price > 0 else None,
+                "change24h": round(float(item.get("change24h")), 4) if item and item.get("change24h") is not None else None,
+                "source": item.get("source") if item else "fallback",
+                "source_count": int(item.get("sourceCount") or 1) if item else (1 if price else 0),
+                "status": "LIVE" if price else "UNAVAILABLE",
+            })
+    return pairs
+
+
+def _llm_performance_sync(model_id: str) -> Dict[str, Any]:
+    conn = db.get_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """SELECT COUNT(*) AS settled,
+                      SUM(CASE WHEN is_correct='WIN' THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN is_correct='LOSS' THEN 1 ELSE 0 END) AS losses,
+                      SUM(CASE WHEN is_correct IN ('HOLD','BREAKEVEN') THEN 1 ELSE 0 END) AS holds,
+                      AVG(forward_pnl) AS avg_pnl,
+                      SUM(forward_pnl) AS total_pnl
+               FROM ai_decisions
+               WHERE settled=1 AND entry_price>0""",
+        ).fetchone()
+        settled = int(row["settled"] or 0)
+        wins = int(row["wins"] or 0)
+        losses = int(row["losses"] or 0)
+        decided = wins + losses
+        accuracy = wins / decided * 100 if decided else None
+        total_pnl = float(row["total_pnl"] or 0.0)
+        return {
+            "model_id": model_id,
+            "settled": settled,
+            "wins": wins,
+            "losses": losses,
+            "holds": int(row["holds"] or 0),
+            "accuracy_pct": round(accuracy, 2) if accuracy is not None else None,
+            "avg_pnl_pct": round(float(row["avg_pnl"] or 0.0), 4) if settled else None,
+            "total_pnl_pct": round(total_pnl, 4),
+            "profitable": total_pnl > 0 if settled else None,
+            "verdict": "样本不足，继续收集真实结算结果" if decided < 10 else ("历史结算表现为正" if total_pnl > 0 else "历史结算表现未盈利"),
+            "method": "以该 LLM 已建立且真实结算的模拟交易计算，不使用模型自评",
+        }
+    finally:
+        conn.close()
+
+
+def _run_feedback_sync(run_id: Optional[int]) -> Dict[str, Any]:
+    if not run_id:
+        return {"stage": "STOPPED", "message": "模拟操盘未启动", "evaluated": 0, "passed": 0, "rejected": 0, "latest": []}
+    conn = db.get_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        run = conn.execute("SELECT started_at FROM paper_trading_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return {"stage": "STOPPED", "message": "运行记录不存在", "evaluated": 0, "passed": 0, "rejected": 0, "latest": []}
+        rows = conn.execute(
+            """SELECT id, target_asset, suggested_action, evidence_confidence,
+                      evidence_action, trade_gate_reason, entry_price, created_at
+               FROM ai_decisions
+               WHERE created_at>=? AND paper_trading_run_id=?
+               ORDER BY id DESC LIMIT 20""",
+            (run["started_at"], run_id),
+        ).fetchall()
+        latest = [dict(row) for row in rows]
+        passed = sum(item["entry_price"] is not None for item in latest)
+        rejected = len(latest) - passed
+        stage = "POSITION_OPEN" if passed else ("SIGNAL_REJECTED" if rejected else "WAITING_NEWS")
+        message = (
+            "已自动建仓并跟踪实时盈亏" if passed
+            else "已收到信号，但未通过 LLM 多证据与策略闸门" if rejected
+            else "运行正常，正在等待所选赛道的新新闻信号"
+        )
+        return {"stage": stage, "message": message, "evaluated": len(latest), "passed": passed, "rejected": rejected, "latest": latest[:5]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/replay/positions")
+async def get_replay_positions(limit: int = 200):
+    signals = await get_replay_signals(settled=-1, limit=limit)
+    assets = sorted({str(item["asset"]).upper() for item in signals if not item["settled"]})
+    values = await asyncio.gather(
+        *(asyncio.to_thread(_get_current_price, asset) for asset in assets),
+        return_exceptions=True,
+    )
+    prices = {
+        asset: value for asset, value in zip(assets, values)
+        if isinstance(value, (int, float)) and value > 0
+    }
+    current = strategy_store.get_current_strategy()
+    trading_settings = paper_trading.get_settings()
+    market = await asyncio.to_thread(_cached_market_prices)
+    pairs = await asyncio.to_thread(_replay_pairs, trading_settings, market)
+    feedback = await asyncio.to_thread(_run_feedback_sync, trading_settings.get("active_run_id"))
+    model_id = str((trading_settings.get("active_run") or {}).get("model_id") or config.get_selected_ai_model_id())
+    llm_performance = await asyncio.to_thread(_llm_performance_sync, model_id)
+    quick_evaluation = await asyncio.to_thread(quick_sim.snapshot)
+    positions = [
+        _paper_metrics(
+            item,
+            float(item["exit_price"]) if item["settled"] and item.get("exit_price") else prices.get(str(item["asset"]).upper()),
+        )
+        for item in signals
+    ]
+    realized = sum(
+        float(item.get("current_pnl_usdt") or 0.0)
+        for item in positions if item["settled"]
+    )
+    tracking = [item for item in positions if not item["settled"]]
+    unrealized_values = [item.get("current_pnl_usdt") for item in tracking]
+    unpriced = sum(value is None for value in unrealized_values)
+    unrealized = sum(float(value or 0.0) for value in unrealized_values)
+    used_margin = sum(
+        float((item.get("strategy_params") or strategy_store.default_params()).get("notional_usdt") or 0.0)
+        for item in tracking
+    )
+    initial = config.PAPER_INITIAL_EQUITY_USDT
+    equity = initial + realized + unrealized
+    return {
+        "current_strategy": current,
+        "trading_settings": trading_settings,
+        "news_settings": news_sources.get_settings(),
+        "pairs": pairs,
+        "market_status": market.get("status", "unavailable"),
+        "market_sources": market.get("sources", {}),
+        "strategy_feedback": feedback,
+        "llm_performance": llm_performance,
+        "quick_sim": quick_evaluation,
+        "positions": positions,
+        "account": {
+            "initial_equity_usdt": round(initial, 4),
+            "realized_pnl_usdt": round(realized, 4),
+            "unrealized_pnl_usdt": round(unrealized, 4) if not unpriced else None,
+            "current_equity_usdt": round(equity, 4) if not unpriced else None,
+            "used_margin_usdt": round(used_margin, 4),
+            "available_equity_usdt": round(equity - used_margin, 4) if not unpriced else None,
+            "unpriced_positions": unpriced,
+        },
+        "updated_at_ms": int(time.time() * 1000),
+        "is_paper_trading": True,
+        "pricing_note": "实时浮盈亏按当前行情估算，未计手续费、滑点和资金费率。",
+    }
+
+
+@app.get("/api/replay/stats")
+async def get_replay_stats(strategy_id: Optional[int] = None, version_id: Optional[int] = None):
+    """当前策略模拟交易统计，胜率只使用有明确胜负的已结算交易。"""
+    strategy_filter = "entry_price IS NOT NULL AND entry_price > 0"
+    filter_params: tuple[Any, ...] = ()
+    if strategy_id is not None:
+        strategy_filter += " AND strategy_id = ?"
+        filter_params += (strategy_id,)
+    if version_id is not None:
+        strategy_filter += " AND strategy_version_id = ?"
+        filter_params += (version_id,)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN settled = 0 THEN 1 ELSE 0 END) AS tracking,
+                SUM(CASE WHEN settled = 1 THEN 1 ELSE 0 END) AS settled,
+                SUM(CASE WHEN is_correct = 'WIN' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN is_correct = 'LOSS' THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN is_correct IN ('HOLD', 'BREAKEVEN') THEN 1 ELSE 0 END) AS holds,
+                AVG(CASE WHEN settled = 1 THEN forward_pnl END) AS avg_pnl,
+                AVG(CASE WHEN settled = 1 THEN mfe_pct END) AS avg_mfe,
+                AVG(CASE WHEN settled = 1 THEN mae_pct END) AS avg_mae,
+                MAX(CASE WHEN settled = 1 THEN forward_pnl END) AS best_trade,
+                MIN(CASE WHEN settled = 1 THEN forward_pnl END) AS worst_trade
+            FROM ai_decisions
+            WHERE {strategy_filter}
+            """,
+            filter_params,
+        )
+        overall = dict(await cur.fetchone())
+        await cur.close()
+
+        cur = await db.execute(
+            f"""
+            SELECT
+                UPPER(target_asset) AS asset,
+                COUNT(*) AS total,
+                SUM(CASE WHEN is_correct = 'WIN' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN is_correct = 'LOSS' THEN 1 ELSE 0 END) AS losses,
+                AVG(forward_pnl) AS avg_pnl
+            FROM ai_decisions
+            WHERE settled = 1 AND {strategy_filter}
+            GROUP BY UPPER(target_asset)
+            ORDER BY total DESC
+            """,
+            filter_params,
+        )
+        by_asset = [dict(r) for r in await cur.fetchall()]
+        await cur.close()
+
+        cur = await db.execute(
+            f"""
+            SELECT
+                UPPER(suggested_action) AS action,
+                COUNT(*) AS total,
+                SUM(CASE WHEN is_correct = 'WIN' THEN 1 ELSE 0 END) AS wins,
+                AVG(forward_pnl) AS avg_pnl
+            FROM ai_decisions
+            WHERE settled = 1 AND {strategy_filter}
+            GROUP BY UPPER(suggested_action)
+            """,
+            filter_params,
+        )
+        by_action = [dict(r) for r in await cur.fetchall()]
+        await cur.close()
+
+    decided = (overall.get("wins") or 0) + (overall.get("losses") or 0)
+    for key in ("total", "tracking", "settled", "wins", "losses", "holds"):
+        overall[key] = int(overall.get(key) or 0)
+    overall["winrate"] = round((overall.get("wins") or 0) / decided, 4) if decided else 0.0
+    return {
+        "overall": overall,
+        "strategy_id": strategy_id,
+        "strategy_version_id": version_id,
+        "by_asset": by_asset,
+        "by_action": by_action,
+        "is_paper_trading": True,
+    }
+
+
+@app.get("/api/replay/signal/{signal_id}/kline")
+async def get_replay_signal_kline(signal_id: int):
+    """根据信号 ID 生成模拟盘 K 线（用 entry/max/min 反推 1 小时 K 线序列）。"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT
+                ad.id, ad.entry_price, ad.exit_price, ad.max_price,
+                ad.min_price, ad.max_price_time, ad.min_price_time,
+                ad.target_asset, ad.entry_time
+            FROM ai_decisions ad
+            WHERE ad.id = ?
+            """,
+            (signal_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"signal {signal_id} not found")
+
+    d = dict(row)
+    if not d.get("entry_price"):
+        raise HTTPException(status_code=400, detail="signal has no entry_price")
+
+    # Convert entry_time to epoch seconds
+    entry_time = d.get("entry_time")
+    if isinstance(entry_time, str):
+        try:
+            entry_time = datetime.fromisoformat(entry_time.replace("Z", "+00:00"))
+        except Exception:
+            entry_time = datetime.now(TZ_SHANGHAI)
+    elif entry_time is None:
+        entry_time = datetime.now(TZ_SHANGHAI)
+    if entry_time.tzinfo is None:
+        entry_time = entry_time.replace(tzinfo=TZ_SHANGHAI)
+    entry_ts = int(entry_time.timestamp())
+
+    klines = _build_simulated_klines(
+        entry_time_ts=entry_ts,
+        entry_price=float(d["entry_price"]),
+        max_price=d.get("max_price"),
+        min_price=d.get("min_price"),
+        exit_price=d.get("exit_price"),
+        asset=str(d.get("target_asset") or ""),
+    )
+    action = str(d.get("suggested_action") or "HOLD").upper()
+    try:
+        params = json.loads(d.get("strategy_params") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        params = {}
+    trailing = float(params.get("trailing_callback_rate") or 0.0)
+    entry_price = float(d["entry_price"])
+    max_price = float(d["max_price"]) if d.get("max_price") else entry_price
+    min_price = float(d["min_price"]) if d.get("min_price") else entry_price
+    if action == "BUY":
+        stop_loss = max_price * (1 - trailing / 100) if trailing > 0 else entry_price * (1 - 0.8 / 100)
+        take_profit = max_price
+    elif action == "SELL":
+        stop_loss = min_price * (1 + trailing / 100) if trailing > 0 else entry_price * (1 + 0.8 / 100)
+        take_profit = min_price
+    else:
+        stop_loss = None
+        take_profit = None
+    markers = [{
+        "time": entry_ts,
+        "position": "belowBar" if action == "BUY" else "aboveBar",
+        "color": "#2ebd85" if action == "BUY" else "#f6465d",
+        "shape": "arrowUp" if action == "BUY" else "arrowDown",
+        "text": f"{action} {entry_price}",
+        "kind": "entry",
+    }]
+    if d.get("exit_price"):
+        markers.append({
+            "time": int(d["max_price_time"] or d["min_price_time"] or entry_ts),
+            "position": "aboveBar" if action == "BUY" else "belowBar",
+            "color": "#9aa3af",
+            "shape": "circle",
+            "text": f"EXIT {float(d['exit_price']):.4f}",
+            "kind": "exit",
+        })
+    return {
+        "signal_id": signal_id,
+        "asset": d.get("target_asset"),
+        "action": action,
+        "entry_price": entry_price,
+        "entry_time": entry_ts,
+        "exit_price": d.get("exit_price"),
+        "stop_loss": round(stop_loss, 6) if stop_loss else None,
+        "take_profit": round(take_profit, 6) if take_profit else None,
+        "trailing_callback_rate": trailing,
+        "invalidation_condition": d.get("invalidation_condition") or "",
+        "settled": int(d.get("settled") or 0),
+        "is_paper_trading": True,
+        "markers": markers,
+        "klines": klines,
+    }
+
+
+# -- Strategy library + honest backtest ------------------------------------
+
+class StrategyCreateBody(BaseModel):
+    name: str
+    description: str = ""
+    params: Dict[str, Any] = {}
+
+
+class StrategyVersionBody(BaseModel):
+    params: Dict[str, Any]
+    note: str = ""
+    source: str = "manual"
+
+
+class StrategyActivateBody(BaseModel):
+    version_id: Optional[int] = None
+
+
+class BacktestBody(BaseModel):
+    strategy_id: int
+    version_id: Optional[int] = None
+    params: Optional[Dict[str, Any]] = None
+    asset: str = ""
+    limit: int = 500
+    persist: bool = True
+
+
+class OptimizeBody(BaseModel):
+    strategy_id: int
+    version_id: Optional[int] = None
+    use_llm: bool = True
+
+
+def _strategy_or_404(strategy_id: int) -> Dict[str, Any]:
+    try:
+        return strategy_store.get_strategy(strategy_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/strategies")
+async def list_strategies(include_archived: bool = False):
+    return await asyncio.to_thread(strategy_store.list_strategies, include_archived)
+
+
+@app.get("/api/strategies/current")
+async def get_current_strategy():
+    return await asyncio.to_thread(strategy_store.get_current_strategy)
+
+
+@app.post("/api/strategies/{strategy_id}/activate")
+async def activate_strategy(strategy_id: int, body: StrategyActivateBody):
+    try:
+        return await asyncio.to_thread(
+            strategy_store.set_current_strategy, strategy_id, body.version_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/strategies")
+async def create_strategy(body: StrategyCreateBody):
+    try:
+        return await asyncio.to_thread(
+            strategy_store.create_strategy, body.name, body.description, body.params,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/strategies/meta/defaults")
+async def strategy_defaults():
+    return {
+        "defaults": strategy_store.default_params(),
+        "bounds": {
+            "signal_threshold": {"min": 0.3, "max": 0.9},
+            "notional_usdt": {"min": 5, "max": 500},
+            "leverage": {"min": 1, "max": 20},
+            "trailing_callback_rate": {"min": 0.1, "max": 5},
+            "holding_horizon_minutes": {"min": 15, "max": 240},
+        },
+        "assets": sorted(a for a in strategy_store.ALLOWED_ASSETS if a),
+        "strengths": [item for item in strategy_store.ALLOWED_STRENGTH if item],
+    }
+
+
+@app.get("/api/strategies/{strategy_id}")
+async def get_strategy(strategy_id: int):
+    return _strategy_or_404(strategy_id)
+
+
+@app.post("/api/strategies/{strategy_id}/versions")
+async def add_strategy_version(strategy_id: int, body: StrategyVersionBody):
+    _strategy_or_404(strategy_id)
+    try:
+        return await asyncio.to_thread(
+            strategy_store.add_version, strategy_id, body.params,
+            source=body.source, note=body.note,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/strategies/{strategy_id}/archive")
+async def archive_strategy(strategy_id: int):
+    try:
+        await asyncio.to_thread(strategy_store.archive_strategy, strategy_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"archived": True, "id": strategy_id}
+
+
+@app.post("/api/backtest/run")
+async def run_strategy_backtest(body: BacktestBody):
+    strategy = _strategy_or_404(body.strategy_id)
+    if body.version_id:
+        try:
+            version = strategy_store.get_version(body.version_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if version["strategy_id"] != body.strategy_id:
+            raise HTTPException(status_code=400, detail="version does not belong to strategy")
+    else:
+        latest = strategy.get("latest_version")
+        if not latest:
+            raise HTTPException(status_code=400, detail="strategy has no version")
+        version = latest
+    params = strategy_store.clamp_params(body.params or version["params"])
+    report = await asyncio.to_thread(backtest.run_backtest, params, asset=body.asset, limit=body.limit)
+    run_id = None
+    if body.persist:
+        run_id = await asyncio.to_thread(
+            strategy_store.save_backtest_run, body.strategy_id, version["id"], params, report,
+        )
+    return {
+        "run_id": run_id,
+        "strategy": {"id": strategy["id"], "name": strategy["name"], "slug": strategy["slug"]},
+        "version": {"id": version["id"], "version": version["version"]},
+        "report": report,
+    }
+
+
+@app.get("/api/backtest/runs")
+async def list_backtest_runs(strategy_id: int = 0, limit: int = 20):
+    sid = strategy_id or None
+    return await asyncio.to_thread(strategy_store.list_backtest_runs, sid, limit)
+
+
+def _llm_optimize_sync(params: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    response = _agent_llm_client().chat.completions.create(
+        model=_agent_llm_model(), temperature=0.0, max_tokens=700,
+        extra_body=config.AIPING_EXTRA_BODY, response_format=({"type": "json_object"} if config.AIPING_JSON_MODE else None),
+        messages=[
+            {"role": "system", "content": (
+                "你是本平台策略参数优化器。只输出 JSON。"
+                "只能引用已给出的回测报告数字，禁止编造胜率、行情或未发生的成交。"
+                "样本不足或回撤过大时必须更保守。"
+                "字段：signal_threshold, notional_usdt, leverage, trailing_callback_rate, "
+                "holding_horizon_minutes, min_event_strength, asset_filter, require_direct_catalyst, note。"
+            )},
+            {"role": "user", "content": json.dumps({"current": params, "report": {
+                k: report[k] for k in (
+                    "sample_size", "taken", "skipped", "wins", "losses", "winrate",
+                    "total_pnl_usdt", "max_drawdown_usdt", "profit_factor",
+                    "insufficient_sample", "by_asset", "params",
+                ) if k in report
+            }}, ensure_ascii=False)},
+        ],
+    )
+    result = json.loads(response.choices[0].message.content)
+    note = str(result.pop("note", "") or "LLM 基于已结算回测报告给出的下一组参数")
+    return {"params": strategy_store.clamp_params(result), "note": note, "mode": "llm"}
+
+
+@app.post("/api/backtest/optimize")
+async def optimize_strategy(body: OptimizeBody):
+    strategy = _strategy_or_404(body.strategy_id)
+    if body.version_id:
+        version = strategy_store.get_version(body.version_id)
+    else:
+        version = strategy.get("latest_version")
+        if not version:
+            raise HTTPException(status_code=400, detail="strategy has no version")
+    report = await asyncio.to_thread(backtest.run_backtest, version["params"])
+    mode = "rules"
+    note = ""
+    if body.use_llm:
+        try:
+            llm = await asyncio.to_thread(_llm_optimize_sync, version["params"], report)
+            next_params, note, mode = llm["params"], llm["note"], "llm"
+        except Exception:
+            fallback = backtest.optimize_params(version["params"], report)
+            next_params, note, mode = fallback["params"], "；".join(fallback["notes"]), "rules"
+    else:
+        fallback = backtest.optimize_params(version["params"], report)
+        next_params, note, mode = fallback["params"], "；".join(fallback["notes"]), "rules"
+    saved = await asyncio.to_thread(
+        strategy_store.add_version, body.strategy_id, next_params, source="llm" if mode == "llm" else "backtest", note=note,
+    )
+    return {
+        "mode": mode,
+        "baseline_report": {
+            "sample_size": report["sample_size"],
+            "taken": report["taken"],
+            "winrate": report["winrate"],
+            "total_pnl_usdt": report["total_pnl_usdt"],
+            "max_drawdown_usdt": report["max_drawdown_usdt"],
+            "insufficient_sample": report["insufficient_sample"],
+        },
+        "version": saved,
+        "note": note,
+    }
+
+
+@app.get("/api/dashboard/overview")
+async def dashboard_overview():
+    """对齐 dashboard/app.py 的离线复盘能力：信号统计 + 健康检查 + 最近已结算单。"""
+    health = {
+        "status": "ok",
+        "db_path": DB_PATH,
+        "db_exists": os.path.exists(DB_PATH),
+        "sse_clients": len(_SSE_QUEUES),
+    }
+    stats = await get_replay_stats()
+    recent = await get_replay_signals(settled=1, limit=12)
+    strategies = await asyncio.to_thread(strategy_store.list_strategies, False)
+    runs = await asyncio.to_thread(strategy_store.list_backtest_runs, None, 5)
+    return {
+        "health": health,
+        "replay": stats,
+        "recent_signals": recent,
+        "strategies": strategies,
+        "recent_runs": runs,
+        "streamlit": {"url": "http://127.0.0.1:8501", "source": "dashboard/app.py"},
+        "exports": {"signals_xlsx": "/api/export/signals"},
+    }
+
+
+# -- Entry point -----------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    _host = os.getenv("API_HOST", "0.0.0.0")
+    _port = int(os.getenv("API_PORT", "8000"))
+    uvicorn.run(app, host=_host, port=_port, reload=False, log_level="info")
