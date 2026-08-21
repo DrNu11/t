@@ -30,6 +30,8 @@ import config  # noqa: E402
 API_KEY = config.BINANCE_API_KEY
 API_SECRET = config.BINANCE_API_SECRET
 USE_TESTNET = config.BINANCE_USE_TESTNET
+LIVE_TRADING_ENABLED = config.BINANCE_LIVE_TRADING_ENABLED
+HEDGE_MODE_ENABLED = config.BINANCE_HEDGE_MODE_ENABLED
 NOTIONAL_USDT = config.BINANCE_NOTIONAL_USDT
 LEVERAGE = config.BINANCE_LEVERAGE
 SIGNAL_THRESHOLD = config.BINANCE_SIGNAL_THRESHOLD
@@ -341,8 +343,15 @@ def calculate_quantity(client: BinanceFutures, symbol: str, notional: float) -> 
 def open_and_trail(client: BinanceFutures, news_key: str, direction: str, item: Dict[str, Any]) -> bool:
     symbol = SYMBOL_MAP[news_key]
     client.validate_symbol(symbol)
-    if any(Decimal(str(position.get("positionAmt", "0"))) != 0 for position in client.get_positions()):
-        logger.warning("[%s] 账户已有非零持仓，跳过信号", symbol)
+    # Scope the idempotency check to the requested symbol.  The previous
+    # account-wide check incorrectly blocked BTC after an XAU/WTI position was
+    # opened, making independent paper/live legs impossible.
+    try:
+        existing_positions = client.get_positions(symbol)
+    except TypeError:  # compatibility with small test doubles
+        existing_positions = client.get_positions()
+    if any(Decimal(str(position.get("positionAmt", "0"))) != 0 for position in existing_positions):
+        logger.warning("[%s] 该品种已有非零持仓，跳过重复信号", symbol)
         return True
     client.set_margin_type_isolated(symbol)
     client.set_leverage(symbol, LEVERAGE)
@@ -405,6 +414,12 @@ def _request_stop(signum: int, _frame: Any) -> None:
 
 def main() -> int:
     configure_logging()
+    if not LIVE_TRADING_ENABLED:
+        logger.error(
+            "拒绝启动：BINANCE_LIVE_TRADING_ENABLED=false。"
+            "分析与模拟盘可以运行，真实下单需要单独显式开启。"
+        )
+        return 3
     if not API_KEY or not API_SECRET:
         logger.error("拒绝启动：BINANCE_API_KEY / BINANCE_API_SECRET 未配置")
         return 2

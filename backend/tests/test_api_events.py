@@ -118,6 +118,7 @@ def test_ingest_external_news_survives_missing_ts(tmp_path, monkeypatch):
     db_file = tmp_path / "legacy_raw.db"
     monkeypatch.setattr(config, "DB_PATH", str(db_file))
     monkeypatch.setattr(api_server, "DB_PATH", str(db_file))
+    monkeypatch.setenv("TRIDENT_DECISION_SOURCE_ALLOWLIST", "techflow")
     conn = sqlite3.connect(str(db_file))
     conn.execute(
         "CREATE TABLE raw_news (id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -136,7 +137,10 @@ def test_ingest_external_news_survives_missing_ts(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
     inserted = api_server._ingest_external_news_sync([
-        {"id": "x1", "title": "美联储暗示降息", "summary": "宏观快讯", "source": "TechFlow 深潮"},
+        {
+            "id": "x1", "title": "美联储暗示降息", "summary": "宏观快讯",
+            "source": "TechFlow 深潮", "published_at": "2026-08-21T10:00:00+08:00",
+        },
     ])
     assert inserted == 1
     check = sqlite3.connect(str(db_file))
@@ -146,6 +150,9 @@ def test_ingest_external_news_survives_missing_ts(tmp_path, monkeypatch):
 
 def test_ingest_external_news_preserves_provider_timestamp(temp_db, monkeypatch):
     monkeypatch.setattr(api_server, "evaluate_news", lambda *args: {"is_noise": 0, "relevance_score": 0.9})
+    monkeypatch.setattr(api_server.config, "JIN10_ENABLED", True)
+    monkeypatch.setattr(api_server.config, "JIN10_API_KEY", "test-authorized-key")
+    monkeypatch.setenv("TRIDENT_JIN10_DECISION_ENABLED", "1")
     assert api_server._ingest_external_news_sync([{
         "id": "jin-1",
         "title": "金十快讯",

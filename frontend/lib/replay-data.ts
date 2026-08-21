@@ -24,6 +24,8 @@ export type SimSignal = {
   decision_context: string | null
   entry_price: number | null
   exit_price: number | null
+  exit_time: string | null
+  exit_reason: string | null
   max_price: number | null
   min_price: number | null
   max_price_time: number | null
@@ -35,6 +37,19 @@ export type SimSignal = {
   mae_pct: number | null
   forward_pnl: number | null
   mfe_time_mins: number | null
+  analysis_type: 'conflict' | 'trend' | string | null
+  bullish_probability: number | null
+  bearish_probability: number | null
+  uncertainty: number | null
+  bullish_force: number | null
+  bearish_force: number | null
+  impact_horizon: 'short' | 'medium' | 'long' | string | null
+  impact_window: Record<string, unknown> | string | null
+  entry_zone: string | null
+  take_profit_pct: number | null
+  stop_loss_pct: number | null
+  exit_policy: string | null
+  dual_side_candidate: number | null
   extra_models_consensus: Record<string, unknown> | string | null
   doubao_action: 'BUY' | 'SELL' | 'HOLD' | null
   doubao_reasoning: string | null
@@ -49,6 +64,13 @@ export type SimSignal = {
   current_price?: number | null
   current_pnl_pct?: number | null
   current_pnl_usdt?: number | null
+  notional_usdt?: number | null
+  leverage?: number | null
+  margin_usdt?: number | null
+  gross_pnl_usdt?: number | null
+  fees_usdt?: number | null
+  slippage_usdt?: number | null
+  hold_minutes?: number | null
   live_mfe_pct?: number
   live_mae_pct?: number
   pricing_status?: 'LIVE' | 'UNAVAILABLE'
@@ -150,7 +172,10 @@ export type ReplayPositions = {
     change24h: number | null
     source: string
     source_count: number
-    status: 'LIVE' | 'UNAVAILABLE'
+    status: 'LIVE' | 'OBSERVATION_ONLY' | 'UNAVAILABLE'
+    quality_status: string
+    quality_reason: string
+    decision_eligible: boolean
   }>
   market_status: 'ok' | 'partial' | 'unavailable'
   market_sources: Record<string, { status: string; assets: string[]; error: string }>
@@ -194,6 +219,9 @@ export type ReplayPositions = {
     used_margin_usdt: number
     available_equity_usdt: number | null
     unpriced_positions: number
+    fees_usdt?: number
+    slippage_usdt?: number
+    trade_count?: number
   }
   updated_at_ms: number
   pricing_note: string
@@ -234,7 +262,7 @@ export type ReplayKlineResponse = {
   klines: ReplayKlineBar[]
 }
 
-export type NewsSourceKey = 'financialjuice' | 'tree_news' | 'techflow' | 'eastmoney' | 'blockbeats'
+export type NewsSourceKey = 'financialjuice' | 'tree_news' | 'techflow' | 'eastmoney' | 'blockbeats' | 'jin10'
 
 export type NewsSourceSettings = {
   enabled: boolean
@@ -264,6 +292,19 @@ export type ReplayStats = {
   by_asset: Array<{ asset: string; total: number; wins: number; losses: number; avg_pnl: number | null }>
   by_action: Array<{ action: string; total: number; wins: number; avg_pnl: number | null }>
   is_paper_trading: boolean
+}
+
+export type ReplayReflection = {
+  sample: number
+  wins: number
+  losses: number
+  winrate: number
+  by_analysis_type: Array<{ key: string; sample: number; wins: number; losses: number; winrate: number; avg_forward_pnl: number | null }>
+  by_horizon: Array<{ key: string; sample: number; wins: number; losses: number; winrate: number; avg_forward_pnl: number | null }>
+  by_asset: Array<{ key: string; sample: number; wins: number; losses: number; winrate: number; avg_forward_pnl: number | null }>
+  failure_patterns: Record<string, number>
+  recommendations: string[]
+  method: string
 }
 
 export async function fetchReplaySignals(params?: {
@@ -335,6 +376,12 @@ export async function fetchReplayStats(strategyId?: number, versionId?: number):
   return (await r.json()) as ReplayStats
 }
 
+export async function fetchReplayReflection(limit = 500): Promise<ReplayReflection> {
+  const r = await fetch(`${API_BASE}/replay/reflection?limit=${Math.min(Math.max(limit, 20), 500)}`, { cache: 'no-store' })
+  if (!r.ok) throw new Error(`fetchReplayReflection ${r.status}`)
+  return (await r.json()) as ReplayReflection
+}
+
 const DEFAULT_NEWS_SETTINGS: NewsSourceSettings = {
   enabled: true,
   daily_target: 300,
@@ -346,6 +393,7 @@ const DEFAULT_NEWS_SETTINGS: NewsSourceSettings = {
     techflow: true,
     eastmoney: true,
     blockbeats: true,
+    jin10: true,
   },
 }
 

@@ -1,18 +1,22 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import type { ReplayStats } from '@/lib/replay-data'
-import { fetchReplayStats, fmtPct } from '@/lib/replay-data'
+import type { ReplayReflection, ReplayStats } from '@/lib/replay-data'
+import { fetchReplayReflection, fetchReplayStats, fmtPct } from '@/lib/replay-data'
 
 export function ReplayStats({ refreshKey }: { refreshKey: number }) {
   const [stats, setStats] = useState<ReplayStats | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [reflection, setReflection] = useState<ReplayReflection | null>(null)
 
   useEffect(() => {
     let cancelled = false
     fetchReplayStats()
       .then((s) => { if (!cancelled) { setStats(s); setError(null) } })
       .catch((e) => { if (!cancelled) setError(String(e)) })
+    fetchReplayReflection()
+      .then((value) => { if (!cancelled) setReflection(value) })
+      .catch(() => { if (!cancelled) setReflection(null) })
     return () => { cancelled = true }
   }, [refreshKey])
 
@@ -107,6 +111,25 @@ export function ReplayStats({ refreshKey }: { refreshKey: number }) {
               )
             })}
           </div>
+        </div>
+      )}
+      {reflection && (
+        <div className="rounded-md border border-border bg-card p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">交易过程复盘 · 正确/失败模式</div>
+            <span className="font-mono text-[10px] text-muted-foreground">样本 {reflection.sample}</span>
+          </div>
+          <div className="grid gap-2 md:grid-cols-3">
+            {reflection.by_analysis_type.map((row) => (
+              <div key={row.key} className="rounded border border-border bg-secondary/30 px-2 py-1.5 font-mono text-[10px]">
+                <div className="text-foreground">{row.key}</div>
+                <div className="text-muted-foreground">{row.sample} 笔 · 胜率 {(row.winrate * 100).toFixed(0)}% · PnL {fmtPct(row.avg_forward_pnl)}</div>
+              </div>
+            ))}
+          </div>
+          <ul className="mt-2 list-disc space-y-1 pl-4 text-[10px] text-muted-foreground">
+            {reflection.recommendations.slice(0, 3).map((item) => <li key={item}>{item}</li>)}
+          </ul>
         </div>
       )}
     </div>

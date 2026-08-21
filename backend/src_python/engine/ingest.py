@@ -13,6 +13,7 @@ from realtime_filter import evaluate_news
 import db
 import news_sources
 import timeseries
+import data_quality
 
 from .utils import (
     _clean_html,
@@ -263,29 +264,53 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
                                 conn = _open_db()
                                 try:
                                     source_label = f"WS:fj:{channel}" if channel else "WS:financialjuice"
+                                    data_quality.ensure_schema(conn)
                                     if not news_sources.allow_ingest(source_label, conn):
+                                        return None
+                                    published_at = _ts()
+                                    quality_payload = {"text": text[:500], "channel": channel}
+                                    quality = data_quality.assess(
+                                        source=source_label,
+                                        kind="news",
+                                        event_id=h,
+                                        published_at=published_at,
+                                        payload=quality_payload,
+                                    )
+                                    if (
+                                        not quality.decision_eligible
+                                        and data_quality.observation_already_recorded(
+                                            conn, quality, quality_payload,
+                                        )
+                                    ):
+                                        return None
+                                    data_quality.record(
+                                        conn, quality, published_at=published_at,
+                                        payload=quality_payload,
+                                        metadata={"transport": "financialjuice_websocket"},
+                                        quarantine=not quality.decision_eligible,
+                                    )
+                                    if not quality.accepted or not quality.decision_eligible:
+                                        conn.commit()
                                         return None
                                     ts = _ts()
                                     ts_epoch = int(time.time())
                                     cleaned = f"[hash:{h}] {text[:500]}"
                                     f_result = evaluate_news(cleaned)
-                                    source_name = f"WS:fj:{channel}" if channel else "WS:financialjuice"
-                                    cur = conn.execute(
-                                        "INSERT INTO raw_news"
-                                        " (source, content, timestamp, ts, status, is_noise, relevance_score)"
-                                        " VALUES (?, ?, ?, ?, ?, ?, ?);",
-                                        (
-                                            source_name,
-                                            cleaned,
-                                            ts,
-                                            ts_epoch,
-                                            "PENDING",
-                                            f_result["is_noise"],
-                                            f_result["relevance_score"],
-                                        ),
+                                    source_name = source_label
+                                    news_id = db.insert_raw_news(
+                                        conn,
+                                        source=source_name,
+                                        content=cleaned,
+                                        timestamp=ts,
+                                        status="PENDING",
+                                        is_noise=int(f_result["is_noise"]),
+                                        relevance_score=float(f_result["relevance_score"]),
+                                        ts=ts_epoch,
+                                        quality_status=quality.quality_status,
+                                        quality_reason=quality.reason,
                                     )
                                     timeseries.record_news_event(
-                                        cur.lastrowid,
+                                        news_id,
                                         source=source_name,
                                         is_noise=int(f_result["is_noise"]),
                                         status="PENDING",
@@ -293,7 +318,7 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
                                         connection=conn,
                                     )
                                     conn.commit()
-                                    return cur.lastrowid
+                                    return news_id
                                 finally:
                                     conn.close()
 
@@ -364,6 +389,33 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
                                         source_label = f"WS:fj:{channel}" if channel else "WS:financialjuice"
                                         if vip_tag:
                                             source_label = f"{source_label} {vip_tag}"
+                                        data_quality.ensure_schema(conn)
+                                        if not news_sources.allow_ingest(source_label, conn):
+                                            return None
+                                        quality_payload = {"text": text[:500], "channel": channel}
+                                        quality = data_quality.assess(
+                                            source=source_label,
+                                            kind="news",
+                                            event_id=h,
+                                            published_at=ts,
+                                            payload=quality_payload,
+                                        )
+                                        if (
+                                            not quality.decision_eligible
+                                            and data_quality.observation_already_recorded(
+                                                conn, quality, quality_payload,
+                                            )
+                                        ):
+                                            return None
+                                        data_quality.record(
+                                            conn, quality, published_at=ts,
+                                            payload=quality_payload,
+                                            metadata={"transport": "financialjuice_websocket"},
+                                            quarantine=not quality.decision_eligible,
+                                        )
+                                        if not quality.accepted or not quality.decision_eligible:
+                                            conn.commit()
+                                            return None
                                         cleaned = f"[hash:{h}] {text[:500]}"
                                         f_result = evaluate_news(cleaned)
                                         news_id = db.insert_raw_news(
@@ -374,6 +426,17 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
                                             status="PENDING",
                                             is_noise=int(f_result["is_noise"]),
                                             relevance_score=float(f_result["relevance_score"]),
+                                            ts=int(time.time()),
+                                            quality_status=quality.quality_status,
+                                            quality_reason=quality.reason,
+                                        )
+                                        timeseries.record_news_event(
+                                            news_id,
+                                            source=source_label,
+                                            is_noise=int(f_result["is_noise"]),
+                                            status="PENDING",
+                                            ts=int(time.time()),
+                                            connection=conn,
                                         )
                                         conn.commit()
                                         return news_id

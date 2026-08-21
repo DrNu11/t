@@ -18,11 +18,13 @@ schema 归 db.py 管，本模块只做读写，不含任何 CREATE/ALTER。
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
 import db
+import data_quality
 
 # 支持的重采样粒度（秒）
 BUCKET_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
@@ -61,14 +63,61 @@ def record_market_snapshot(payload: Dict[str, Any],
     if not items:
         return 0
     ts = _now()
-    rows = [
-        (str(item["asset"]).upper(), ts, float(item["price"]), float(item.get("change24h") or 0.0),
-         str(item.get("source") or "median"), int(item.get("sourceCount") or 0))
-        for item in items
-    ]
     owned = connection is None
     connection = connection or _connect()
     try:
+        data_quality.ensure_schema(connection)
+        rows = []
+        for index, item in enumerate(items):
+            try:
+                if not isinstance(item, dict):
+                    raise ValueError("quote_not_object")
+                asset = str(item.get("asset") or item.get("symbol") or "").upper().strip()
+                price = float(item.get("price"))
+                change = float(item.get("change24h") or 0.0)
+                source = str(item.get("source") or "median")
+                source_count = int(item.get("sourceCount") or 0)
+                event_ts = int(item.get("event_ts") or ts)
+                if event_ts > 10_000_000_000:
+                    event_ts //= 1000
+                if not asset or not math.isfinite(price) or price <= 0 or not math.isfinite(change):
+                    raise ValueError("invalid_quote_shape")
+                if abs(change) > 10000:
+                    raise ValueError("implausible_change24h")
+                if source_count < 1:
+                    raise ValueError("missing_source_count")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raw_source = item.get("source") if isinstance(item, dict) else "unknown"
+                decision = data_quality.assess(
+                    source=str(raw_source or "unknown"), kind="market",
+                    event_id=f"invalid:{ts}:{index}", payload=item,
+                    observed_at=ts,
+                )
+                decision = data_quality.QualityDecision(
+                    decision.source, decision.kind, decision.event_id, False, False,
+                    decision.authority_tier, str(exc), "blocked", decision.latency_ms,
+                )
+                if not data_quality.observation_already_recorded(connection, decision, item):
+                    data_quality.record(connection, decision, payload=item, quarantine=True, observed_at=ts)
+                continue
+            decision = data_quality.assess(
+                source=source,
+                kind="market",
+                event_id=f"{asset}:{event_ts}",
+                published_at=event_ts,
+                payload=item,
+                observed_at=ts,
+            )
+            if not data_quality.observation_already_recorded(connection, decision, item):
+                data_quality.record(connection, decision, published_at=event_ts, payload=item,
+                                    metadata={"source_count": source_count}, observed_at=ts)
+            if not decision.accepted:
+                continue
+            rows.append((asset, event_ts, price, change, source, source_count))
+        if not rows:
+            if owned:
+                connection.commit()
+            return 0
         cursor = connection.executemany(
             """INSERT OR IGNORE INTO market_ticks(symbol, ts, price, change24h, source, source_count)
                VALUES(?,?,?,?,?,?)""",

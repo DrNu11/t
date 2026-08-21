@@ -22,6 +22,7 @@ const NEWS_SOURCES: Array<[NewsSourceKey, string]> = [
   ['techflow', '深潮'],
   ['eastmoney', '东财'],
   ['blockbeats', '律动'],
+  ['jin10', '金十'],
 ]
 
 export function ReplayPanel() {
@@ -307,6 +308,7 @@ export function ReplayPanel() {
           <span className={`font-mono text-xs ${(account?.realized_pnl_usdt ?? 0) >= 0 ? 'text-long' : 'text-short'}`}>已实现 {(account?.realized_pnl_usdt ?? 0) >= 0 ? '+' : ''}{account?.realized_pnl_usdt.toFixed(2) ?? '—'}</span>
           <span className={`font-mono text-xs ${livePnl >= 0 ? 'text-long' : 'text-short'}`}>浮盈亏 {account?.unrealized_pnl_usdt == null ? '待行情' : `${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</span>
           <span className="font-mono text-xs text-muted-foreground">可用 {account?.available_equity_usdt?.toFixed(2) ?? '—'} · 占用 {account?.used_margin_usdt.toFixed(2) ?? '—'}</span>
+          <span className="font-mono text-[10px] text-muted-foreground">成交 {account?.trade_count ?? 0} · 费用 {account?.fees_usdt?.toFixed(2) ?? '0.00'}</span>
           <div className="ml-auto flex gap-2">
             <a href={`${API_BASE}/export/signals`} className="rounded border border-border px-2 py-1.5 text-xs text-foreground">下载八列数据</a>
             <a href="http://127.0.0.1:8501" target="_blank" rel="noreferrer" className="rounded border border-primary/40 bg-primary/10 px-2 py-1.5 text-xs text-primary">Streamlit :8501</a>
@@ -334,7 +336,7 @@ export function ReplayPanel() {
                     <div key={pair.symbol} className="flex items-center justify-between rounded border border-border bg-secondary/40 px-2 py-1 font-mono text-[10px]">
                       <span className="text-foreground">{pair.symbol}</span>
                       <span>{pair.price == null ? '待行情' : pair.price.toLocaleString(undefined, { maximumFractionDigits: 4 })}</span>
-                      <span className={pair.status === 'LIVE' ? 'text-long' : 'text-short'}>{pair.status}</span>
+                      <span className={pair.status === 'LIVE' ? 'text-long' : pair.status === 'OBSERVATION_ONLY' ? 'text-hold' : 'text-short'}>{pair.status === 'OBSERVATION_ONLY' ? 'OBSERVE' : pair.status}</span>
                     </div>
                   ))}
                 </div>

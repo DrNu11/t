@@ -29,6 +29,7 @@ from realtime_filter import evaluate_news
 import db
 import news_sources
 import timeseries
+import data_quality
 
 from .utils import (
     _contains_chinese,
@@ -361,21 +362,52 @@ async def _tree_news_handler(reader, writer) -> None:
                 source_label = f"WEB:{source}"
                 if vip_tag:
                     source_label = f"{source_label} {vip_tag}"
+                data_quality.ensure_schema(conn)
                 if not news_sources.allow_ingest(source_label, conn):
+                    return None
+                published_at = _ts()
+                quality_payload = {"text": text[:500], "source": source}
+                quality = data_quality.assess(
+                    source=source_label,
+                    kind="news",
+                    event_id=h,
+                    published_at=published_at,
+                    payload=quality_payload,
+                )
+                if (
+                    not quality.decision_eligible
+                    and data_quality.observation_already_recorded(
+                        conn, quality, quality_payload,
+                    )
+                ):
+                    return None
+                data_quality.record(
+                    conn, quality, published_at=published_at,
+                    payload=quality_payload,
+                    metadata={"transport": "tree_news_webhook"},
+                    quarantine=not quality.decision_eligible,
+                )
+                if not quality.accepted or not quality.decision_eligible:
+                    conn.commit()
                     return None
                 ts = _ts()
                 ts_epoch = int(time.time())
                 cleaned = f"[hash:{h}] {text[:500]}"
                 f_result = evaluate_news(cleaned)
-                cur = conn.execute(
-                    "INSERT INTO raw_news (source, content, timestamp, ts, status, is_noise, relevance_score)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?);",
-                    (source_label, cleaned, ts, ts_epoch,
-                     "PENDING",
-                     f_result["is_noise"], f_result["relevance_score"]),
+                news_id = db.insert_raw_news(
+                    conn,
+                    source=source_label,
+                    content=cleaned,
+                    timestamp=ts,
+                    status="PENDING",
+                    is_noise=int(f_result["is_noise"]),
+                    relevance_score=float(f_result["relevance_score"]),
+                    ts=ts_epoch,
+                    quality_status=quality.quality_status,
+                    quality_reason=quality.reason,
                 )
                 timeseries.record_news_event(
-                    cur.lastrowid,
+                    news_id,
                     source=source_label,
                     is_noise=int(f_result["is_noise"]),
                     status="PENDING",
@@ -383,7 +415,7 @@ async def _tree_news_handler(reader, writer) -> None:
                     connection=conn,
                 )
                 conn.commit()
-                return cur.lastrowid
+                return news_id
             finally:
                 conn.close()
 

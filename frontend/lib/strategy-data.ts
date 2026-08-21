@@ -6,6 +6,14 @@ export type StrategyParams = {
   leverage: number
   trailing_callback_rate: number
   holding_horizon_minutes: number
+  short_horizon_minutes: number
+  medium_horizon_minutes: number
+  long_horizon_minutes: number
+  take_profit_pct: number
+  stop_loss_pct: number
+  uncertainty_threshold: number
+  dual_side_mode: 'off' | 'paper_only' | 'review' | string
+  close_on_take_profit: boolean
   min_event_strength: string
   asset_filter: string
   require_direct_catalyst: boolean
@@ -15,6 +23,8 @@ export type StrategyVersion = {
   id: number
   version: number
   params: StrategyParams
+  ai_prompt: string
+  analysis_structure: Record<string, unknown>
   source: string
   note: string
   created_at: string
@@ -66,6 +76,8 @@ export type BacktestReport = {
     is_correct: string
     equity_usdt: number
   }>
+  ai_prompt?: string
+  analysis_structure?: Record<string, unknown>
 }
 
 export type BacktestRun = {
@@ -124,15 +136,15 @@ export function fetchStrategy(id: number) {
   return apiGet<Strategy>(`/strategies/${id}`)
 }
 
-export function createStrategy(payload: { name: string; description: string; params?: Partial<StrategyParams> }) {
+export function createStrategy(payload: { name: string; description: string; params?: Partial<StrategyParams>; ai_prompt?: string; analysis_structure?: Record<string, unknown> }) {
   return apiSend<Strategy>('/strategies', 'POST', payload)
 }
 
-export function addStrategyVersion(id: number, params: StrategyParams, note: string) {
-  return apiSend<StrategyVersion>(`/strategies/${id}/versions`, 'POST', { params, note, source: 'manual' })
+export function addStrategyVersion(id: number, params: StrategyParams, note: string, aiPrompt = '', analysisStructure: Record<string, unknown> = {}) {
+  return apiSend<StrategyVersion>(`/strategies/${id}/versions`, 'POST', { params, note, source: 'manual', ai_prompt: aiPrompt, analysis_structure: analysisStructure })
 }
 
-export function runBacktest(payload: { strategy_id: number; version_id?: number; asset?: string; persist?: boolean }) {
+export function runBacktest(payload: { strategy_id: number; version_id?: number; asset?: string; persist?: boolean; ai_prompt?: string; analysis_structure?: Record<string, unknown> }) {
   return apiSend<BacktestRun>('/backtest/run', 'POST', payload)
 }
 

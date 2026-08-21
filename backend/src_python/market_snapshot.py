@@ -36,6 +36,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import config
+import data_quality
 from providers.jin10 import get_jin10_provider
 
 # ---------------------------------------------------------------------------
@@ -97,6 +98,20 @@ def _apply_jin10_xau(assets: Dict[str, Dict[str, Any]], quote: Optional[Dict[str
     if price <= 0:
         return
     entry = assets["XAU"]
+    quality = data_quality.assess(
+        source=str(quote.get("source") or "金十"),
+        kind="market",
+        event_id=f"XAU:{quote.get('event_ts') or int(time.time())}",
+        published_at=quote.get("event_ts"),
+        payload=quote,
+    )
+    if not quality.decision_eligible:
+        entry.setdefault("ignored_sources", []).append({
+            "source": "金十",
+            "quality_status": quality.quality_status,
+            "reason": quality.reason,
+        })
+        return
     change = quote.get("change_pct")
     entry.update({
         "symbol": quote.get("symbol") or "XAUUSD",
@@ -105,6 +120,9 @@ def _apply_jin10_xau(assets: Dict[str, Dict[str, Any]], quote: Optional[Dict[str
         "change_24h_pct": round(_safe_float(change), 2) if change is not None else entry.get("change_24h_pct", 0.0),
         "change_24h_str": _format_pct(_safe_float(change)) if change is not None else entry.get("change_24h_str", "N/A"),
         "source": "金十",
+        "quality_status": quality.quality_status,
+        "quality_reason": quality.reason,
+        "decision_eligible": True,
         "status": "ok",
         "status_note": "金十现货报价；趋势/资金费率仍沿用交易所回退数据",
     })
@@ -653,6 +671,11 @@ async def get_snapshot() -> Dict[str, Any]:
         elif asset_id in _SKIP_FUNDING:
             fr_str = "N/A (现货)"
 
+        quality = data_quality.assess(
+            source="OKX", kind="market", event_id=f"{asset_id}:{ts}",
+            published_at=ts, payload={"price": price, "symbol": symbol},
+        )
+
         asset_entry = {
             "symbol": symbol,
             "price": round(price, 4),
@@ -662,17 +685,32 @@ async def get_snapshot() -> Dict[str, Any]:
             "funding_rate_pct": round(fr_pct, 4),
             "funding_rate_str": fr_str,
             "status": "ok",
+            "source": "OKX",
+            "quality_status": quality.quality_status,
+            "quality_reason": quality.reason,
+            "decision_eligible": quality.decision_eligible,
             "stats_7d": stats_7d,
         }
 
+        if not quality.decision_eligible:
+            asset_entry["status"] = "unavailable"
+            asset_entry["status_note"] = f"行情质量门禁未通过: {quality.reason}"
+
         assets[asset_id] = asset_entry
-        ok_count += 1
+        if quality.decision_eligible:
+            ok_count += 1
+        else:
+            fail_count += 1
 
     jin10_quote = await jin10_task if jin10_task is not None else None
     _apply_jin10_xau(assets, jin10_quote)
 
     # ── 整体状态 ──
     total = len(_CORE_SYMBOLS)
+    ok_count = sum(
+        item.get("status") == "ok" and item.get("decision_eligible") is True
+        for item in assets.values()
+    )
     if ok_count == total:
         overall_status = "ok"
     elif ok_count == 0:
@@ -762,7 +800,12 @@ def get_snapshot_sync() -> Dict[str, Any]:
         elif asset_id in _SKIP_FUNDING:
             fr_str = "N/A (现货)"
 
-        assets[asset_id] = {
+        quality = data_quality.assess(
+            source="OKX", kind="market", event_id=f"{asset_id}:{ts}",
+            published_at=ts, payload={"price": price, "symbol": symbol},
+        )
+
+        asset_entry = {
             "symbol": symbol,
             "price": round(price, 4),
             "price_str": _format_price(price, 2),
@@ -771,9 +814,20 @@ def get_snapshot_sync() -> Dict[str, Any]:
             "funding_rate_pct": round(fr_pct, 4),
             "funding_rate_str": fr_str,
             "status": "ok",
+            "source": "OKX",
+            "quality_status": quality.quality_status,
+            "quality_reason": quality.reason,
+            "decision_eligible": quality.decision_eligible,
             "stats_7d": stats_7d,
         }
-        ok_count += 1
+        if not quality.decision_eligible:
+            asset_entry["status"] = "unavailable"
+            asset_entry["status_note"] = f"行情质量门禁未通过: {quality.reason}"
+        assets[asset_id] = asset_entry
+        if quality.decision_eligible:
+            ok_count += 1
+        else:
+            fail_count += 1
 
     _apply_jin10_xau(
         assets,
@@ -792,6 +846,10 @@ def get_snapshot_sync() -> Dict[str, Any]:
     }
 
     total = len(_CORE_SYMBOLS)
+    ok_count = sum(
+        item.get("status") == "ok" and item.get("decision_eligible") is True
+        for item in assets.values()
+    )
     overall_status = "ok" if ok_count == total else ("down" if ok_count == 0 else "partial")
     summary = _build_summary(assets, macro, overall_status)
     elapsed = round(time.time() - t0, 3)
@@ -836,7 +894,7 @@ def _build_summary(assets: Dict[str, Dict], macro: Dict[str, Any], overall_statu
         if a is None:
             continue
 
-        if a.get("status") == "unavailable":
+        if a.get("status") == "unavailable" or a.get("decision_eligible") is not True:
             lines.append(f"{asset_id}: 数据不可用")
             continue
 

@@ -1,12 +1,16 @@
-"""Unified price sources — Gold (Sina/EastMoney) + BTC (Binance REST) + WTI.
+"""Unified price sources with fail-closed settlement fallbacks.
 
-Leaf module: depends only on stdlib.
+Direct OKX quotes are eligible by default.  Legacy Sina/EastMoney fallbacks
+remain available for operator-controlled compatibility, but cannot silently
+become paper-trading/training labels.
 """
 
 from __future__ import annotations
 
 import json
 import urllib.request
+
+from config import ALLOW_LEGACY_PRICE_FALLBACKS
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +122,9 @@ def _get_current_price(asset: str) -> float | None:
     asset_upper = asset.upper()
     if asset_upper in ("XAU", "GOLD", "XAUUSD"):
         p = _fetch_okx_price(_OKX_INSTID["XAU"])
-        return p if p is not None else _fetch_gold_price()
+        if p is not None:
+            return p
+        return _fetch_gold_price() if ALLOW_LEGACY_PRICE_FALLBACKS else None
     if asset_upper in ("BTC", "BTCUSDT"):
         return _fetch_okx_price(_OKX_INSTID["BTC"])
     if asset_upper in ("ETH", "ETHUSDT"):
@@ -126,5 +132,5 @@ def _get_current_price(asset: str) -> float | None:
     if asset_upper in ("SOL", "SOLUSDT"):
         return _fetch_okx_price(_OKX_INSTID["SOL"])
     if asset_upper in ("WTI", "WTI/USD", "OIL"):
-        return _fetch_wti_price()
+        return _fetch_wti_price() if ALLOW_LEGACY_PRICE_FALLBACKS else None
     return None

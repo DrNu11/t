@@ -33,7 +33,8 @@ def test_layers_parse_and_do_not_invent_missing_etf(monkeypatch):
     assert etf["value"] is None
     text = macro_context.render_prompt_block(layers)
     assert "盘面结构" in text
-    assert "Fear&Greed 28" in text
+    assert "Fear&Greed 28" not in text  # candidate sentiment is stored but cannot enter AI
+    assert layers["sentiment"][0]["decision_eligible"] is False
     assert "不得臆造" not in text or "btc_etf" in json.dumps(layers, ensure_ascii=False)
 
 
@@ -61,3 +62,4 @@ def test_persist_macro_snapshots(temp_db, monkeypatch):
     rows = temp_db.execute("SELECT metric_key, status FROM macro_snapshots ORDER BY id").fetchall()
     assert {row["metric_key"] for row in rows} == {"BTC.funding", "crypto_fng", "implied_ff"}
     assert any(row["status"] == "unavailable" for row in rows)
+    assert temp_db.execute("SELECT COUNT(*) FROM data_quality_audit").fetchone()[0] == 2

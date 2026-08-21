@@ -38,10 +38,13 @@ def test_incremental_change_detection(temp_db, monkeypatch):
 
 
 def test_sse_payload_has_millisecond_emission_time(monkeypatch):
-    queue = asyncio.Queue()
-    monkeypatch.setattr(api_server, "_SSE_QUEUES", [queue])
     monkeypatch.setattr(api_server.time, "time", lambda: 1_786_772_999.123)
 
-    asyncio.run(api_server._broadcast_sse({"id": 1}))
-    payload = queue.get_nowait()
+    async def scenario():
+        queue = asyncio.Queue()
+        monkeypatch.setattr(api_server, "_SSE_QUEUES", [queue])
+        await api_server._broadcast_sse({"id": 1})
+        return queue.get_nowait()
+
+    payload = asyncio.run(scenario())
     assert '"server_emitted_at_ms": 1786772999123' in payload

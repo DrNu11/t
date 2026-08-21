@@ -85,6 +85,7 @@ export function ReplayList({ signals, loading, selectedId, onSelect, onReload }:
                       >
                         {s.action}
                       </span>
+                      {s.dual_side_candidate ? <span className="rounded border border-hold/40 bg-hold/10 px-1.5 py-0.5 font-mono text-[10px] text-hold">双向候选</span> : null}
                       <span
                         className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${verdictColor(
                           s.is_correct
@@ -95,7 +96,7 @@ export function ReplayList({ signals, loading, selectedId, onSelect, onReload }:
                     </div>
                     <span className="font-mono text-[10px] text-muted-foreground">{fmtTime(s.entry_time)}</span>
                   </div>
-                  <div className="mt-1 grid grid-cols-3 gap-2 font-mono text-[10px] text-muted-foreground">
+                  <div className="mt-1 grid grid-cols-2 gap-2 font-mono text-[10px] text-muted-foreground sm:grid-cols-4">
                     <span>
                       入场{' '}
                       <span className="text-foreground">{fmtPrice(s.entry_price, s.asset)}</span>
@@ -110,6 +111,9 @@ export function ReplayList({ signals, loading, selectedId, onSelect, onReload }:
                       }
                     >
                       PnL {fmtPct(s.settled ? s.forward_pnl : s.current_pnl_pct)}
+                    </span>
+                    <span className={(s.current_pnl_usdt ?? 0) >= 0 ? 'text-long' : 'text-short'}>
+                      {s.current_pnl_usdt == null ? 'USDT —' : `USDT ${s.current_pnl_usdt >= 0 ? '+' : ''}${s.current_pnl_usdt.toFixed(2)}`}
                     </span>
                   </div>
                   <div className="mt-1 line-clamp-1 text-[11px] text-muted-foreground">

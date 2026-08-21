@@ -88,6 +88,8 @@ export function SignalDetail({ signal }: Props) {
           <KV label={signal.settled ? '出场价' : '当前价'} value={fmtPrice(signal.settled ? signal.exit_price : signal.current_price, signal.asset)} />
           <KV label="期间最高" value={fmtPrice(signal.max_price, signal.asset)} />
           <KV label="期间最低" value={fmtPrice(signal.min_price, signal.asset)} />
+          <KV label="PnL USDT" value={signal.current_pnl_usdt == null ? '—' : `${signal.current_pnl_usdt >= 0 ? '+' : ''}${signal.current_pnl_usdt.toFixed(2)}`} tone={(signal.current_pnl_usdt ?? 0) >= 0 ? 'good' : 'bad'} />
+          <KV label="退出原因" value={signal.exit_reason || (signal.settled ? '已结算' : '跟踪中')} />
           <KV
             label={signal.settled ? '结算 PnL' : '实时 PnL'}
             value={
@@ -106,6 +108,25 @@ export function SignalDetail({ signal }: Props) {
                 : '—'
             }
           />
+        </div>
+      </Section>
+
+      {/* Dynamic news classification and direction strength */}
+      <Section title="动态方向 / 力量分析">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <KV label="类型" value={signal.analysis_type || 'trend'} />
+          <KV label="影响区间" value={signal.impact_horizon || signal.expected_horizon || '—'} />
+          <KV label="上涨概率" value={signal.bullish_probability == null ? '—' : `${(signal.bullish_probability * 100).toFixed(1)}%`} tone={(signal.bullish_probability ?? 0) >= (signal.bearish_probability ?? 0) ? 'good' : 'neutral'} />
+          <KV label="下跌概率" value={signal.bearish_probability == null ? '—' : `${(signal.bearish_probability * 100).toFixed(1)}%`} tone={(signal.bearish_probability ?? 0) > (signal.bullish_probability ?? 0) ? 'bad' : 'neutral'} />
+          <KV label="不确定性" value={signal.uncertainty == null ? '—' : `${(signal.uncertainty * 100).toFixed(1)}%`} />
+          <KV label="上涨力量" value={signal.bullish_force == null ? '—' : signal.bullish_force.toFixed(2)} tone="good" />
+          <KV label="下跌力量" value={signal.bearish_force == null ? '—' : signal.bearish_force.toFixed(2)} tone="bad" />
+          <KV label="双向候选" value={signal.dual_side_candidate ? '模拟/复核' : '否'} />
+        </div>
+        <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-muted-foreground">
+          <span>止盈：{signal.take_profit_pct ? `${signal.take_profit_pct}%` : '策略默认'}</span>
+          <span>止损：{signal.stop_loss_pct ? `${signal.stop_loss_pct}%` : '策略默认'}</span>
+          <span className="col-span-2">退出规则：{signal.exit_policy || 'horizon_or_signal_flip'}</span>
         </div>
       </Section>
 

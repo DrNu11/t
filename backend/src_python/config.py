@@ -51,10 +51,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-# Binance Futures trading (USE_TESTNET defaults to False: real trading)
+# Binance Futures trading.  A second explicit opt-in is required even when
+# API keys exist; this keeps the new analysis/paper-trading work non-destructive.
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 BINANCE_USE_TESTNET = _env_bool("BINANCE_USE_TESTNET", False)
+BINANCE_LIVE_TRADING_ENABLED = _env_bool("BINANCE_LIVE_TRADING_ENABLED", False)
+BINANCE_HEDGE_MODE_ENABLED = _env_bool("BINANCE_HEDGE_MODE_ENABLED", False)
 BINANCE_NOTIONAL_USDT = float(os.getenv("BINANCE_NOTIONAL_USDT", "30"))
 BINANCE_LEVERAGE = int(os.getenv("BINANCE_LEVERAGE", "5"))
 BINANCE_SIGNAL_THRESHOLD = float(os.getenv("BINANCE_SIGNAL_THRESHOLD", "0.5"))
@@ -117,7 +120,7 @@ OPENROUTER_BASE_URL = os.getenv(
 ).rstrip("/")
 
 AI_MODEL_ROSTER = (
-    {"id": AIPING_MODEL, "label": AIPING_MODEL},
+    {"id": AIPING_MODEL, "label": "DeepSeek V4 Flash 0731 (Aiping)"},
 )
 DEFAULT_AI_MODEL_ID = AIPING_MODEL
 AI_MODEL_STATE_PATH = os.path.abspath(os.path.join(BASE_DIR, "runtime", "ai_model.json"))
@@ -197,11 +200,16 @@ JIN10_SYMBOLS_URL = os.getenv(
 # The calendar route varies by Jin10 entitlement/version, so require an
 # explicit URL instead of guessing and silently querying the wrong endpoint.
 JIN10_CALENDAR_URL = os.getenv("JIN10_CALENDAR_URL", "").strip()
+JIN10_CALENDAR_CATEGORY = os.getenv("JIN10_CALENDAR_CATEGORY", "cj").strip()
 JIN10_FLASH_CATEGORIES = os.getenv("JIN10_FLASH_CATEGORIES", "1,2,3,4,5").strip()
 JIN10_MARKET_TYPE = os.getenv("JIN10_MARKET_TYPE", "GOODS").strip()
 JIN10_MARKET_CODES = os.getenv("JIN10_MARKET_CODES", "XAUUSD").strip()
 JIN10_REQUEST_TIMEOUT = max(1.0, float(os.getenv("JIN10_REQUEST_TIMEOUT", "5")))
 JIN10_POLL_SECONDS = max(10, int(os.getenv("JIN10_POLL_SECONDS", "15")))
+ALLOW_LEGACY_DECISIONS = _env_bool("TRIDENT_ALLOW_LEGACY_DECISIONS", False)
+ALLOW_LEGACY_PRICE_FALLBACKS = _env_bool("TRIDENT_ALLOW_LEGACY_PRICE_FALLBACKS", False)
+MACRO_CALENDAR_ENABLED = _env_bool("MACRO_CALENDAR_ENABLED", False)
+MACRO_CALENDAR_POLL_SECONDS = max(15, int(os.getenv("MACRO_CALENDAR_POLL_SECONDS", "60")))
 NEWS_SOURCE_POLL_SECONDS = max(10, int(os.getenv("NEWS_SOURCE_POLL_SECONDS", "15")))
 NEWS_SOURCE_PAGES = max(1, int(os.getenv("NEWS_SOURCE_PAGES", "6")))
 EVENTS_LIST_MAX = max(200, int(os.getenv("EVENTS_LIST_MAX", "10000")))

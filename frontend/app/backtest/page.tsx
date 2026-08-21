@@ -5,6 +5,7 @@ import {
   fetchStrategies,
   fmtRate,
   fmtUsd,
+  addStrategyVersion,
   optimizeStrategy,
   runBacktest,
   type BacktestReport,
@@ -17,21 +18,57 @@ export default function BacktestPage() {
   const [report, setReport] = useState<BacktestReport | null>(null)
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
+  const [aiPrompt, setAiPrompt] = useState('')
+  const [analysisStructureText, setAnalysisStructureText] = useState('{\n  "sections": ["news", "structure", "macro", "risk"]\n}')
 
   useEffect(() => {
     fetchStrategies().then((items) => {
       setStrategies(items)
       setStrategyId(items[0]?.id ?? null)
+      const version = items[0]?.latest_version
+      setAiPrompt(version?.ai_prompt ?? '')
+      setAnalysisStructureText(JSON.stringify(version?.analysis_structure ?? { sections: ['news', 'structure', 'macro', 'risk'] }, null, 2))
     }).catch((err) => setMessage(String(err)))
   }, [])
+
+  function selectStrategy(nextId: number) {
+    setStrategyId(nextId)
+    setReport(null)
+    const version = strategies.find((item) => item.id === nextId)?.latest_version
+    setAiPrompt(version?.ai_prompt ?? '')
+    setAnalysisStructureText(JSON.stringify(
+      version?.analysis_structure ?? { sections: ['news', 'structure', 'macro', 'risk'] },
+      null,
+      2,
+    ))
+  }
 
   async function onRun() {
     if (!strategyId) return
     setBusy(true)
     try {
-      const result = await runBacktest({ strategy_id: strategyId, persist: true })
+      const structure = parseStructure(analysisStructureText)
+      const result = await runBacktest({ strategy_id: strategyId, persist: true, ai_prompt: aiPrompt, analysis_structure: structure })
       setReport(result.report)
       setMessage(`回测完成 · run #${result.run_id ?? '—'} · ${result.report.note}`)
+    } catch (err) {
+      setMessage(String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onSavePrompt() {
+    if (!strategyId) return
+    setBusy(true)
+    try {
+      const strategy = strategies.find((item) => item.id === strategyId)
+      const params = strategy?.latest_version?.params
+      if (!params) throw new Error('策略参数尚未加载')
+      const saved = await addStrategyVersion(strategyId, params, '保存 AI 提示词与分析结构', aiPrompt, parseStructure(analysisStructureText))
+      setMessage(`提示词/结构已保存为 v${saved.version}`)
+      const items = await fetchStrategies()
+      setStrategies(items)
     } catch (err) {
       setMessage(String(err))
     } finally {
@@ -62,13 +99,24 @@ export default function BacktestPage() {
           <p className="mt-1 text-sm text-muted-foreground">只回放本平台已结算真实信号的 entry/exit，不生成模拟行情。</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <select value={strategyId ?? ''} onChange={(e) => setStrategyId(Number(e.target.value))} className="rounded border border-border bg-card px-2 py-2 font-mono text-xs">
+          <select value={strategyId ?? ''} onChange={(e) => selectStrategy(Number(e.target.value))} className="rounded border border-border bg-card px-2 py-2 font-mono text-xs">
             {strategies.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select>
           <button disabled={busy || !strategyId} onClick={() => void onRun()} className="rounded-lg border border-primary/40 bg-primary/10 px-3 py-2 text-xs text-primary disabled:opacity-50">运行回测</button>
           <button disabled={busy || !strategyId} onClick={() => void onOptimize()} className="rounded-lg border border-border px-3 py-2 text-xs text-foreground disabled:opacity-50">LLM 优化后再回测</button>
+          <button disabled={busy || !strategyId} onClick={() => void onSavePrompt()} className="rounded-lg border border-border px-3 py-2 text-xs text-foreground disabled:opacity-50">保存提示词/结构</button>
         </div>
       </div>
+      <section className="surface-card mb-4 grid gap-3 p-4 md:grid-cols-2">
+        <label className="text-xs text-muted-foreground">
+          AI 提示词（保存后影响后续 AI 分析；当前回测只记录配置快照，不重算历史决策）
+          <textarea value={aiPrompt} onChange={(event) => setAiPrompt(event.target.value)} rows={7} className="mt-1 w-full rounded border border-border bg-card p-2 font-mono text-xs text-foreground" placeholder="例如：优先结合盘面结构、宏观与情绪，区分冲突类和力量趋势类新闻。" />
+        </label>
+        <label className="text-xs text-muted-foreground">
+          分析结构 JSON
+          <textarea value={analysisStructureText} onChange={(event) => setAnalysisStructureText(event.target.value)} rows={7} className="mt-1 w-full rounded border border-border bg-card p-2 font-mono text-xs text-foreground" />
+        </label>
+      </section>
       {message && <div className="mb-4 rounded border border-border bg-secondary/30 px-3 py-2 text-xs text-muted-foreground">{message}</div>}
       {report && (
         <>
@@ -119,6 +167,15 @@ export default function BacktestPage() {
       )}
     </main>
   )
+}
+
+function parseStructure(text: string): Record<string, unknown> {
+  try {
+    const value = JSON.parse(text)
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : { raw: value }
+  } catch {
+    return { raw: text }
+  }
 }
 
 function Metric({ label, value, tone }: { label: string; value: string; tone?: 'long' | 'short' }) {

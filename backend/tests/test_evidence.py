@@ -1,5 +1,7 @@
 """Smoke tests for src_python/evidence.py — 证据层 / 校验层 / 反幻觉层."""
 
+import json
+
 import decision_guard
 import evidence
 
@@ -176,3 +178,27 @@ def test_decision_guard_uses_auto_sample_scope():
     assert result["significance"]["sample_size"] == 10
     assert result["significance"]["scope"] == "market"
     assert "全市场自动补齐" in result["factors"]["historical_confidence"]["explanation"]
+
+
+def test_decision_guard_neutralizes_market_factors_without_quality_approval():
+    context = {
+        "assets": {
+            "BTC": {
+                "status": "ok",
+                "decision_eligible": False,
+                "change_24h_pct": 8,
+                "funding_rate_pct": 0.2,
+                "stats_7d": {"trend": "Strong Bull", "atr_pct": 4},
+            },
+        },
+    }
+    result = decision_guard.evaluate_decision({
+        "sentiment_score": 0.2,
+        "target_asset": "BTC",
+        "market_confirmation": "confirmed",
+        "decision_context": json.dumps(context),
+        "cluster_size": 1,
+    })
+    for name in ("market_confirmation", "trend", "volatility", "funding"):
+        assert result["factors"][name]["score"] == 0.0
+        assert "质量门禁" in result["factors"][name]["explanation"]

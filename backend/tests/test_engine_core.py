@@ -169,6 +169,34 @@ def test_news_llm_request_injects_hermes_writing_context(monkeypatch):
     assert "offline news content" in user
 
 
+def test_news_llm_request_injects_active_strategy_context(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def read(self):
+            result = {
+                "sentiment_score": 0.2, "suggested_action": "HOLD",
+                "reasoning": "离线测试", "market_category": "OTHER",
+                "target_asset": "NONE", "reasoning_path": "测试路径",
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(result)}}]}).encode()
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["payload"] = json.loads(request.data.decode())
+            return FakeResponse()
+
+    monkeypatch.setattr("engine.ai_worker.urllib.request.build_opener", lambda *args: FakeOpener())
+    model = build_model_config("DeepSeek-V4-Flash-0731")
+    _call_llm_sync(
+        "offline news content", model,
+        strategy_context="[活动策略版本配置]\n先分析盘面结构",
+    )
+    user = captured["payload"]["messages"][1]["content"]
+    assert "[活动策略版本配置]" in user
+    assert "先分析盘面结构" in user
+
+
 def test_reconcile_hold_weak_score_is_neutral():
     assert reconcile_score_action(0.05, "HOLD") == (0.0, "HOLD")
     assert reconcile_score_action(0.0, "HOLD") == (0.0, "HOLD")

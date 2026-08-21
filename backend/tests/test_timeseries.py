@@ -20,6 +20,7 @@ def test_record_market_snapshot_persists_and_is_idempotent(temp_db, monkeypatch)
     assert timeseries.record_market_snapshot(payload, connection=temp_db) == 2
     assert timeseries.record_market_snapshot(payload, connection=temp_db) == 0
     assert temp_db.execute("SELECT COUNT(*) FROM market_ticks").fetchone()[0] == 2
+    assert temp_db.execute("SELECT COUNT(*) FROM data_quality_audit").fetchone()[0] == 2
 
 
 def test_record_market_snapshot_empty_items_noop(temp_db):

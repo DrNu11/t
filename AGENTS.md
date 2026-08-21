@@ -9,8 +9,8 @@
 - `pip install -r backend/requirements.txt -r backend/requirements-dev.txt` installs backend and test dependencies.
 - From `backend/src_python/`, run `python engine.py` for the engine and `uvicorn api_server:app --host 127.0.0.1 --port 8000` for the API.
 - `cd backend && python -m pytest tests/ -q` runs the offline test suite.
-- `cd frontend && npm ci && npm run dev` starts Next.js on port 3030.
-- `cd frontend && npm run build` performs the production and TypeScript build checks.
+- `cd frontend && pnpm install --frozen-lockfile && pnpm run dev` starts Next.js on port 3030.
+- `cd frontend && pnpm run build` performs the production and TypeScript build checks.
 - `cd dashboard && pip install -r requirements.txt && streamlit run app.py --server.port 8501` starts the replay dashboard.
 
 ## Coding Style & Naming Conventions
@@ -23,7 +23,7 @@ Use pytest and name files `test_<feature>.py`. Tests must remain offline: mock n
 
 ## Commit & Pull Request Guidelines
 
-This snapshot has no Git history, so use concise imperative commits such as `fix: make migration idempotent`. Keep refactors separate from changes to prompts, keyword lists, and trading thresholds. Pull requests should explain behavior and risk, list verification commands, link issues when available, and include screenshots for UI changes.
+History uses short Conventional Commit-style prefixes such as `feat:` and `chore:`; continue with focused messages like `fix: make migration idempotent`. Keep refactors separate from changes to prompts, keyword lists, and trading thresholds. Pull requests should explain behavior and risk, list verification commands, link issues when available, and include screenshots for UI changes.
 
 ## Security & Data Rules
 

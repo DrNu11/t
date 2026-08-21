@@ -19,6 +19,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import config
 import db
+import data_quality
+from providers.jin10 import get_jin10_provider
 
 HttpGet = Callable[[str, int], Any]
 
@@ -194,10 +196,17 @@ def fetch_fed(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
             next_move = "cut"
         else:
             next_move = "hold"
+        # Transparent directional proxy for UI/AI ranking.  It is not a CME
+        # FedWatch probability and is labelled as such everywhere.
+        hike_probability_proxy = max(0.0, min(1.0, 0.5 + spread_bp / 50.0))
         rows.append(_metric(
             "fed", "derived", "next_move_bp",
             spread_bp, unit="bp",
-            extra={"next_move": next_move, "method": "ZQ implied − EFFR；非 CME FedWatch 官方概率"},
+            extra={
+                "next_move": next_move,
+                "hike_probability_proxy": round(hike_probability_proxy, 4),
+                "method": "ZQ implied − EFFR；非 CME FedWatch 官方概率",
+            },
         ))
     else:
         rows.append(_fail("fed", "derived", "next_move_bp", "缺少 EFFR 或隐含利率"))
@@ -265,12 +274,43 @@ def fetch_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
 
 
 def collect_layers(get: HttpGet = _default_get) -> Dict[str, List[Dict[str, Any]]]:
-    return {
+    layers = {
         "structure": fetch_structure(get),
         "sentiment": fetch_sentiment(get),
         "fed": fetch_fed(get),
         "flow": fetch_flow(get),
     }
+    return apply_quality(layers)
+
+
+def apply_quality(
+    layers: Dict[str, List[Dict[str, Any]]],
+    *,
+    observed_at: Optional[int] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Attach source-governance results without changing the raw metric value."""
+    stamp = int(observed_at or _now())
+    governed: Dict[str, List[Dict[str, Any]]] = {}
+    for category, values in layers.items():
+        governed[category] = []
+        for index, original in enumerate(values or []):
+            item = dict(original)
+            decision = data_quality.assess(
+                source=str(item.get("source") or ""),
+                kind=str(item.get("category") or category),
+                event_id=f"{item.get('metric_key') or index}:{stamp}",
+                published_at=stamp,
+                payload={"value": item.get("value"), **(item.get("payload") or {})},
+                observed_at=stamp,
+            )
+            available = item.get("status") == "ok" and item.get("value") is not None
+            item["quality_status"] = decision.quality_status if available else "unavailable"
+            item["quality_reason"] = decision.reason if available else "upstream_unavailable"
+            item["decision_eligible"] = bool(decision.decision_eligible and available)
+            item["authority_tier"] = decision.authority_tier
+            item["quality_event_id"] = decision.event_id
+            governed[category].append(item)
+    return governed
 
 
 def flatten(layers: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -286,20 +326,53 @@ def persist_layers(
     ts: Optional[int] = None,
     connection: Optional[sqlite3.Connection] = None,
 ) -> int:
+    stamp = int(ts or _now())
     rows = flatten(layers)
+    if rows and any("quality_event_id" not in item for item in rows):
+        layers = apply_quality(layers, observed_at=stamp)
+        rows = flatten(layers)
     if not rows:
         return 0
-    stamp = int(ts or _now())
     owned = connection is None
     conn = connection or db.get_connection()
     try:
+        data_quality.ensure_schema(conn)
         exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='macro_snapshots'"
         ).fetchone()
         if exists is None:
             return 0
-        payload = [
-            (
+        payload = []
+        for item in rows:
+            quality = data_quality.QualityDecision(
+                source=data_quality.canonical_source(str(item.get("source") or "")),
+                kind=str(item.get("category") or "macro"),
+                event_id=str(item.get("quality_event_id") or f"{item.get('metric_key')}:{stamp}"),
+                accepted=item.get("quality_status") != "blocked",
+                decision_eligible=bool(item.get("decision_eligible")),
+                authority_tier=str(item.get("authority_tier") or "unknown"),
+                reason=str(item.get("quality_reason") or ""),
+                quality_status=str(item.get("quality_status") or "unknown"),
+            )
+            audit_payload = {"value": item.get("value"), **(item.get("payload") or {})}
+            # Availability failures belong in macro_snapshots as an explicit
+            # gap, not in the source-quality audit as if they were observations.
+            if item.get("status") == "ok" and item.get("value") is not None:
+                if not data_quality.observation_already_recorded(conn, quality, audit_payload):
+                    data_quality.record(
+                        conn, quality, published_at=stamp, payload=audit_payload,
+                        metadata={"metric_key": item.get("metric_key")},
+                        quarantine=quality.quality_status == "blocked",
+                        observed_at=stamp,
+                    )
+            stored_payload = {
+                **(item.get("payload") or {}),
+                "quality_status": item.get("quality_status"),
+                "quality_reason": item.get("quality_reason"),
+                "decision_eligible": bool(item.get("decision_eligible")),
+                "authority_tier": item.get("authority_tier"),
+            }
+            payload.append((
                 stamp,
                 item["category"],
                 item["source"],
@@ -307,10 +380,8 @@ def persist_layers(
                 item.get("value"),
                 item.get("unit") or "",
                 item.get("status") or "unavailable",
-                json.dumps(item.get("payload") or {}, ensure_ascii=False),
-            )
-            for item in rows
-        ]
+                json.dumps(stored_payload, ensure_ascii=False),
+            ))
         cursor = conn.executemany(
             """INSERT INTO macro_snapshots(ts, category, source, metric_key, value, unit, status, payload)
                VALUES(?,?,?,?,?,?,?,?)""",
@@ -334,7 +405,9 @@ def _fmt(item: Dict[str, Any]) -> str:
     if item["metric_key"] == "crypto_fng":
         return f"Fear&Greed {value:.0f} {extra.get('classification') or ''}".strip()
     if item["metric_key"] == "next_move_bp":
-        return f"期货隐含相对 EFFR {value:+.1f}bp → {extra.get('next_move')}"
+        proxy = extra.get("hike_probability_proxy")
+        suffix = f"，加息概率代理={float(proxy):.0%}" if proxy is not None else ""
+        return f"期货隐含相对 EFFR {value:+.1f}bp → {extra.get('next_move')}{suffix}"
     if isinstance(value, float) and abs(value) >= 1000:
         text = f"{value:,.0f}"
     else:
@@ -353,7 +426,12 @@ def render_prompt_block(layers: Dict[str, List[Dict[str, Any]]]) -> str:
     any_ok = False
     for key, title in titles.items():
         items = layers.get(key) or []
-        ok_items = [item for item in items if item.get("status") == "ok" and item.get("value") is not None]
+        ok_items = [
+            item for item in items
+            if item.get("status") == "ok"
+            and item.get("value") is not None
+            and item.get("decision_eligible") is True
+        ]
         if not ok_items:
             lines.append(f"{title}: 当前不可用，不得臆造")
             continue
@@ -369,13 +447,20 @@ def render_prompt_block(layers: Dict[str, List[Dict[str, Any]]]) -> str:
 def build_context(get: HttpGet = _default_get, persist: bool = True) -> Dict[str, Any]:
     layers = collect_layers(get)
     written = persist_layers(layers) if persist else 0
-    ok = sum(1 for item in flatten(layers) if item.get("status") == "ok" and item.get("value") is not None)
+    ok = sum(
+        1 for item in flatten(layers)
+        if item.get("status") == "ok"
+        and item.get("value") is not None
+        and item.get("decision_eligible") is True
+    )
     total = len(flatten(layers))
+    candidates = sum(1 for item in flatten(layers) if item.get("quality_status") == "candidate")
     status = "ok" if ok == total and total else ("partial" if ok else "unavailable")
     return {
         "status": status,
         "ok": ok,
         "total": total,
+        "candidate_count": candidates,
         "written": written,
         "layers": layers,
         "summary": render_prompt_block(layers),
@@ -412,3 +497,152 @@ def latest_snapshot(limit: int = 80, connection: Optional[sqlite3.Connection] = 
     finally:
         if owned:
             conn.close()
+
+
+def persist_macro_events(
+    events: List[Any],
+    *,
+    connection: Optional[sqlite3.Connection] = None,
+) -> int:
+    """Upsert canonical calendar/releases while retaining their quality state."""
+    if not events:
+        return 0
+    owned = connection is None
+    conn = connection or db.get_connection()
+    written = 0
+    try:
+        data_quality.ensure_schema(conn)
+        for event in events:
+            raw = event.to_dict() if hasattr(event, "to_dict") else dict(event or {})
+            source = str(raw.get("source") or "")
+            external_id = str(raw.get("event_id") or "").strip()
+            indicator = str(raw.get("indicator") or "").strip()
+            published_at = str(raw.get("published_at") or "").strip()
+            if not external_id or not indicator:
+                quality = data_quality.assess(
+                    source=source, kind="calendar", event_id=external_id,
+                    published_at=published_at, payload=raw,
+                )
+                quality = data_quality.QualityDecision(
+                    quality.source, quality.kind, quality.event_id, False, False,
+                    quality.authority_tier, "missing_macro_identity", "blocked", quality.latency_ms,
+                )
+                data_quality.record(conn, quality, published_at=published_at, payload=raw, quarantine=True)
+                continue
+            event_id = f"{data_quality.canonical_source(source)}:{external_id}"
+            kind = "macro" if raw.get("actual") is not None else "calendar"
+            quality = data_quality.assess(
+                source=source, kind=kind, event_id=event_id,
+                published_at=published_at,
+                payload={"value": raw.get("actual"), **raw},
+            )
+            if not data_quality.observation_already_recorded(conn, quality, raw):
+                data_quality.record(
+                    conn, quality, published_at=published_at, payload=raw,
+                    metadata={"indicator": indicator, "external_event_id": external_id},
+                    quarantine=not quality.decision_eligible,
+                )
+            if not quality.accepted:
+                continue
+            status = "released" if raw.get("actual") is not None else "scheduled"
+            stored_payload = {
+                **raw,
+                "external_event_id": external_id,
+                "quality_status": quality.quality_status,
+                "quality_reason": quality.reason,
+                "decision_eligible": quality.decision_eligible,
+            }
+            conn.execute(
+                """INSERT INTO macro_events(
+                       event_id, source, indicator, published_at, country, importance,
+                       actual, consensus, previous, unit, time_period, status,
+                       quality_status, quality_reason, decision_eligible, payload, updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+                   ON CONFLICT(event_id) DO UPDATE SET
+                       source=excluded.source,
+                       indicator=excluded.indicator,
+                       published_at=excluded.published_at,
+                       country=excluded.country,
+                       importance=excluded.importance,
+                       actual=excluded.actual,
+                       consensus=excluded.consensus,
+                       previous=excluded.previous,
+                       unit=excluded.unit,
+                       time_period=excluded.time_period,
+                       status=excluded.status,
+                       quality_status=excluded.quality_status,
+                       quality_reason=excluded.quality_reason,
+                       decision_eligible=excluded.decision_eligible,
+                       payload=excluded.payload,
+                       updated_at=datetime('now')""",
+                (
+                    event_id, source, indicator, published_at,
+                    str(raw.get("country") or ""), raw.get("impact"),
+                    raw.get("actual"), raw.get("consensus"), raw.get("previous"),
+                    str(raw.get("unit") or ""), str(raw.get("time_period") or ""), status,
+                    quality.quality_status, quality.reason, int(quality.decision_eligible),
+                    json.dumps(stored_payload, ensure_ascii=False, default=str),
+                ),
+            )
+            written += 1
+        if owned:
+            conn.commit()
+        return written
+    finally:
+        if owned:
+            conn.close()
+
+
+def sync_jin10_calendar() -> Dict[str, Any]:
+    """Fetch the explicitly configured/authorised Jin10 calendar once."""
+    provider = get_jin10_provider()
+    health = provider.health()
+    if not provider.configured:
+        return {"status": "disabled", "written": 0, **health, "reason": "jin10_not_configured"}
+    if not provider.calendar_url:
+        return {"status": "disabled", "written": 0, **health, "reason": "calendar_url_not_configured"}
+    try:
+        events = provider.fetch_macro(category=getattr(config, "JIN10_CALENDAR_CATEGORY", "cj"))
+        written = persist_macro_events(events)
+        return {"status": "ok", "fetched": len(events), "written": written, **health}
+    except Exception as exc:
+        return {
+            "status": "unavailable", "fetched": 0, "written": 0, **health,
+            "reason": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+
+
+def list_macro_events(
+    *,
+    start: str = "",
+    end: str = "",
+    limit: int = 200,
+    decision_eligible: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
+    clauses: List[str] = []
+    params: List[Any] = []
+    if start:
+        clauses.append("published_at >= ?")
+        params.append(start)
+    if end:
+        clauses.append("published_at <= ?")
+        params.append(end)
+    if decision_eligible is not None:
+        clauses.append("decision_eligible = ?")
+        params.append(int(decision_eligible))
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(max(1, min(int(limit), 1000)))
+    conn = db.get_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"""SELECT event_id, source, indicator, published_at, country, importance,
+                       actual, consensus, previous, unit, time_period, status, notified,
+                       quality_status, quality_reason, decision_eligible, created_at, updated_at
+                FROM macro_events {where}
+                ORDER BY published_at ASC, importance DESC LIMIT ?""",
+            params,
+        ).fetchall()
+        return [{**dict(row), "decision_eligible": bool(row["decision_eligible"])} for row in rows]
+    finally:
+        conn.close()

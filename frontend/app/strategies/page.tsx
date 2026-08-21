@@ -17,6 +17,14 @@ const EMPTY: StrategyParams = {
   leverage: 5,
   trailing_callback_rate: 0.5,
   holding_horizon_minutes: 120,
+  short_horizon_minutes: 30,
+  medium_horizon_minutes: 720,
+  long_horizon_minutes: 10080,
+  take_profit_pct: 0,
+  stop_loss_pct: 0,
+  uncertainty_threshold: 0.55,
+  dual_side_mode: 'paper_only',
+  close_on_take_profit: true,
   min_event_strength: '',
   asset_filter: '',
   require_direct_catalyst: false,
@@ -30,6 +38,8 @@ export default function StrategiesPage() {
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
+  const [aiPrompt, setAiPrompt] = useState('')
+  const [analysisStructureText, setAnalysisStructureText] = useState('{"sections":["news","structure","macro","risk"]}')
 
   async function reload() {
     const data = await fetchStrategies()
@@ -42,14 +52,18 @@ export default function StrategiesPage() {
   }, [])
 
   useEffect(() => {
-    if (selected?.latest_version) setDraft(selected.latest_version.params)
+    if (selected?.latest_version) {
+      setDraft(selected.latest_version.params)
+      setAiPrompt(selected.latest_version.ai_prompt ?? '')
+      setAnalysisStructureText(JSON.stringify(selected.latest_version.analysis_structure ?? { sections: ['news', 'structure', 'macro', 'risk'] }))
+    }
   }, [selected])
 
   async function onCreate() {
     if (!name.trim()) return
     setBusy(true)
     try {
-      await createStrategy({ name, description: '手动入库', params: draft })
+      await createStrategy({ name, description: '手动入库', params: draft, ai_prompt: aiPrompt, analysis_structure: parseStructure(analysisStructureText) })
       setName('')
       setMessage('策略已入库')
       await reload()
@@ -64,7 +78,7 @@ export default function StrategiesPage() {
     if (!selected) return
     setBusy(true)
     try {
-      await addStrategyVersion(selected.id, draft, note || '手动保存参数')
+      await addStrategyVersion(selected.id, draft, note || '手动保存参数', aiPrompt, parseStructure(analysisStructureText))
       setNote('')
       setMessage(`已写入 ${selected.name} 新版本`)
       await reload()
@@ -126,6 +140,11 @@ export default function StrategiesPage() {
               <Field label="杠杆" value={draft.leverage} step={1} onChange={(v) => setDraft({ ...draft, leverage: v })} />
               <Field label="追踪止损 %" value={draft.trailing_callback_rate} step={0.1} onChange={(v) => setDraft({ ...draft, trailing_callback_rate: v })} />
               <Field label="持仓窗口 分钟" value={draft.holding_horizon_minutes} step={15} onChange={(v) => setDraft({ ...draft, holding_horizon_minutes: v })} />
+              <Field label="短期窗口 分钟" value={draft.short_horizon_minutes} step={5} onChange={(v) => setDraft({ ...draft, short_horizon_minutes: v })} />
+              <Field label="中期窗口 分钟" value={draft.medium_horizon_minutes} step={60} onChange={(v) => setDraft({ ...draft, medium_horizon_minutes: v })} />
+              <Field label="长期窗口 分钟" value={draft.long_horizon_minutes} step={1440} onChange={(v) => setDraft({ ...draft, long_horizon_minutes: v })} />
+              <Field label="止盈 %（0=关闭）" value={draft.take_profit_pct} step={0.1} onChange={(v) => setDraft({ ...draft, take_profit_pct: v })} />
+              <Field label="止损 %（0=关闭）" value={draft.stop_loss_pct} step={0.1} onChange={(v) => setDraft({ ...draft, stop_loss_pct: v })} />
               <label className="text-xs text-muted-foreground">
                 最低事件强度
                 <select value={draft.min_event_strength} onChange={(e) => setDraft({ ...draft, min_event_strength: e.target.value })} className="mt-1 w-full rounded border border-border bg-card px-2 py-1.5 text-foreground">
@@ -146,6 +165,10 @@ export default function StrategiesPage() {
                 <input type="checkbox" checked={draft.require_direct_catalyst} onChange={(e) => setDraft({ ...draft, require_direct_catalyst: e.target.checked })} />
                 只要直接催化剂
               </label>
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="text-xs text-muted-foreground">AI 提示词<textarea value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} rows={5} className="mt-1 w-full rounded border border-border bg-card p-2 font-mono text-xs text-foreground" /></label>
+              <label className="text-xs text-muted-foreground">分析结构 JSON<textarea value={analysisStructureText} onChange={(e) => setAnalysisStructureText(e.target.value)} rows={5} className="mt-1 w-full rounded border border-border bg-card p-2 font-mono text-xs text-foreground" /></label>
             </div>
             <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="版本备注" className="w-full rounded border border-border bg-card px-2 py-1.5 text-xs" />
             <div className="flex flex-wrap gap-2">
@@ -170,6 +193,15 @@ export default function StrategiesPage() {
       </section>
     </main>
   )
+}
+
+function parseStructure(text: string): Record<string, unknown> {
+  try {
+    const value = JSON.parse(text)
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : { raw: value }
+  } catch {
+    return { raw: text }
+  }
 }
 
 function Field({ label, value, step, onChange }: { label: string; value: number; step: number; onChange: (value: number) => void }) {

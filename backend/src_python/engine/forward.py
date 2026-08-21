@@ -38,6 +38,8 @@ async def forward_tracker() -> None:
                         "SELECT ad.id, ad.suggested_action, ad.target_asset, ad.entry_price,"
                         " ad.max_price, ad.min_price, ad.max_price_time, ad.min_price_time,"
                         " ad.entry_time, ad.settled, sv.params AS strategy_params"
+                        ", ad.impact_horizon, ad.take_profit_pct, ad.stop_loss_pct"
+                        ", ad.exit_policy"
                         " FROM ai_decisions ad"
                         " LEFT JOIN strategy_versions sv ON sv.id = ad.strategy_version_id"
                         " WHERE ad.settled = 0 AND ad.entry_price IS NOT NULL AND ad.entry_time != ''"
@@ -64,30 +66,74 @@ async def forward_tracker() -> None:
                         price = _get_current_price(asset_raw)  # used for tracking only
                         horizon_minutes = _FORWARD_DURATION_HOURS * 60
                         trailing_callback = 0.0
+                        strategy_params = {}
                         try:
                             strategy_params = json.loads(row["strategy_params"] or "{}")
-                            horizon_minutes = int(strategy_params.get(
-                                "holding_horizon_minutes", horizon_minutes
-                            ))
+                            horizon_minutes = int(strategy_params.get("holding_horizon_minutes", horizon_minutes))
                             trailing_callback = float(strategy_params.get("trailing_callback_rate") or 0.0)
                         except (json.JSONDecodeError, TypeError, ValueError):
                             strategy_params = {}
 
+                        # Use the AI-labelled impact interval when available;
+                        # old decisions continue to use holding_horizon_minutes.
+                        impact_horizon = str(row["impact_horizon"] or "").lower()
+                        selected_horizon = {
+                            "short": strategy_params.get("short_horizon_minutes"),
+                            "medium": strategy_params.get("medium_horizon_minutes"),
+                            "long": strategy_params.get("long_horizon_minutes"),
+                        }.get(impact_horizon)
+                        if selected_horizon:
+                            try:
+                                horizon_minutes = max(5, int(selected_horizon))
+                            except (TypeError, ValueError):
+                                pass
+
+                        try:
+                            take_profit_pct = float(row["take_profit_pct"] or strategy_params.get("take_profit_pct") or 0.0)
+                        except (TypeError, ValueError):
+                            take_profit_pct = 0.0
+                        try:
+                            stop_loss_pct = float(row["stop_loss_pct"] or strategy_params.get("stop_loss_pct") or 0.0)
+                        except (TypeError, ValueError):
+                            stop_loss_pct = 0.0
+
                         stop_hit = False
-                        if (
-                            price is not None
-                            and entry
-                            and entry > 0
-                            and trailing_callback > 0
-                        ):
+                        take_profit_hit = False
+                        exit_reason = ""
+                        if price is not None and entry and entry > 0:
+                            favourable = (
+                                (price - entry) / entry * 100
+                                if action == "BUY"
+                                else (entry - price) / entry * 100
+                                if action == "SELL" else 0.0
+                            )
+                            adverse = (
+                                (entry - price) / entry * 100
+                                if action == "BUY"
+                                else (price - entry) / entry * 100
+                                if action == "SELL" else 0.0
+                            )
+                            take_profit_hit = take_profit_pct > 0 and favourable >= take_profit_pct
+                            stop_hit = stop_loss_pct > 0 and adverse >= stop_loss_pct
+                            if take_profit_hit:
+                                exit_reason = "take_profit"
+                            elif stop_hit:
+                                exit_reason = "stop_loss"
+
+                        if not exit_reason and price is not None and entry and entry > 0 and trailing_callback > 0:
                             if action == "BUY" and cur_max and cur_max > 0:
                                 stop_price = cur_max * (1 - trailing_callback / 100)
                                 stop_hit = price <= stop_price
                             elif action == "SELL" and cur_min and cur_min > 0:
                                 stop_price = cur_min * (1 + trailing_callback / 100)
                                 stop_hit = price >= stop_price
+                            if stop_hit:
+                                exit_reason = "trailing_stop"
 
-                        if stop_hit or elapsed.total_seconds() >= horizon_minutes * 60:
+                        if not exit_reason and elapsed.total_seconds() >= horizon_minutes * 60:
+                            exit_reason = "impact_horizon"
+
+                        if exit_reason:
                             if price is None:
                                 continue
                             exit_p = price
@@ -126,7 +172,11 @@ async def forward_tracker() -> None:
                             threshold = IMPACT_THRESHOLD.get(asset_raw, 1.0)
 
                             # ── 3D empirical verdict decision tree ──
-                            if mfe_pct < threshold and mae_pct < threshold:
+                            if exit_reason == "take_profit":
+                                verdict = "WIN"
+                            elif exit_reason in {"stop_loss", "trailing_stop"}:
+                                verdict = "LOSS"
+                            elif mfe_pct < threshold and mae_pct < threshold:
                                 # Condition A: neither side exceeded threshold
                                 verdict = "HOLD"    # NO_IMPACT — market did not break window
                             elif mfe_pct >= threshold and mfe_time_mins <= 45 and mfe_pct > mae_pct:
@@ -150,11 +200,11 @@ async def forward_tracker() -> None:
                                     fwd_pnl = 0.0
 
                             conn.execute(
-                                "UPDATE ai_decisions SET exit_price = ?, is_correct = ?,"
+                                "UPDATE ai_decisions SET exit_price = ?, exit_time = ?, exit_reason = ?, is_correct = ?,"
                                 " settled = 1, mfe_pct = ?, mae_pct = ?, forward_pnl = ?,"
                                 " mfe_time_mins = ?, max_price=?, min_price=?,"
                                 " max_price_time=?, min_price_time=? WHERE id = ?",
-                                (round(exit_p, 2), verdict,
+                                (round(exit_p, 2), datetime.now(TZ_SHANGHAI).isoformat(), exit_reason, verdict,
                                  round(max(0.0, mfe_pct), 4), round(max(0.0, mae_pct), 4),
                                  round(fwd_pnl, 4), round(mfe_time_mins, 1),
                                  round(cur_max, 2) if cur_max is not None else None,

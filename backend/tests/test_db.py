@@ -24,7 +24,8 @@ def test_tables_exist(temp_db):
     assert "ai_decisions" in tables
     assert {"market_ticks", "factor_snapshots", "signal_performance",
             "strategies", "strategy_versions", "backtest_runs",
-            "paper_trading_settings", "paper_trading_runs"} <= tables
+            "paper_trading_settings", "paper_trading_runs", "macro_events",
+            "data_quality_audit", "data_quarantine"} <= tables
 
 
 def test_timeseries_columns_and_indexes(temp_db):
@@ -75,7 +76,8 @@ def test_paper_trading_defaults(temp_db):
 
 def test_raw_news_columns(temp_db):
     cols = {r[1] for r in temp_db.execute("PRAGMA table_info(raw_news)")}
-    assert {"is_noise", "relevance_score", "status", "content", "ts"} <= cols
+    assert {"is_noise", "relevance_score", "status", "content", "ts",
+            "quality_status", "quality_reason"} <= cols
 
 
 def test_insert_raw_news_works_without_ts_column():

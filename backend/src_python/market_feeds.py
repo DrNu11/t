@@ -94,12 +94,20 @@ def fetch_market_prices() -> Dict[str, Any]:
     for asset in ASSETS:
         valid = [(source, values[asset]) for source, values in source_values.items() if asset in values]
         if valid:
+            prices = [float(value["price"]) for _, value in valid]
+            median_price = median(prices)
+            max_deviation_bps = (
+                max(abs(price / median_price - 1.0) for price in prices) * 10000.0
+                if median_price > 0 else 0.0
+            )
             items.append({
                 "asset": asset,
-                "price": median(value["price"] for _, value in valid),
+                "price": median_price,
                 "change24h": median(value["change24h"] for _, value in valid),
                 "source": "median",
                 "sourceCount": len(valid),
+                "sourceNames": [source for source, _ in valid],
+                "maxDeviationBps": round(max_deviation_bps, 4),
                 "updated_at": updated_at,
             })
 
@@ -121,6 +129,9 @@ def fetch_market_prices() -> Dict[str, Any]:
                         "change24h": quote.change_pct or 0.0,
                         "source": "金十",
                         "sourceCount": 1,
+                        "symbol": quote.symbol,
+                        "event_ts": quote.event_ts,
+                        "volume": quote.volume,
                         "updated_at": updated_at,
                     })
         except Exception as exc:
@@ -141,8 +152,9 @@ def fetch_market_prices() -> Dict[str, Any]:
             "assets": ["XAU"] if has_xau else [],
             "error": jin10_error,
         }
+    core_count = sum(str(item.get("asset") or "") in ASSETS for item in items)
     return {
-        "status": "ok" if len(items) == len(ASSETS) else ("partial" if items else "unavailable"),
+        "status": "ok" if core_count == len(ASSETS) else ("partial" if core_count else "unavailable"),
         "items": items,
         "sources": sources,
         "updated_at": updated_at,

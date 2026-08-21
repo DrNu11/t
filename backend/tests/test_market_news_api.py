@@ -110,11 +110,15 @@ def test_news_report_tracks_signal_and_trade_pipeline(monkeypatch):
 
 
 def test_external_news_ingestion_is_deduplicated(temp_db, monkeypatch):
+    monkeypatch.setenv("TRIDENT_DECISION_SOURCE_ALLOWLIST", "techflow")
     monkeypatch.setattr(api_server.db, "get_connection", lambda: __import__("sqlite3").connect(
         temp_db.execute("PRAGMA database_list").fetchone()[2]
     ))
     monkeypatch.setattr(api_server, "evaluate_news", lambda *args: {"is_noise": 0, "relevance_score": 0.9})
-    items = [{"id": "7", "title": "美联储宣布降息", "summary": "黄金与比特币波动", "source": "TechFlow 深潮"}]
+    items = [{
+        "id": "7", "title": "美联储宣布降息", "summary": "黄金与比特币波动",
+        "source": "TechFlow 深潮", "published_at": "2026-08-21T10:00:00+08:00",
+    }]
     assert api_server._ingest_external_news_sync(items) == 1
     assert api_server._ingest_external_news_sync(items) == 0
     row = temp_db.execute("SELECT source, content, status FROM raw_news").fetchone()

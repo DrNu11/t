@@ -23,7 +23,13 @@ PARAM_BOUNDS = {
     "notional_usdt": (5.0, 500.0),
     "leverage": (1, 20),
     "trailing_callback_rate": (0.1, 5.0),
-    "holding_horizon_minutes": (15, 240),
+    "holding_horizon_minutes": (15, 10080),
+    "short_horizon_minutes": (5, 240),
+    "medium_horizon_minutes": (240, 4320),
+    "long_horizon_minutes": (4320, 43200),
+    "take_profit_pct": (0.0, 20.0),
+    "stop_loss_pct": (0.0, 20.0),
+    "uncertainty_threshold": (0.4, 0.8),
     "min_event_strength": ("", "strong"),  # informational; validated separately
 }
 
@@ -39,6 +45,14 @@ def default_params() -> Dict[str, Any]:
         "leverage": int(config.BINANCE_LEVERAGE),
         "trailing_callback_rate": float(config.BINANCE_TRAILING_CALLBACK_RATE),
         "holding_horizon_minutes": 120,
+        "short_horizon_minutes": 30,
+        "medium_horizon_minutes": 720,
+        "long_horizon_minutes": 10080,
+        "take_profit_pct": 0.0,
+        "stop_loss_pct": 0.0,
+        "uncertainty_threshold": 0.55,
+        "dual_side_mode": "paper_only",
+        "close_on_take_profit": True,
         "min_event_strength": "",
         "asset_filter": "",
         "require_direct_catalyst": False,
@@ -55,11 +69,20 @@ def clamp_params(raw: Dict[str, Any]) -> Dict[str, Any]:
     out["leverage"] = int(_clamp_float(raw.get("leverage"), *PARAM_BOUNDS["leverage"], base["leverage"]))
     out["trailing_callback_rate"] = _clamp_float(raw.get("trailing_callback_rate"), *PARAM_BOUNDS["trailing_callback_rate"], base["trailing_callback_rate"])
     out["holding_horizon_minutes"] = int(_clamp_float(raw.get("holding_horizon_minutes"), *PARAM_BOUNDS["holding_horizon_minutes"], base["holding_horizon_minutes"]))
+    out["short_horizon_minutes"] = int(_clamp_float(raw.get("short_horizon_minutes"), *PARAM_BOUNDS["short_horizon_minutes"], base["short_horizon_minutes"]))
+    out["medium_horizon_minutes"] = int(_clamp_float(raw.get("medium_horizon_minutes"), *PARAM_BOUNDS["medium_horizon_minutes"], base["medium_horizon_minutes"]))
+    out["long_horizon_minutes"] = int(_clamp_float(raw.get("long_horizon_minutes"), *PARAM_BOUNDS["long_horizon_minutes"], base["long_horizon_minutes"]))
+    out["take_profit_pct"] = _clamp_float(raw.get("take_profit_pct"), *PARAM_BOUNDS["take_profit_pct"], base["take_profit_pct"])
+    out["stop_loss_pct"] = _clamp_float(raw.get("stop_loss_pct"), *PARAM_BOUNDS["stop_loss_pct"], base["stop_loss_pct"])
+    out["uncertainty_threshold"] = _clamp_float(raw.get("uncertainty_threshold"), *PARAM_BOUNDS["uncertainty_threshold"], base["uncertainty_threshold"])
     strength = str(raw.get("min_event_strength") or "").lower()
     out["min_event_strength"] = strength if strength in ALLOWED_STRENGTH else ""
     asset = str(raw.get("asset_filter") or "").upper()
     out["asset_filter"] = asset if asset in ALLOWED_ASSETS else ""
     out["require_direct_catalyst"] = bool(raw.get("require_direct_catalyst"))
+    mode = str(raw.get("dual_side_mode") or base["dual_side_mode"]).lower()
+    out["dual_side_mode"] = mode if mode in {"off", "paper_only", "review"} else base["dual_side_mode"]
+    out["close_on_take_profit"] = bool(raw.get("close_on_take_profit", base["close_on_take_profit"]))
     return out
 
 
@@ -117,6 +140,18 @@ def _parse_params(blob: Any) -> Dict[str, Any]:
     return default_params()
 
 
+def _parse_structure(blob: Any) -> Dict[str, Any]:
+    if isinstance(blob, dict):
+        return blob
+    if isinstance(blob, str) and blob.strip():
+        try:
+            value = json.loads(blob)
+            return value if isinstance(value, dict) else {"raw": value}
+        except json.JSONDecodeError:
+            return {"raw": blob}
+    return {}
+
+
 def _row_strategy(row: sqlite3.Row, latest: Optional[sqlite3.Row] = None) -> Dict[str, Any]:
     payload = dict(row)
     if latest:
@@ -124,6 +159,8 @@ def _row_strategy(row: sqlite3.Row, latest: Optional[sqlite3.Row] = None) -> Dic
             "id": latest["id"],
             "version": latest["version"],
             "params": _parse_params(latest["params"]),
+            "ai_prompt": latest["ai_prompt"] if "ai_prompt" in latest.keys() else "",
+            "analysis_structure": _parse_structure(latest["analysis_structure"] if "analysis_structure" in latest.keys() else "{}"),
             "source": latest["source"],
             "note": latest["note"],
             "created_at": latest["created_at"],
@@ -247,6 +284,8 @@ def get_strategy(strategy_id: int) -> Dict[str, Any]:
                 "id": item["id"],
                 "version": item["version"],
                 "params": _parse_params(item["params"]),
+                "ai_prompt": item["ai_prompt"] if "ai_prompt" in item.keys() else "",
+                "analysis_structure": _parse_structure(item["analysis_structure"] if "analysis_structure" in item.keys() else "{}"),
                 "source": item["source"],
                 "note": item["note"],
                 "created_at": item["created_at"],
@@ -271,6 +310,8 @@ def create_strategy(
     slug: str = "",
     source: str = "manual",
     note: str = "",
+    ai_prompt: str = "",
+    analysis_structure: Optional[Dict[str, Any]] = None,
     connection: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, Any]:
     name = (name or "").strip()
@@ -285,7 +326,11 @@ def create_strategy(
             (slug, name, description or ""),
         )
         strategy_id = int(cursor.lastrowid)
-        add_version(strategy_id, params, source=source, note=note, connection=connection)
+        add_version(
+            strategy_id, params, source=source, note=note,
+            ai_prompt=ai_prompt, analysis_structure=analysis_structure,
+            connection=connection,
+        )
         if owned:
             connection.commit()
         return get_strategy(strategy_id) if owned else {"id": strategy_id, "slug": slug}
@@ -300,6 +345,8 @@ def add_version(
     *,
     source: str = "manual",
     note: str = "",
+    ai_prompt: str = "",
+    analysis_structure: Optional[Dict[str, Any]] = None,
     connection: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, Any]:
     if source not in {"manual", "seed", "llm", "backtest"}:
@@ -316,9 +363,16 @@ def add_version(
         ).fetchone()[0]
         version = int(current) + 1
         clamped = clamp_params(params)
+        structure = analysis_structure if isinstance(analysis_structure, dict) else {}
+        prompt = str(ai_prompt or "").strip()[:12000]
         cursor = connection.execute(
-            "INSERT INTO strategy_versions(strategy_id, version, params, source, note) VALUES(?,?,?,?,?)",
-            (strategy_id, version, json.dumps(clamped, ensure_ascii=False), source, note or ""),
+            """INSERT INTO strategy_versions
+               (strategy_id, version, params, ai_prompt, analysis_structure, source, note)
+               VALUES(?,?,?,?,?,?,?)""",
+            (
+                strategy_id, version, json.dumps(clamped, ensure_ascii=False),
+                prompt, json.dumps(structure, ensure_ascii=False), source, note or "",
+            ),
         )
         connection.execute(
             "UPDATE strategies SET updated_at=datetime('now') WHERE id=?",
@@ -331,6 +385,8 @@ def add_version(
             "strategy_id": strategy_id,
             "version": version,
             "params": clamped,
+            "ai_prompt": prompt,
+            "analysis_structure": structure,
             "source": source,
             "note": note or "",
         }
@@ -347,6 +403,8 @@ def get_version(version_id: int) -> Dict[str, Any]:
             raise KeyError(f"strategy version {version_id} not found")
         payload = dict(row)
         payload["params"] = _parse_params(row["params"])
+        payload["analysis_structure"] = _parse_structure(row["analysis_structure"] if "analysis_structure" in row.keys() else "{}")
+        payload["ai_prompt"] = row["ai_prompt"] if "ai_prompt" in row.keys() else ""
         return payload
     finally:
         connection.close()

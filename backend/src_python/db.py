@@ -54,11 +54,16 @@ def insert_raw_news(
     is_noise: int = 0,
     relevance_score: float = 0.0,
     ts: Optional[int] = None,
+    quality_status: str = "unverified",
+    quality_reason: str = "",
 ) -> int:
     """写入 raw_news。生产库若尚未 migrate 出 ts 列，自动降级，避免整批入库失败。"""
     existing = table_columns(conn, "raw_news")
     columns = ["source", "content", "timestamp", "status", "is_noise", "relevance_score"]
     values: List[object] = [source, content, timestamp, status, int(is_noise), float(relevance_score)]
+    if "quality_status" in existing:
+        columns.extend(["quality_status", "quality_reason"])
+        values.extend([str(quality_status or "unverified"), str(quality_reason or "")])
     if "ts" in existing:
         columns.append("ts")
         values.append(int(ts if ts is not None else time.time()))
@@ -84,7 +89,9 @@ _CREATE_RAW_NEWS = """
         status          TEXT    NOT NULL DEFAULT 'PENDING'
             CHECK (status IN ('PENDING', 'PROCESSING', 'DONE', 'FAILED')),
         is_noise        INTEGER NOT NULL DEFAULT 0,
-        relevance_score REAL    NOT NULL DEFAULT 0.0
+        relevance_score REAL    NOT NULL DEFAULT 0.0,
+        quality_status  TEXT    NOT NULL DEFAULT 'unverified',
+        quality_reason  TEXT    NOT NULL DEFAULT ''
     );
 """
 
@@ -111,6 +118,8 @@ _CREATE_AI_DECISIONS = """
         extra_models_consensus TEXT DEFAULT '',
         entry_price       REAL    DEFAULT NULL,
         exit_price        REAL    DEFAULT NULL,
+        exit_time         TEXT    DEFAULT '',
+        exit_reason       TEXT    NOT NULL DEFAULT '',
         max_price         REAL    DEFAULT NULL,
         min_price         REAL    DEFAULT NULL,
         max_price_time    INTEGER DEFAULT 0,
@@ -136,6 +145,19 @@ _CREATE_AI_DECISIONS = """
         evidence_confidence  REAL    DEFAULT NULL,
         evidence_action      TEXT    DEFAULT 'HOLD',
         trade_gate_reason    TEXT    DEFAULT '',
+        analysis_type        TEXT    NOT NULL DEFAULT 'trend',
+        bullish_probability  REAL    DEFAULT 0.5,
+        bearish_probability  REAL    DEFAULT 0.5,
+        uncertainty           REAL    DEFAULT 1.0,
+        bullish_force         REAL    DEFAULT 0.0,
+        bearish_force         REAL    DEFAULT 0.0,
+        impact_horizon        TEXT    NOT NULL DEFAULT 'medium',
+        impact_window         TEXT    NOT NULL DEFAULT '{}',
+        entry_zone            TEXT    NOT NULL DEFAULT '',
+        take_profit_pct       REAL    DEFAULT NULL,
+        stop_loss_pct         REAL    DEFAULT NULL,
+        exit_policy           TEXT    NOT NULL DEFAULT 'horizon_or_signal_flip',
+        dual_side_candidate   INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (news_id) REFERENCES raw_news(id) ON DELETE CASCADE
     );
 """
@@ -146,6 +168,8 @@ _RAW_NEWS_COLUMNS: List[Tuple[str, str]] = [
     ("is_noise",        "INTEGER NOT NULL DEFAULT 0"),
     ("relevance_score", "REAL    NOT NULL DEFAULT 0.0"),
     ("ts",              "INTEGER"),
+    ("quality_status",  "TEXT NOT NULL DEFAULT 'unverified'"),
+    ("quality_reason",  "TEXT NOT NULL DEFAULT ''"),
 ]
 
 _AI_DECISIONS_COLUMNS: List[Tuple[str, str]] = [
@@ -162,6 +186,8 @@ _AI_DECISIONS_COLUMNS: List[Tuple[str, str]] = [
     ("extra_models_consensus", "TEXT    DEFAULT ''"),
     ("entry_price",      "REAL    DEFAULT NULL"),
     ("exit_price",       "REAL    DEFAULT NULL"),
+    ("exit_time",        "TEXT    DEFAULT ''"),
+    ("exit_reason",      "TEXT    NOT NULL DEFAULT ''"),
     ("max_price",        "REAL    DEFAULT NULL"),
     ("min_price",        "REAL    DEFAULT NULL"),
     ("max_price_time",   "INTEGER DEFAULT 0"),
@@ -189,6 +215,19 @@ _AI_DECISIONS_COLUMNS: List[Tuple[str, str]] = [
     ("evidence_confidence", "REAL DEFAULT NULL"),
     ("evidence_action", "TEXT DEFAULT 'HOLD'"),
     ("trade_gate_reason", "TEXT DEFAULT ''"),
+    ("analysis_type", "TEXT NOT NULL DEFAULT 'trend'"),
+    ("bullish_probability", "REAL DEFAULT 0.5"),
+    ("bearish_probability", "REAL DEFAULT 0.5"),
+    ("uncertainty", "REAL DEFAULT 1.0"),
+    ("bullish_force", "REAL DEFAULT 0.0"),
+    ("bearish_force", "REAL DEFAULT 0.0"),
+    ("impact_horizon", "TEXT NOT NULL DEFAULT 'medium'"),
+    ("impact_window", "TEXT NOT NULL DEFAULT '{}'"),
+    ("entry_zone", "TEXT NOT NULL DEFAULT ''"),
+    ("take_profit_pct", "REAL DEFAULT NULL"),
+    ("stop_loss_pct", "REAL DEFAULT NULL"),
+    ("exit_policy", "TEXT NOT NULL DEFAULT 'horizon_or_signal_flip'"),
+    ("dual_side_candidate", "INTEGER NOT NULL DEFAULT 0"),
     ("ts", "INTEGER"),
 ]
 
@@ -205,6 +244,7 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy ON backtest_runs(strategy_id, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_ai_strategy_version ON ai_decisions(strategy_version_id);",
     "CREATE INDEX IF NOT EXISTS idx_ai_paper_run ON ai_decisions(paper_trading_run_id);",
+    "CREATE INDEX IF NOT EXISTS idx_ai_analysis_features ON ai_decisions(analysis_type, impact_horizon);",
     "CREATE INDEX IF NOT EXISTS idx_paper_runs_status ON paper_trading_runs(status, started_at);",
     "CREATE INDEX IF NOT EXISTS idx_quick_sim_settled ON quick_sim_trades(settled, entry_ts);",
     "CREATE INDEX IF NOT EXISTS idx_hermes_obs_ts ON hermes_observations(ts);",
@@ -213,6 +253,11 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_hermes_skills_asset ON hermes_skills(asset, action);",
     "CREATE INDEX IF NOT EXISTS idx_macro_snapshots_ts ON macro_snapshots(ts);",
     "CREATE INDEX IF NOT EXISTS idx_macro_snapshots_key ON macro_snapshots(category, metric_key, ts);",
+    "CREATE INDEX IF NOT EXISTS idx_macro_events_published ON macro_events(published_at, indicator);",
+    "CREATE INDEX IF NOT EXISTS idx_data_quality_audit_source ON data_quality_audit(source, kind, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_data_quality_audit_event ON data_quality_audit(source, kind, event_id, payload_hash);",
+    "CREATE INDEX IF NOT EXISTS idx_data_quality_audit_accept ON data_quality_audit(accepted, decision_eligible, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_data_quarantine_source ON data_quarantine(source, kind, created_at);",
 ]
 
 
@@ -305,12 +350,19 @@ _STRATEGIES_COLUMNS: List[Tuple[str, str]] = [
     ("current_version_id", "INTEGER DEFAULT NULL"),
 ]
 
+_STRATEGY_VERSION_COLUMNS: List[Tuple[str, str]] = [
+    ("ai_prompt", "TEXT NOT NULL DEFAULT ''"),
+    ("analysis_structure", "TEXT NOT NULL DEFAULT '{}'"),
+]
+
 _CREATE_STRATEGY_VERSIONS = """
     CREATE TABLE IF NOT EXISTS strategy_versions (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         strategy_id INTEGER NOT NULL,
         version     INTEGER NOT NULL,
         params      TEXT    NOT NULL DEFAULT '{}',
+        ai_prompt   TEXT    NOT NULL DEFAULT '',
+        analysis_structure TEXT NOT NULL DEFAULT '{}',
         source      TEXT    NOT NULL DEFAULT 'manual'
             CHECK (source IN ('manual', 'seed', 'llm', 'backtest')),
         note        TEXT    NOT NULL DEFAULT '',
@@ -436,6 +488,72 @@ _CREATE_MACRO_SNAPSHOTS = """
     );
 """
 
+_CREATE_MACRO_EVENTS = """
+    CREATE TABLE IF NOT EXISTS macro_events (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id      TEXT NOT NULL UNIQUE,
+        source        TEXT NOT NULL DEFAULT '',
+        indicator     TEXT NOT NULL,
+        published_at  TEXT NOT NULL DEFAULT '',
+        country       TEXT NOT NULL DEFAULT '',
+        importance    INTEGER,
+        actual        REAL,
+        consensus     REAL,
+        previous      REAL,
+        unit          TEXT NOT NULL DEFAULT '',
+        time_period   TEXT NOT NULL DEFAULT '',
+        status        TEXT NOT NULL DEFAULT 'scheduled',
+        notified      INTEGER NOT NULL DEFAULT 0,
+        quality_status TEXT NOT NULL DEFAULT 'unverified',
+        quality_reason TEXT NOT NULL DEFAULT '',
+        decision_eligible INTEGER NOT NULL DEFAULT 0,
+        payload       TEXT NOT NULL DEFAULT '{}',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+"""
+
+_MACRO_EVENT_COLUMNS: List[Tuple[str, str]] = [
+    ("quality_status", "TEXT NOT NULL DEFAULT 'unverified'"),
+    ("quality_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("decision_eligible", "INTEGER NOT NULL DEFAULT 0"),
+    ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+]
+
+_CREATE_DATA_QUALITY_AUDIT = """
+    CREATE TABLE IF NOT EXISTS data_quality_audit (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        source             TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        event_id           TEXT NOT NULL DEFAULT '',
+        observed_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        published_at       TEXT NOT NULL DEFAULT '',
+        authority_tier     TEXT NOT NULL DEFAULT 'unknown',
+        accepted           INTEGER NOT NULL DEFAULT 0,
+        decision_eligible  INTEGER NOT NULL DEFAULT 0,
+        reason             TEXT NOT NULL DEFAULT '',
+        latency_ms         REAL,
+        payload_hash       TEXT NOT NULL DEFAULT '',
+        metadata           TEXT NOT NULL DEFAULT '{}',
+        created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+"""
+
+_CREATE_DATA_QUARANTINE = """
+    CREATE TABLE IF NOT EXISTS data_quarantine (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        source         TEXT NOT NULL,
+        kind           TEXT NOT NULL,
+        event_id       TEXT NOT NULL DEFAULT '',
+        observed_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        published_at   TEXT NOT NULL DEFAULT '',
+        reason         TEXT NOT NULL DEFAULT '',
+        payload        TEXT NOT NULL DEFAULT '{}',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (source, kind, event_id)
+    );
+"""
+
 _CREATE_BACKTEST_RUNS = """
     CREATE TABLE IF NOT EXISTS backtest_runs (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -479,6 +597,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.execute(_CREATE_HERMES_OBSERVATIONS)
     conn.execute(_CREATE_HERMES_SKILLS)
     conn.execute(_CREATE_MACRO_SNAPSHOTS)
+    conn.execute(_CREATE_MACRO_EVENTS)
+    conn.execute(_CREATE_DATA_QUALITY_AUDIT)
+    conn.execute(_CREATE_DATA_QUARANTINE)
     conn.execute(_CREATE_BACKTEST_RUNS)
     conn.execute("INSERT OR IGNORE INTO paper_trading_settings (id) VALUES (1)")
 
@@ -486,7 +607,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_columns(conn, "raw_news", _RAW_NEWS_COLUMNS)
     _ensure_columns(conn, "ai_decisions", _AI_DECISIONS_COLUMNS)
     _ensure_columns(conn, "strategies", _STRATEGIES_COLUMNS)
+    _ensure_columns(conn, "strategy_versions", _STRATEGY_VERSION_COLUMNS)
     _ensure_columns(conn, "paper_trading_settings", _PAPER_SETTINGS_COLUMNS)
+    _ensure_columns(conn, "macro_events", _MACRO_EVENT_COLUMNS)
 
     for stmt in _INDEXES:
         conn.execute(stmt)

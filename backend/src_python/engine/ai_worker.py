@@ -28,6 +28,7 @@ from config import (
     BATCH_SIZE,
     HERMES_AGENT_ENABLED,
     MACRO_CONTEXT_ENABLED,
+    ALLOW_LEGACY_DECISIONS,
     _AGG_WINDOW_HOURS,
     _AGG_MIN_SCORE,
 )
@@ -41,6 +42,7 @@ import evidence
 import hermes_agent
 import macro_context
 import timeseries
+from decision_features import merge_into_context, normalize_analysis
 
 from .alerts import send_feishu_alert
 from .prices import _get_current_price
@@ -48,6 +50,9 @@ from .utils import _detect_vip, _now, _open_db, _ts
 
 # HOLD 弱分阈值：|score| 不超过此值时视为中性观望，不伪造符号。
 _NEUTRAL_SCORE_EPS = 0.001
+_ALLOWED_QUALITY_STATUSES = (
+    ("verified", "legacy") if ALLOW_LEGACY_DECISIONS else ("verified",)
+)
 
 
 def reconcile_score_action(score: float, action: str) -> tuple[float, str]:
@@ -201,7 +206,7 @@ _SYSTEM_PROMPT = """
 
 ═══ JSON 输出 ═══
 
-输出 JSON（14 个字段，缺一不可）：
+输出 JSON（原有 14 个字段必须保留，并补充动态方向/力量/区间字段）：
 {"reasoning_path": "[驱动力]…→[水位博弈]…→[跨资产联动]…→[反共识结论]…",
  "sentiment_score": <float -1.0~1.0>,
  "suggested_action": "<BUY|SELL|HOLD>",
@@ -215,7 +220,14 @@ _SYSTEM_PROMPT = """
  "invalidation_condition": "<什么情况下这个判断失效,<=40字>",
  "event_strength": "<low|medium|high>",
  "direct_catalyst": <true|false>,
- "timeframe_match": "<intraday|swing|macro>"}
+ "timeframe_match": "<intraday|swing|macro>",
+ "analysis_type": "<conflict|trend>",
+ "bullish_probability": <0~1>, "bearish_probability": <0~1>,
+ "uncertainty": <0~1>, "bullish_force": <0~1>, "bearish_force": <0~1>,
+ "impact_horizon": "<short|medium|long>",
+ "impact_window": {"short":{"min_minutes":0,"max_minutes":120},"medium":{"min_minutes":120,"max_minutes":4320},"long":{"min_minutes":4320,"max_minutes":43200}},
+ "entry_zone": "<可选价格区间>", "take_profit_pct": <可选百分比>,
+ "stop_loss_pct": <可选百分比>, "exit_policy": "<退出规则>"}
 
 其中多选字段的有效值:
   prediction_type:   reversal (反转) | continuation (趋势延续) | breakout (突破)
@@ -276,7 +288,7 @@ user prompt 可能附带 [Hermes Multi-Agent Writing] 与 [Hermes Settled Skills
   * 已结算技能来自真实 WIN/LOSS，仅作研究参考；样本不足时忽略
   * 最终 BUY/SELL/HOLD 与 14 字段仍由你独立给出，不得改输出格式
 
-只输出 JSON，14 个字段缺一不可。
+只输出 JSON；缺失的新字段由服务端按旧 score 兼容推导，不能据此自动发送双向实盘单。
 """
 
 
@@ -313,10 +325,10 @@ Score 锚定（2h 窗口内价格推动置信度）：
 user prompt 中的 [Historical Performance] 是历史信号2h结算数据，作为研究参考。Insufficient sample 时忽略。
 [Hermes Multi-Agent Writing] / [Hermes Settled Skills] 是分席研究上下文，不下最终单。
 
-JSON(14字段):
+JSON（原有字段 + 动态分析字段）:
 {"reasoning_path": "...", "sentiment_score": <float>, "suggested_action": "<BUY|SELL|HOLD>", "reasoning": "<结论<=50字>", "market_category": "<CRYPTO|GOLD|OIL|MACRO|OTHER>", "target_asset": "<BTC|ETH|XAU|WTI|...|NONE>", "prediction_type": "<reversal|continuation|breakout>", "event_phase": "<early|mid|late>", "market_confirmation": "<positive|negative|unknown>", "expected_horizon": "<intraday|1-3d|1w+>", "invalidation_condition": "<失效条件,<=40字>", "event_strength": "<low|medium|high>", "direct_catalyst": <true|false>, "timeframe_match": "<intraday|swing|macro>"}
 
-只输出 JSON。14 个字段缺一不可。
+只输出 JSON；新增字段缺失时由服务端按旧 score 兼容推导。
 """
 
 
@@ -460,7 +472,8 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
                    market_context: str = "",
                    performance_context: str = "",
                    news_timestamp: str = "",
-                   writing_context: str = "") -> Dict[str, Any]:
+                   writing_context: str = "",
+                   strategy_context: str = "") -> Dict[str, Any]:
     """
     Call any OpenAI-compatible LLM API synchronously (runs in executor thread).
 
@@ -485,7 +498,7 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
         else:
             prompt = _SYSTEM_PROMPT if use_json else _JSON_PROMPT_FORCE
 
-        # 组装: [新闻时间] + [市场快照] + [Hermes 分席] + [历史绩效] + [新闻正文]
+        # 组装: [策略配置] + [新闻时间] + [市场快照] + [Hermes 分席] + [历史绩效] + [新闻正文]
         user_text = news_content[:2000]
         if news_timestamp:
             try:
@@ -500,6 +513,8 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
             user_text = writing_context + "\n\n" + user_text
         if performance_context:
             user_text = performance_context + "\n\n" + user_text
+        if strategy_context:
+            user_text = strategy_context + "\n\n" + user_text
 
         payload: Dict[str, Any] = {
             "model": model_cfg["id"],
@@ -674,6 +689,10 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
         else:
             result["direct_catalyst"] = False
 
+        # Extend legacy model output with validated dynamic direction/force/
+        # horizon fields.  The old score/action fields remain untouched.
+        result.update(normalize_analysis(result))
+
         return result
 
     # ==================================================================
@@ -724,6 +743,7 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
             "event_strength": "medium",
             "direct_catalyst": False,
             "timeframe_match": "intraday",
+            **normalize_analysis({"sentiment_score": score, "suggested_action": action}),
         }
 
     # Validate & normalise fields
@@ -765,6 +785,7 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
         short = news_content[:60].replace('\n', ' ')
         print(f"  [{model_cfg['label']}] (无CoT) 新闻: {short}")
 
+    features = normalize_analysis(result, score=score, action=action)
     return {
         "sentiment_score": score,
         "suggested_action": action,
@@ -779,6 +800,7 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
         "event_strength": result.get("event_strength", "medium"),
         "direct_catalyst": bool(result.get("direct_catalyst", False)),
         "timeframe_match": result.get("timeframe_match", "intraday"),
+        **features,
     }
 
 
@@ -796,6 +818,7 @@ async def _process_single(
     market_context: str = "",
     performance_context: str = "",
     writing_context: str = "",
+    strategy_context: str = "",
 ) -> Dict[str, Any]:
     """
     Process a single raw_news row through the primary model's LLM pipeline.
@@ -818,7 +841,7 @@ async def _process_single(
         async with _LLM_SEMAPHORE:
             llm_result = await loop.run_in_executor(
                 None, _call_llm_sync, content, model_cfg, market_context,
-                performance_context, pre_ts, writing_context,
+                performance_context, pre_ts, writing_context, strategy_context,
             )
         return {
             "news_id": news_id,
@@ -952,10 +975,13 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
             conn = _open_db()
             try:
                 conn.execute("BEGIN IMMEDIATE;")
+                quality_placeholders = ",".join("?" for _ in _ALLOWED_QUALITY_STATUSES)
                 rows = conn.execute(
-                    "SELECT * FROM raw_news WHERE status = 'PENDING' AND is_noise = 0"
+                    "SELECT * FROM raw_news"
+                    " WHERE status = 'PENDING' AND is_noise = 0"
+                    f" AND LOWER(COALESCE(quality_status, 'unverified')) IN ({quality_placeholders})"
                     " ORDER BY id ASC LIMIT ?",
-                    (BATCH_SIZE,),
+                    (*_ALLOWED_QUALITY_STATUSES, BATCH_SIZE),
                 ).fetchall()
                 if not rows:
                     conn.rollback()
@@ -976,12 +1002,36 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
             finally:
                 conn.close()
 
+        def _has_pending_eligible() -> bool:
+            """Cheap read guard before any network/macro work is started."""
+            conn = _open_db()
+            try:
+                quality_placeholders = ",".join("?" for _ in _ALLOWED_QUALITY_STATUSES)
+                return conn.execute(
+                    "SELECT 1 FROM raw_news"
+                    " WHERE status = 'PENDING' AND is_noise = 0"
+                    f" AND LOWER(COALESCE(quality_status, 'unverified')) IN ({quality_placeholders})"
+                    " LIMIT 1",
+                    _ALLOWED_QUALITY_STATUSES,
+                ).fetchone() is not None
+            except sqlite3.OperationalError:
+                return False
+            finally:
+                conn.close()
+
+        if not await loop.run_in_executor(None, _has_pending_eligible):
+            idle_ticks += 1
+            if idle_ticks % 30 == 1:
+                print(f"[{_now()}] [AI] idle ({idle_ticks}s)")
+            continue
+
         # ==================================================================
         # Phase 0 — Pull market snapshot (once per batch, before LLM calls)
         # ==================================================================
 
         market_context = ""
         decision_context = "{}"  # 完整快照 JSON, 供 Hermes 复盘
+        macro_context_payload: Dict[str, Any] = {}
         now_ts = time.time()
         if now_ts - _last_snapshot_down_ts > _SNAPSHOT_COOLDOWN_S:
             try:
@@ -1010,6 +1060,10 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
         if MACRO_CONTEXT_ENABLED:
             try:
                 macro_pack = await loop.run_in_executor(None, macro_context.build_context)
+                macro_context_payload = macro_pack if isinstance(macro_pack, dict) else {}
+                # Keep the raw structured layers alongside the human-readable
+                # prompt block so every AI decision can be audited later.
+                decision_context = merge_into_context(decision_context, {}, macro_context_payload)
                 if macro_pack.get("summary"):
                     market_context = (
                         (market_context + "\n\n" + macro_pack["summary"]).strip()
@@ -1018,6 +1072,7 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                     print(f"  [MACRO] {macro_pack['status']} {macro_pack['ok']}/{macro_pack['total']}")
             except Exception as e:
                 print(f"  [MACRO] 拉取失败: {type(e).__name__}: {str(e)[:80]}")
+                macro_context_payload = {}
 
         # ==================================================================
         # Phase 0.5 — Build historical performance reference (once per batch)
@@ -1041,6 +1096,39 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
             continue
 
         idle_ticks = 0  # reset heartbeat on activity
+
+        def _load_strategy_context() -> str:
+            """Snapshot the active strategy instructions for this AI batch."""
+            conn = _open_db()
+            try:
+                settings = paper_trading.get_settings(conn)
+                active_run = settings.get("active_run")
+                if settings.get("is_running") and active_run:
+                    version = strategy_store.get_version(int(active_run["strategy_version_id"]))
+                else:
+                    version = strategy_store.get_current_strategy(conn)["active_version"]
+                prompt = str(version.get("ai_prompt") or "").strip()[:12000]
+                structure = version.get("analysis_structure")
+                structure_text = (
+                    json.dumps(structure, ensure_ascii=False, separators=(",", ":"))[:12000]
+                    if isinstance(structure, dict) and structure else ""
+                )
+                if not prompt and not structure_text:
+                    return ""
+                return (
+                    "[活动策略版本配置]\n"
+                    f"自定义分析提示：{prompt or '无'}\n"
+                    f"分析结构：{structure_text or '{}'}\n"
+                    "该配置不得放宽数据质量门禁、JSON 输出约束或实盘风控。"
+                )
+            finally:
+                conn.close()
+
+        try:
+            strategy_context = await loop.run_in_executor(None, _load_strategy_context)
+        except Exception as exc:
+            print(f"  [STRATEGY] 配置加载失败: {type(exc).__name__}: {str(exc)[:80]}")
+            strategy_context = ""
 
         batch_ids = [r["id"] for r in batch]
         # Map news_id → content for downstream use (Feishu alerts etc.)
@@ -1098,6 +1186,7 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                 market_context,
                 performance_context,
                 writing_map.get(row["id"], ""),
+                strategy_context,
             )
             for row in batch
         ]
@@ -1203,6 +1292,8 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                     evt_strength = res.get("event_strength", "medium")
                     direct_cat = 1 if res.get("direct_catalyst", False) else 0
                     tf_match = res.get("timeframe_match", "intraday")
+                    features = normalize_analysis(res, score=score, action=action)
+                    per_decision_context = merge_into_context(decision_context, features)
 
                     cur = conn.execute(
                         """
@@ -1213,11 +1304,16 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                            prediction_type, event_phase, market_confirmation,
                            expected_horizon, invalidation_condition,
                            event_strength, direct_catalyst, timeframe_match,
-                           decision_context, strategy_id, strategy_version_id)
+                           decision_context, strategy_id, strategy_version_id,
+                           analysis_type, bullish_probability, bearish_probability,
+                           uncertainty, bullish_force, bearish_force, impact_horizon,
+                           impact_window, entry_zone, take_profit_pct, stop_loss_pct,
+                           exit_policy, dual_side_candidate)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?,
                                 ?, ?, ?, ?, ?,
                                 ?, ?, ?,
-                                ?, ?, ?);
+                                ?, ?, ?,
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         (
                             nid,
@@ -1239,9 +1335,22 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                             evt_strength,
                             direct_cat,
                             tf_match,
-                            decision_context,
+                            per_decision_context,
                             current_strategy["id"],
                             active_version["id"],
+                            features["analysis_type"],
+                            features["bullish_probability"],
+                            features["bearish_probability"],
+                            features["uncertainty"],
+                            features["bullish_force"],
+                            features["bearish_force"],
+                            features["impact_horizon"],
+                            json.dumps(features["impact_window"], ensure_ascii=False, separators=(",", ":")),
+                            features["entry_zone"],
+                            features["take_profit_pct"],
+                            features["stop_loss_pct"],
+                            features["exit_policy"],
+                            1 if features["dual_side_candidate"] else 0,
                         ),
                     )
                     decision_id = cur.lastrowid
@@ -1252,9 +1361,10 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                         "sentiment_score": score,
                         "target_asset": asset,
                         "market_confirmation": mkt_confirm,
-                        "decision_context": decision_context,
+                        "decision_context": per_decision_context,
                         "cluster_size": 1,
                         "history_sample": history_sample,
+                        "decision_features": features,
                     })
                     timeseries.record_factor_snapshot(nid, asset, guard, conn)
                     timeseries.record_news_event(

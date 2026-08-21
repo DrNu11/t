@@ -42,6 +42,7 @@ import config
 import db
 import evidence
 import macro_context
+import data_quality
 import decision_guard
 import market_feeds
 import timeseries
@@ -217,6 +218,8 @@ def _row_to_event(row) -> Dict[str, Any]:
         "timestamp": _format_time(_safe(row, "timestamp")),
         "ai_time": _format_time(_safe(row, "created_at")) if decision_id is not None else "——",
         "source": _safe(row, "source") or "FinancialJuice",
+        "quality_status": _safe(row, "quality_status") or "unverified",
+        "quality_reason": _safe(row, "quality_reason") or "",
         "news_text": re.sub(r'\[hash:[a-fA-F0-9]+\]\s*', '', (_safe(row, "news_text") or "")[:200]),
         "action": (_safe(row, "action") or "HOLD").upper(),
         "score": round(_safe(row, "score"), 2) if _safe(row, "score") is not None else 0.0,
@@ -234,6 +237,8 @@ def _row_to_event(row) -> Dict[str, Any]:
         "max_price_time": _safe(row, "max_price_time") or 0,
         "min_price_time": _safe(row, "min_price_time") or 0,
         "entry_time": _safe(row, "entry_time") or "",
+        "exit_time": _safe(row, "exit_time") or "",
+        "exit_reason": _safe(row, "exit_reason") or "",
         "is_correct": _safe(row, "is_correct") or "",
         "settled": _safe(row, "settled") or 0,
         "doubao_action": _safe(row, "doubao_action") or "HOLD",
@@ -251,6 +256,19 @@ def _row_to_event(row) -> Dict[str, Any]:
         "expected_horizon": _safe(row, "expected_horizon") or "1-3d",
         "invalidation_condition": _safe(row, "invalidation_condition") or "",
         "decision_context": _safe(row, "decision_context") or "{}",
+        "analysis_type": _safe(row, "analysis_type") or "trend",
+        "bullish_probability": _safe(row, "bullish_probability"),
+        "bearish_probability": _safe(row, "bearish_probability"),
+        "uncertainty": _safe(row, "uncertainty"),
+        "bullish_force": _safe(row, "bullish_force"),
+        "bearish_force": _safe(row, "bearish_force"),
+        "impact_horizon": _safe(row, "impact_horizon") or "medium",
+        "impact_window": _safe(row, "impact_window") or "{}",
+        "entry_zone": _safe(row, "entry_zone") or "",
+        "take_profit_pct": _safe(row, "take_profit_pct"),
+        "stop_loss_pct": _safe(row, "stop_loss_pct"),
+        "exit_policy": _safe(row, "exit_policy") or "horizon_or_signal_flip",
+        "dual_side_candidate": _safe(row, "dual_side_candidate") or 0,
         # ── Phase 0.5: 结果追踪指标 ──
         "mfe_pct": _safe(row, "mfe_pct"),
         "mae_pct": _safe(row, "mae_pct"),
@@ -283,6 +301,8 @@ _EVENT_SELECT = """
         rn.id AS news_id,
         rn.timestamp,
         rn.source,
+        rn.quality_status,
+        rn.quality_reason,
         rn.content AS news_text,
         rn.status AS analysis_status,
         ad.id AS decision_id,
@@ -325,7 +345,20 @@ _EVENT_SELECT = """
         ad.mfe_pct,
         ad.mae_pct,
         ad.forward_pnl,
-        ad.mfe_time_mins
+        ad.mfe_time_mins,
+        ad.analysis_type,
+        ad.bullish_probability,
+        ad.bearish_probability,
+        ad.uncertainty,
+        ad.bullish_force,
+        ad.bearish_force,
+        ad.impact_horizon,
+        ad.impact_window,
+        ad.entry_zone,
+        ad.take_profit_pct,
+        ad.stop_loss_pct,
+        ad.exit_policy,
+        ad.dual_side_candidate
     FROM raw_news rn
     LEFT JOIN ai_decisions ad ON ad.id = (
         SELECT MAX(latest.id) FROM ai_decisions latest WHERE latest.news_id = rn.id
@@ -684,6 +717,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(wti_http_watcher(), name="wti_http"),
         asyncio.create_task(wti_mt5_watcher(), name="wti_mt5"),
         asyncio.create_task(news_source_watcher(), name="news_sources"),
+        asyncio.create_task(macro_calendar_watcher(), name="macro_calendar"),
         asyncio.create_task(quick_sim_watcher(), name="quick_sim"),
     ]
     yield
@@ -1187,15 +1221,39 @@ def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
     inserted = 0
     conn = db.get_connection()
     try:
+        data_quality.ensure_schema(conn)
         for item in items:
             title = str(item.get("title") or "").strip()
             summary = str(item.get("summary") or item.get("body") or "").strip()
             if not title:
                 continue
             source = str(item.get("source") or "External")
+            published_value = item.get("published_at") or item.get("time")
             external_key = f"{source}:{item.get('id') or title}"
             marker = hashlib.sha256(external_key.encode("utf-8")).hexdigest()[:24]
             if conn.execute("SELECT 1 FROM raw_news WHERE content LIKE ? LIMIT 1", (f"[hash:{marker}]%",)).fetchone():
+                continue
+            quality = data_quality.assess(
+                source=source,
+                kind="news",
+                event_id=item.get("id") or title,
+                published_at=published_value,
+                payload=item,
+            )
+            if (
+                not quality.decision_eligible
+                and data_quality.observation_already_recorded(conn, quality, item)
+            ):
+                continue
+            data_quality.record(
+                conn,
+                quality,
+                published_at=published_value,
+                payload=item,
+                metadata={"provider_id": str(item.get("id") or "")[:200]},
+                quarantine=not quality.decision_eligible,
+            )
+            if not quality.accepted or not quality.decision_eligible:
                 continue
             content = f"[hash:{marker}] {title}"
             if summary and summary not in title:
@@ -1203,7 +1261,7 @@ def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
             if not news_sources.allow_ingest(source, conn):
                 continue
             filtered = evaluate_news(title, summary)
-            normalized_ts = _external_timestamp(item.get("published_at") or item.get("time"))
+            normalized_ts = _external_timestamp(published_value)
             timestamp, ts_epoch = normalized_ts or (_now(), int(time.time()))
             news_id = db.insert_raw_news(
                 conn,
@@ -1214,6 +1272,8 @@ def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
                 is_noise=int(filtered["is_noise"]),
                 relevance_score=float(filtered["relevance_score"]),
                 ts=ts_epoch,
+                quality_status=quality.quality_status,
+                quality_reason=quality.reason,
             )
             try:
                 timeseries.record_news_event(
@@ -1267,14 +1327,45 @@ async def news_source_watcher() -> None:
         await asyncio.sleep(poll_seconds)
 
 
+async def macro_calendar_watcher() -> None:
+    """Low-frequency calendar sync; dormant until explicitly configured."""
+    while True:
+        try:
+            if (
+                getattr(config, "MACRO_CALENDAR_ENABLED", False)
+                and config.JIN10_ENABLED
+                and config.JIN10_CALENDAR_URL
+            ):
+                result = await asyncio.to_thread(macro_context.sync_jin10_calendar)
+                if result.get("status") not in {"ok", "disabled"}:
+                    print(f"[MACRO-CALENDAR] {result.get('reason') or result.get('status')}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[MACRO-CALENDAR] {type(exc).__name__}: {exc}")
+        await asyncio.sleep(getattr(config, "MACRO_CALENDAR_POLL_SECONDS", 60))
+
+
+def _market_item_quality(item: Dict[str, Any], payload: Dict[str, Any]) -> data_quality.QualityDecision:
+    published_at = item.get("event_ts") or item.get("updated_at") or payload.get("updated_at")
+    return data_quality.assess(
+        source=str(item.get("source") or ""),
+        kind="market",
+        event_id=f"{str(item.get('asset') or '').upper()}:{published_at}",
+        published_at=published_at,
+        payload=item,
+    )
+
+
 def _market_price_from_cache(asset: str) -> float | None:
-    """只读多源行情缓存，避免在 quick_sim 写库时再次打开同一 SQLite。"""
+    """只读已通过决策门禁的行情缓存，候选价不可作为盈亏标签。"""
     payload = _MARKET_CACHE.get("value") or {}
     for item in payload.get("items") or []:
         if str(item.get("asset") or "").upper() != (asset or "").upper():
             continue
         price = item.get("price")
-        if isinstance(price, (int, float)) and price > 0:
+        quality = _market_item_quality(item, payload)
+        if quality.decision_eligible and isinstance(price, (int, float)) and price > 0:
             return float(price)
     return None
 
@@ -1593,6 +1684,8 @@ async def _do_export_excel():
                 ad.entry_price, ad.exit_price, ad.max_price, ad.min_price,
                 ad.max_price_time, ad.min_price_time,
                 ad.entry_time,
+                ad.exit_time,
+                ad.exit_reason,
                 ad.is_correct,
                 ad.cluster_size,
                 ad.prediction_type,
@@ -2067,6 +2160,70 @@ async def get_macro_context(refresh: int = 0):
     return {"status": "ok", "items": latest}
 
 
+@app.get("/api/macro/calendar")
+async def get_macro_calendar(
+    refresh: int = 0,
+    start: str = "",
+    end: str = "",
+    limit: int = 200,
+    verified_only: int = 0,
+):
+    """Government/macro schedule and releases, with source quality attached."""
+    sync_result: Dict[str, Any] | None = None
+    if refresh:
+        sync_result = await asyncio.to_thread(macro_context.sync_jin10_calendar)
+    items = await asyncio.to_thread(
+        macro_context.list_macro_events,
+        start=start,
+        end=end,
+        limit=limit,
+        decision_eligible=True if verified_only else None,
+    )
+    return {
+        "status": "ok" if items else "empty",
+        "items": items,
+        "sync": sync_result,
+        "note": "候选日历仅展示/验证；decision_eligible=true 才可进入 AI 或交易闸门。",
+    }
+
+
+def _data_quality_summary_sync() -> Dict[str, Any]:
+    conn = db.get_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        data_quality.ensure_schema(conn)
+        rows = conn.execute(
+            """SELECT source, kind,
+                      COUNT(*) AS total,
+                      SUM(accepted) AS accepted,
+                      SUM(decision_eligible) AS decision_eligible,
+                      SUM(CASE WHEN accepted=0 THEN 1 ELSE 0 END) AS rejected,
+                      ROUND(AVG(CASE WHEN latency_ms >= 0 THEN latency_ms END), 2) AS avg_latency_ms,
+                      MAX(created_at) AS last_seen_at
+               FROM data_quality_audit
+               GROUP BY source, kind
+               ORDER BY source, kind"""
+        ).fetchall()
+        quarantine = int(conn.execute("SELECT COUNT(*) FROM data_quarantine").fetchone()[0])
+        return {"items": [dict(row) for row in rows], "quarantine_count": quarantine}
+    finally:
+        conn.close()
+
+
+@app.get("/api/data-quality/policies")
+async def get_data_quality_policies():
+    return {
+        "policy_version": "source-policy-v1",
+        "fail_closed": True,
+        "sources": data_quality.policies_as_dict(),
+    }
+
+
+@app.get("/api/data-quality/summary")
+async def get_data_quality_summary():
+    return await asyncio.to_thread(_data_quality_summary_sync)
+
+
 @app.get("/api/health")
 async def health_check():
     """Liveness probe."""
@@ -2427,12 +2584,27 @@ async def get_replay_signals(
                 ad.max_price_time,
                 ad.min_price_time,
                 ad.entry_time,
+                ad.exit_time,
+                ad.exit_reason,
                 ad.is_correct,
                 ad.settled,
                 ad.mfe_pct,
                 ad.mae_pct,
                 ad.forward_pnl,
                 ad.mfe_time_mins,
+                ad.analysis_type,
+                ad.bullish_probability,
+                ad.bearish_probability,
+                ad.uncertainty,
+                ad.bullish_force,
+                ad.bearish_force,
+                ad.impact_horizon,
+                ad.impact_window,
+                ad.entry_zone,
+                ad.take_profit_pct,
+                ad.stop_loss_pct,
+                ad.exit_policy,
+                ad.dual_side_candidate,
                 ad.extra_models_consensus,
                 ad.doubao_action,
                 ad.doubao_reasoning,
@@ -2461,7 +2633,7 @@ async def get_replay_signals(
     out: list[dict] = []
     for r in rows:
         d = dict(r)
-        for json_field in ("extra_models_consensus", "strategy_params"):
+        for json_field in ("extra_models_consensus", "strategy_params", "impact_window"):
             value = d.get(json_field)
             if value and isinstance(value, str):
                 try:
@@ -2506,11 +2678,39 @@ def _paper_metrics(signal: Dict[str, Any], current_price: Optional[float]) -> Di
     params = signal.get("strategy_params") or strategy_store.default_params()
     notional = float(params.get("notional_usdt") or 0.0)
     leverage = float(params.get("leverage") or 1.0)
+    exit_reason = "tracking"
+    if int(signal.get("settled") or 0):
+        verdict = str(signal.get("is_correct") or "").upper()
+        exit_reason = {
+            "WIN": "take_profit_or_horizon",
+            "LOSS": "stop_loss_or_horizon",
+            "HOLD": "horizon_without_edge",
+            "BREAKEVEN": "breakeven",
+        }.get(verdict, "settled")
+    hold_minutes = None
+    entry_time = signal.get("entry_time")
+    if entry_time:
+        try:
+            started = datetime.fromisoformat(str(entry_time).replace("Z", "+00:00"))
+            end_value = signal.get("created_at") if not signal.get("settled") else signal.get("exit_time")
+            if end_value:
+                ended = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
+                hold_minutes = max(0.0, (ended - started).total_seconds() / 60.0)
+        except (TypeError, ValueError):
+            hold_minutes = None
     return {
         **signal,
         "current_price": current_price,
         "current_pnl_pct": round(pnl, 4) if pnl is not None else None,
         "current_pnl_usdt": round(notional * leverage * pnl / 100, 4) if pnl is not None else None,
+        "notional_usdt": round(notional, 4),
+        "leverage": leverage,
+        "margin_usdt": round(notional, 4),
+        "gross_pnl_usdt": round(notional * leverage * pnl / 100, 4) if pnl is not None else None,
+        "fees_usdt": 0.0,
+        "slippage_usdt": 0.0,
+        "hold_minutes": round(hold_minutes, 2) if hold_minutes is not None else None,
+        "exit_reason": exit_reason,
         "live_mfe_pct": round(max(0.0, mfe), 4),
         "live_mae_pct": round(max(0.0, mae), 4),
         "pricing_status": "LIVE" if current_price is not None else "UNAVAILABLE",
@@ -2597,16 +2797,32 @@ def _replay_pairs(settings: Dict[str, Any], market: Dict[str, Any]) -> list[Dict
     for track in settings.get("tracks", []):
         for asset, symbol in symbols.get(track, ()):
             item = item_map.get(asset)
-            price = item.get("price") if item else _get_current_price(asset)
+            if item:
+                quality = _market_item_quality(item, market)
+                price = item.get("price")
+                source = str(item.get("source") or "")
+                quality_status = quality.quality_status
+                quality_reason = quality.reason
+                decision_eligible = quality.decision_eligible
+            else:
+                price = _get_current_price(asset)
+                source = "OKX direct" if price else "unavailable"
+                quality_status = "verified" if price else "unavailable"
+                quality_reason = "verified_source" if price else "no_verified_quote"
+                decision_eligible = bool(price)
+            has_price = isinstance(price, (int, float)) and price > 0
             pairs.append({
                 "asset": asset,
                 "symbol": symbol,
                 "track": track,
-                "price": round(float(price), 6) if isinstance(price, (int, float)) and price > 0 else None,
+                "price": round(float(price), 6) if has_price else None,
                 "change24h": round(float(item.get("change24h")), 4) if item and item.get("change24h") is not None else None,
-                "source": item.get("source") if item else "fallback",
+                "source": source,
                 "source_count": int(item.get("sourceCount") or 1) if item else (1 if price else 0),
-                "status": "LIVE" if price else "UNAVAILABLE",
+                "status": "LIVE" if has_price and decision_eligible else ("OBSERVATION_ONLY" if has_price else "UNAVAILABLE"),
+                "quality_status": quality_status,
+                "quality_reason": quality_reason,
+                "decision_eligible": decision_eligible,
             })
     return pairs
 
@@ -2718,6 +2934,8 @@ async def get_replay_positions(limit: int = 200):
         float((item.get("strategy_params") or strategy_store.default_params()).get("notional_usdt") or 0.0)
         for item in tracking
     )
+    fees = sum(float(item.get("fees_usdt") or 0.0) for item in positions)
+    slippage = sum(float(item.get("slippage_usdt") or 0.0) for item in positions)
     initial = config.PAPER_INITIAL_EQUITY_USDT
     equity = initial + realized + unrealized
     return {
@@ -2737,6 +2955,9 @@ async def get_replay_positions(limit: int = 200):
             "unrealized_pnl_usdt": round(unrealized, 4) if not unpriced else None,
             "current_equity_usdt": round(equity, 4) if not unpriced else None,
             "used_margin_usdt": round(used_margin, 4),
+            "fees_usdt": round(fees, 4),
+            "slippage_usdt": round(slippage, 4),
+            "trade_count": len(positions),
             "available_equity_usdt": round(equity - used_margin, 4) if not unpriced else None,
             "unpriced_positions": unpriced,
         },
@@ -2826,6 +3047,78 @@ async def get_replay_stats(strategy_id: Optional[int] = None, version_id: Option
         "by_asset": by_asset,
         "by_action": by_action,
         "is_paper_trading": True,
+    }
+
+
+@app.get("/api/replay/reflection")
+async def get_replay_reflection(limit: int = 500):
+    """Return a deterministic post-trade review for model/self-reflection UI.
+
+    This endpoint intentionally reports observable patterns only.  It does not
+    ask an LLM to invent causes; a later strategy version may feed this compact
+    summary into a human-approved prompt.
+    """
+    signals = await get_replay_signals(settled=1, limit=min(max(limit, 20), 500))
+    decided = [item for item in signals if str(item.get("is_correct") or "").upper() in {"WIN", "LOSS"}]
+    wins = [item for item in decided if str(item.get("is_correct")).upper() == "WIN"]
+    losses = [item for item in decided if str(item.get("is_correct")).upper() == "LOSS"]
+
+    def grouped(field: str) -> list[Dict[str, Any]]:
+        buckets: Dict[str, list[Dict[str, Any]]] = {}
+        for item in decided:
+            key = str(item.get(field) or "unknown")
+            buckets.setdefault(key, []).append(item)
+        result = []
+        for key, rows in sorted(buckets.items(), key=lambda pair: -len(pair[1])):
+            local_wins = sum(str(row.get("is_correct")).upper() == "WIN" for row in rows)
+            pnls = [float(row.get("forward_pnl")) for row in rows if row.get("forward_pnl") is not None]
+            result.append({
+                "key": key,
+                "sample": len(rows),
+                "wins": local_wins,
+                "losses": len(rows) - local_wins,
+                "winrate": round(local_wins / len(rows), 4) if rows else 0.0,
+                "avg_forward_pnl": round(sum(pnls) / len(pnls), 4) if pnls else None,
+            })
+        return result
+
+    patterns = {
+        "uncertain_direction_loss": sum(
+            float(item.get("uncertainty") or 0) >= 0.4 for item in losses
+        ),
+        "conflict_event_loss": sum(
+            str(item.get("analysis_type") or "").lower() == "conflict" for item in losses
+        ),
+        "trend_event_loss": sum(
+            str(item.get("analysis_type") or "").lower() == "trend" for item in losses
+        ),
+        "adverse_excursion_dominated": sum(
+            float(item.get("mae_pct") or 0) > float(item.get("mfe_pct") or 0) for item in losses
+        ),
+        "market_not_confirmed": sum(
+            str(item.get("market_confirmation") or "").lower() == "negative" for item in losses
+        ),
+    }
+    recommendations: list[str] = []
+    if patterns["uncertain_direction_loss"]:
+        recommendations.append("不确定性较高的信号先进入双向模拟/人工复核，不直接放大实盘仓位。")
+    if patterns["adverse_excursion_dominated"]:
+        recommendations.append("亏损单的 MAE 多于 MFE，优先复核入场节点与止损距离。")
+    if patterns["market_not_confirmed"]:
+        recommendations.append("盘面未确认的新闻降低阈值通过率，等待结构或资金流确认。")
+    if not recommendations:
+        recommendations.append("当前样本未发现稳定失败模式，继续积累可结算样本后再调参。")
+    return {
+        "sample": len(decided),
+        "wins": len(wins),
+        "losses": len(losses),
+        "winrate": round(len(wins) / len(decided), 4) if decided else 0.0,
+        "by_analysis_type": grouped("analysis_type"),
+        "by_horizon": grouped("impact_horizon"),
+        "by_asset": grouped("asset"),
+        "failure_patterns": patterns,
+        "recommendations": recommendations,
+        "method": "deterministic_replay_review_v1",
     }
 
 
@@ -2935,12 +3228,16 @@ class StrategyCreateBody(BaseModel):
     name: str
     description: str = ""
     params: Dict[str, Any] = {}
+    ai_prompt: str = ""
+    analysis_structure: Dict[str, Any] = {}
 
 
 class StrategyVersionBody(BaseModel):
     params: Dict[str, Any]
     note: str = ""
     source: str = "manual"
+    ai_prompt: str = ""
+    analysis_structure: Dict[str, Any] = {}
 
 
 class StrategyActivateBody(BaseModel):
@@ -2954,6 +3251,8 @@ class BacktestBody(BaseModel):
     asset: str = ""
     limit: int = 500
     persist: bool = True
+    ai_prompt: Optional[str] = None
+    analysis_structure: Optional[Dict[str, Any]] = None
 
 
 class OptimizeBody(BaseModel):
@@ -2994,6 +3293,7 @@ async def create_strategy(body: StrategyCreateBody):
     try:
         return await asyncio.to_thread(
             strategy_store.create_strategy, body.name, body.description, body.params,
+            ai_prompt=body.ai_prompt, analysis_structure=body.analysis_structure,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3008,7 +3308,13 @@ async def strategy_defaults():
             "notional_usdt": {"min": 5, "max": 500},
             "leverage": {"min": 1, "max": 20},
             "trailing_callback_rate": {"min": 0.1, "max": 5},
-            "holding_horizon_minutes": {"min": 15, "max": 240},
+            "holding_horizon_minutes": {"min": 15, "max": 10080},
+            "short_horizon_minutes": {"min": 5, "max": 240},
+            "medium_horizon_minutes": {"min": 240, "max": 4320},
+            "long_horizon_minutes": {"min": 4320, "max": 43200},
+            "take_profit_pct": {"min": 0, "max": 20},
+            "stop_loss_pct": {"min": 0, "max": 20},
+            "uncertainty_threshold": {"min": 0.4, "max": 0.8},
         },
         "assets": sorted(a for a in strategy_store.ALLOWED_ASSETS if a),
         "strengths": [item for item in strategy_store.ALLOWED_STRENGTH if item],
@@ -3027,6 +3333,7 @@ async def add_strategy_version(strategy_id: int, body: StrategyVersionBody):
         return await asyncio.to_thread(
             strategy_store.add_version, strategy_id, body.params,
             source=body.source, note=body.note,
+            ai_prompt=body.ai_prompt, analysis_structure=body.analysis_structure,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -3058,6 +3365,11 @@ async def run_strategy_backtest(body: BacktestBody):
         version = latest
     params = strategy_store.clamp_params(body.params or version["params"])
     report = await asyncio.to_thread(backtest.run_backtest, params, asset=body.asset, limit=body.limit)
+    report["ai_prompt"] = body.ai_prompt if body.ai_prompt is not None else version.get("ai_prompt", "")
+    report["analysis_structure"] = (
+        body.analysis_structure if body.analysis_structure is not None
+        else version.get("analysis_structure", {})
+    )
     run_id = None
     if body.persist:
         run_id = await asyncio.to_thread(
@@ -3126,7 +3438,10 @@ async def optimize_strategy(body: OptimizeBody):
         fallback = backtest.optimize_params(version["params"], report)
         next_params, note, mode = fallback["params"], "；".join(fallback["notes"]), "rules"
     saved = await asyncio.to_thread(
-        strategy_store.add_version, body.strategy_id, next_params, source="llm" if mode == "llm" else "backtest", note=note,
+        strategy_store.add_version, body.strategy_id, next_params,
+        source="llm" if mode == "llm" else "backtest", note=note,
+        ai_prompt=version.get("ai_prompt", ""),
+        analysis_structure=version.get("analysis_structure", {}),
     )
     return {
         "mode": mode,
