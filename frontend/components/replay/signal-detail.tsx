@@ -116,6 +116,11 @@ export function SignalDetail({ signal }: Props) {
 
       {/* Dynamic news classification and direction strength */}
       <Section title="动态方向 / 力量分析">
+        {!signal.decision_eligible && (
+          <div className="mb-2 rounded border border-border bg-secondary px-2 py-1.5 font-mono text-[10px] leading-relaxed text-muted-foreground">
+            此记录属于旧研究或未验证数据，动态字段按历史原值保留，不代表当前正式算法输出。
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <KV label="类型" value={signal.analysis_type || 'trend'} />
           <KV label="影响区间" value={signal.impact_horizon || signal.expected_horizon || '—'} />

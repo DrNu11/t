@@ -3330,8 +3330,11 @@ async def get_replay_signal_kline(signal_id: int):
             SELECT
                 ad.id, ad.entry_price, ad.exit_price, ad.max_price,
                 ad.min_price, ad.max_price_time, ad.min_price_time,
-                ad.target_asset, ad.entry_time
+                ad.target_asset, ad.entry_time, ad.exit_time,
+                ad.suggested_action, ad.invalidation_condition, ad.settled,
+                sv.params AS strategy_params
             FROM ai_decisions ad
+            LEFT JOIN strategy_versions sv ON sv.id = ad.strategy_version_id
             WHERE ad.id = ?
             """,
             (signal_id,),
@@ -3348,13 +3351,15 @@ async def get_replay_signal_kline(signal_id: int):
 
     # Convert entry_time to epoch seconds
     entry_time = d.get("entry_time")
-    if isinstance(entry_time, str):
+    if isinstance(entry_time, str) and entry_time.strip():
         try:
             entry_time = datetime.fromisoformat(entry_time.replace("Z", "+00:00"))
-        except Exception:
-            entry_time = datetime.now(TZ_SHANGHAI)
-    elif entry_time is None:
-        entry_time = datetime.now(TZ_SHANGHAI)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="signal has no reliable entry_time"
+            ) from exc
+    elif not isinstance(entry_time, datetime):
+        raise HTTPException(status_code=400, detail="signal has no reliable entry_time")
     if entry_time.tzinfo is None:
         entry_time = entry_time.replace(tzinfo=TZ_SHANGHAI)
     entry_ts = int(entry_time.timestamp())
@@ -3394,8 +3399,23 @@ async def get_replay_signal_kline(signal_id: int):
         "kind": "entry",
     }]
     if d.get("exit_price"):
+        exit_marker_ts = None
+        exit_time = d.get("exit_time")
+        if isinstance(exit_time, str) and exit_time.strip():
+            try:
+                parsed_exit = datetime.fromisoformat(exit_time.replace("Z", "+00:00"))
+                if parsed_exit.tzinfo is None:
+                    parsed_exit = parsed_exit.replace(tzinfo=TZ_SHANGHAI)
+                exit_marker_ts = int(parsed_exit.timestamp())
+            except ValueError:
+                exit_marker_ts = None
+        if exit_marker_ts is None:
+            extreme_ts = (
+                d.get("max_price_time") if action == "BUY" else d.get("min_price_time")
+            ) or d.get("max_price_time") or d.get("min_price_time") or 0
+            exit_marker_ts = max(entry_ts, int(extreme_ts or 0))
         markers.append({
-            "time": int(d["max_price_time"] or d["min_price_time"] or entry_ts),
+            "time": exit_marker_ts,
             "position": "aboveBar" if action == "BUY" else "belowBar",
             "color": "#9aa3af",
             "shape": "circle",

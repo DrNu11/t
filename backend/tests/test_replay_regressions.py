@@ -4,6 +4,7 @@ import asyncio
 
 import api_server
 import paper_trading
+import pytest
 
 
 PASSED = "证据充分，允许输出方向性结论"
@@ -140,3 +141,42 @@ def test_research_position_has_no_live_pnl_or_active_status():
     assert position["current_price"] is None
     assert position["current_pnl_pct"] is None
     assert position["current_pnl_usdt"] is None
+
+
+def test_signal_kline_preserves_sell_direction_and_reliable_times(
+    temp_db, monkeypatch
+):
+    monkeypatch.setattr(api_server, "DB_PATH", api_server.config.DB_PATH)
+    run = _start_run(temp_db)
+    signal_id = _insert_trade(temp_db, run, asset="XAU", action="SELL", pnl=-0.4)
+    temp_db.execute(
+        """UPDATE ai_decisions
+           SET exit_price=99.5,
+               exit_time='2026-08-15T10:30:00+08:00',
+               max_price=101.0,
+               min_price=99.0,
+               max_price_time=10,
+               min_price_time=20
+           WHERE id=?""",
+        (signal_id,),
+    )
+    temp_db.commit()
+
+    payload = asyncio.run(api_server.get_replay_signal_kline(signal_id))
+
+    assert payload["action"] == "SELL"
+    assert payload["markers"][0]["text"] == "SELL 100.0"
+    assert payload["markers"][0]["shape"] == "arrowDown"
+    assert payload["markers"][1]["time"] - payload["entry_time"] == 30 * 60
+
+
+def test_signal_kline_rejects_missing_entry_time(temp_db, monkeypatch):
+    monkeypatch.setattr(api_server, "DB_PATH", api_server.config.DB_PATH)
+    run = _start_run(temp_db)
+    signal_id = _insert_trade(temp_db, run, entry_time="")
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        asyncio.run(api_server.get_replay_signal_kline(signal_id))
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "signal has no reliable entry_time"
