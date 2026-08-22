@@ -21,6 +21,79 @@ from .utils import _now, _open_db
 
 _FORWARD_DURATION_HOURS = 2
 
+# ``IMPACT_THRESHOLD`` remains the asset-specific materiality threshold used by
+# the analysis layer. Settlement needs a much narrower neutral band: otherwise
+# a small but real directional PnL is incorrectly recorded as HOLD and cannot be
+# used by replay/reflection. One percent of the configured impact threshold is
+# enough to absorb quote/rounding noise without hiding an actual outcome.
+_NEUTRAL_BAND_SCALE = 0.01
+_MIN_NEUTRAL_BAND_PCT = 0.0001
+_MAX_NEUTRAL_BAND_PCT = 0.02
+
+
+def _parse_entry_time(value) -> datetime | None:
+    """Validate the persisted entry timestamp for settlement.
+
+    Only ``ai_decisions.entry_time`` is authoritative.  In particular, an old
+    row must never infer its entry from ``created_at`` or the related news time:
+    doing so would settle a historical decision against a current quote and
+    manufacture PnL.  Naive entry timestamps are interpreted as platform local
+    time, while explicit offsets are preserved before conversion.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).strip().replace("Z", "+00:00")
+        )
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=TZ_SHANGHAI)
+    return parsed.astimezone(TZ_SHANGHAI)
+
+
+def _neutral_pnl_band_pct(asset: str) -> float:
+    """Small explicit HOLD band derived from the existing asset threshold."""
+    try:
+        impact = abs(float(IMPACT_THRESHOLD.get(str(asset or "").upper(), 1.0)))
+    except (TypeError, ValueError):
+        impact = 1.0
+    return max(
+        _MIN_NEUTRAL_BAND_PCT,
+        min(impact * _NEUTRAL_BAND_SCALE, _MAX_NEUTRAL_BAND_PCT),
+    )
+
+
+def directional_pnl_pct(action: str, entry_price: float, exit_price: float) -> float:
+    """Calculate BUY/SELL PnL with profit positive and loss negative."""
+    entry = float(entry_price)
+    exit_value = float(exit_price)
+    if entry <= 0:
+        return 0.0
+    raw = (exit_value - entry) / entry * 100
+    return -raw if str(action or "").upper() == "SELL" else raw
+
+
+def classify_directional_outcome(action: str, forward_pnl: float, asset: str) -> str:
+    """Classify a settled directional trade from signed PnL.
+
+    MFE/MAE remain diagnostic path metrics; they must not override the actual
+    realised direction at exit. Non-directional or sub-noise outcomes are HOLD.
+    """
+    if str(action or "").upper() not in {"BUY", "SELL"}:
+        return "HOLD"
+    try:
+        pnl = float(forward_pnl)
+    except (TypeError, ValueError):
+        return "HOLD"
+    band = _neutral_pnl_band_pct(asset)
+    if pnl > band:
+        return "WIN"
+    if pnl < -band:
+        return "LOSS"
+    return "HOLD"
+
 
 async def forward_tracker() -> None:
     """2-hour simulated trade verification. Tracks max/min, settles with WIN/LOSS verdict."""
@@ -37,15 +110,18 @@ async def forward_tracker() -> None:
                     rows = conn.execute(
                         "SELECT ad.id, ad.suggested_action, ad.target_asset, ad.entry_price,"
                         " ad.max_price, ad.min_price, ad.max_price_time, ad.min_price_time,"
-                        " ad.entry_time, ad.settled, sv.params AS strategy_params"
+                        " ad.entry_time,"
+                        " ad.settled, sv.params AS strategy_params"
                         ", ad.impact_horizon, ad.take_profit_pct, ad.stop_loss_pct"
                         ", ad.exit_policy"
                         " FROM ai_decisions ad"
                         " LEFT JOIN strategy_versions sv ON sv.id = ad.strategy_version_id"
-                        " WHERE ad.settled = 0 AND ad.entry_price IS NOT NULL AND ad.entry_time != ''"
+                        " WHERE ad.settled = 0 AND ad.entry_price IS NOT NULL"
+                        " AND COALESCE(TRIM(ad.entry_time), '') != ''"
                     ).fetchall()
 
-                    # Asset-specific impact thresholds for verdict ruling — IMPACT_THRESHOLD 见 config.py
+                    # MFE/MAE remain path diagnostics; realised signed PnL
+                    # determines the final directional verdict.
                     for row in rows:
                         eid = row["id"]
                         action = (row["suggested_action"] or "").upper()
@@ -55,11 +131,8 @@ async def forward_tracker() -> None:
                         cur_min = row["min_price"]
                         max_ptime = row["max_price_time"] or 0
                         min_ptime = row["min_price_time"] or 0
-                        entry_ts = row["entry_time"]
-
-                        try:
-                            et = datetime.fromisoformat(entry_ts)
-                        except (ValueError, TypeError):
+                        et = _parse_entry_time(row["entry_time"])
+                        if et is None:
                             continue
 
                         elapsed = datetime.now(TZ_SHANGHAI) - et
@@ -168,36 +241,11 @@ async def forward_tracker() -> None:
                                     if min_ptime > 0:
                                         mfe_time_mins = (min_ptime - entry_unix) / 60
 
-                            # ── Get asset-specific threshold ──
-                            threshold = IMPACT_THRESHOLD.get(asset_raw, 1.0)
-
-                            # ── 3D empirical verdict decision tree ──
-                            if exit_reason == "take_profit":
-                                verdict = "WIN"
-                            elif exit_reason in {"stop_loss", "trailing_stop"}:
-                                verdict = "LOSS"
-                            elif mfe_pct < threshold and mae_pct < threshold:
-                                # Condition A: neither side exceeded threshold
-                                verdict = "HOLD"    # NO_IMPACT — market did not break window
-                            elif mfe_pct >= threshold and mfe_time_mins <= 45 and mfe_pct > mae_pct:
-                                # Condition B: favourable excursion hit hard & fast
-                                verdict = "WIN"     # CORRECT — direction right, rapid reaction
-                            elif mae_pct >= threshold and mae_pct > mfe_pct:
-                                # Condition C: adverse excursion dominated
-                                verdict = "LOSS"    # INCORRECT — direction wrong
-                            else:
-                                # Catch-all: e.g. MFE hit but too slow (>45min), or tie
-                                verdict = "HOLD"    # NOT_DRIVEN — late/sector move, not news-driven
-
                             # ── forward_pnl: signed PnL % from entry to exit ──
-                            fwd_pnl: float = 0.0
-                            if entry and entry > 0 and exit_p is not None:
-                                if action == "BUY":
-                                    fwd_pnl = (exit_p - entry) / entry * 100
-                                elif action == "SELL":
-                                    fwd_pnl = (entry - exit_p) / entry * 100
-                                else:
-                                    fwd_pnl = 0.0
+                            fwd_pnl = directional_pnl_pct(action, entry, exit_p)
+                            verdict = classify_directional_outcome(
+                                action, fwd_pnl, asset_raw
+                            )
 
                             conn.execute(
                                 "UPDATE ai_decisions SET exit_price = ?, exit_time = ?, exit_reason = ?, is_correct = ?,"

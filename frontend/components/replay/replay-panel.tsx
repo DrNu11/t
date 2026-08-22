@@ -174,6 +174,10 @@ export function ReplayPanel() {
 
   function toggleGate() {
     if (!tradingSettings) return
+    if (tradingSettings.gate_locked) {
+      setError('数据治理已锁定严格闸门；仅隔离研究环境允许关闭。')
+      return
+    }
     const nextGate = !(tradingSettings.gate_enabled ?? true)
     setTradingSettings({ ...tradingSettings, gate_enabled: nextGate })
     void persistTrading({
@@ -212,9 +216,9 @@ export function ReplayPanel() {
     }).then(() => reload())
   }
 
-  const tracking = signals.filter((signal) => !signal.settled).length
+  const tracking = signals.filter((signal) => !signal.settled && signal.tracking_quality === 'TRACKABLE').length
   const livePnl = signals
-    .filter((signal) => !signal.settled)
+    .filter((signal) => !signal.settled && signal.tracking_quality === 'TRACKABLE')
     .reduce((sum, signal) => sum + (signal.current_pnl_usdt ?? 0), 0)
   const gateOn = tradingSettings?.gate_enabled ?? true
   const newsOn = newsSettings?.enabled !== false
@@ -260,11 +264,11 @@ export function ReplayPanel() {
           </button>
           <button
             type="button"
-            disabled={changingTrading || !tradingSettings}
+            disabled={changingTrading || !tradingSettings || tradingSettings.gate_locked}
             onClick={toggleGate}
             className={`rounded border px-3 py-1.5 font-mono text-xs disabled:cursor-wait disabled:opacity-60 ${gateOn ? 'border-hold/50 bg-hold/10 text-hold' : 'border-long/50 bg-long/10 text-long'}`}
           >
-            {gateOn ? '闸门开启 · 严格' : '闸门关闭 · 宽松'}
+            {tradingSettings?.gate_locked ? '闸门锁定 · 严格' : gateOn ? '闸门开启 · 严格' : '闸门关闭 · 宽松'}
           </button>
           <button
             type="button"

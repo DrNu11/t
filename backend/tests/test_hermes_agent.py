@@ -1,20 +1,41 @@
 """离线测试：Hermes 多 agent 写作 + 已结算技能沉淀。"""
 
+import pytest
+
 import hermes_agent
 
+PASSED_REASON = "证据充分，允许输出方向性结论"
 
-def _seed_settled(conn, asset, action, prediction_type, verdicts):
+
+def _seed_settled(
+    conn,
+    asset,
+    action,
+    prediction_type,
+    verdicts,
+    *,
+    quality_status="verified",
+    evidence_action=None,
+    gate_reason=PASSED_REASON,
+    paper_run_id=1,
+):
     for verdict in verdicts:
         news_id = conn.execute(
-            "INSERT INTO raw_news (source, content, timestamp, status) VALUES ('test', ?, '2026-08-15 10:00:00', 'DONE')",
-            (f"{asset} {verdict}",),
+            """INSERT INTO raw_news
+                   (source, content, timestamp, status, quality_status)
+               VALUES ('test', ?, '2026-08-15 10:00:00', 'DONE', ?)""",
+            (f"{asset} {verdict}", quality_status),
         ).lastrowid
         conn.execute(
             """INSERT INTO ai_decisions
                    (news_id, sentiment_score, suggested_action, reasoning, target_asset,
-                    prediction_type, settled, is_correct, forward_pnl)
-               VALUES (?, 0.6, ?, 'test', ?, ?, 1, ?, 0.4)""",
-            (news_id, action, asset, prediction_type, verdict),
+                    prediction_type, settled, is_correct, forward_pnl, evidence_action,
+                    trade_gate_reason, paper_trading_run_id)
+               VALUES (?, 0.6, ?, 'test', ?, ?, 1, ?, 0.4, ?, ?, ?)""",
+            (
+                news_id, action, asset, prediction_type, verdict,
+                evidence_action or action, gate_reason, paper_run_id,
+            ),
         )
     conn.commit()
 
@@ -68,3 +89,24 @@ def test_build_prompt_context_includes_settled_skills(temp_db):
     text = hermes_agent.build_prompt_context("地缘冲突升级", connection=temp_db)
     assert "Hermes Settled Skills" in text
     assert "XAU reversal SELL" in text
+
+
+@pytest.mark.parametrize(
+    "invalidate_sql",
+    [
+        "UPDATE raw_news SET quality_status='unverified'",
+        "UPDATE ai_decisions SET evidence_action='HOLD'",
+        "UPDATE ai_decisions SET trade_gate_reason='research_only'",
+        "UPDATE ai_decisions SET paper_trading_run_id=NULL",
+    ],
+)
+def test_refresh_skills_fail_closed_and_removes_stale_skill(temp_db, invalidate_sql):
+    _seed_settled(temp_db, "BTC", "BUY", "continuation", ["WIN"] * 8)
+    assert len(hermes_agent.refresh_skills(temp_db)) == 1
+    assert len(hermes_agent.load_skills(temp_db)) == 1
+
+    temp_db.execute(invalidate_sql)
+    temp_db.commit()
+
+    assert hermes_agent.refresh_skills(temp_db) == []
+    assert hermes_agent.load_skills(temp_db) == []

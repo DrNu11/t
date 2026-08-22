@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -25,15 +26,25 @@ from providers.jin10 import get_jin10_provider
 HttpGet = Callable[[str, int], Any]
 
 _TIMEOUT = 8
-_SYMBOLS = (
+_BINANCE_FUTURES_SYMBOLS = (
     ("BTC", "BTCUSDT"),
     ("ETH", "ETHUSDT"),
-    ("XAU", "XAUUSDT"),
 )
 _BINANCE_FAPI = "https://fapi.binance.com"
 _FNG_URL = "https://api.alternative.me/fng/?limit=1&format=json"
 _NYFED_EFFR = "https://markets.newyorkfed.org/api/rates/unsecured/effr/last/1.json"
 _YAHOO_ZQ = "https://query1.finance.yahoo.com/v8/finance/chart/ZQ=F?interval=1d&range=5d"
+
+# Polling cadence and upstream publication cadence are very different.  These
+# buckets are only a fallback when a provider did not publish its own event
+# timestamp; a changed value/status still gets a different observation id.
+_OBSERVATION_BUCKET_SECONDS = {
+    "structure": 60,
+    "flow": 60,
+    "sentiment": 3600,
+    "fed": 3600,
+}
+_ERROR_BUCKET_SECONDS = 300
 
 
 def _now() -> int:
@@ -71,7 +82,7 @@ def _metric(
     status: str = "ok",
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    payload = extra or {}
+    payload = dict(extra or {})
     if label:
         payload["label"] = label
     return {
@@ -85,41 +96,133 @@ def _metric(
     }
 
 
-def _fail(category: str, source: str, metric_key: str, note: str) -> Dict[str, Any]:
-    return _metric(category, source, metric_key, None, status="unavailable", extra={"note": note})
+def _error_payload(error: Any) -> Dict[str, Any]:
+    """Keep actionable upstream error semantics without storing secrets."""
+    if not isinstance(error, BaseException):
+        return {"note": str(error or "upstream_unavailable")[:240]}
+    error_type = type(error).__name__
+    status = getattr(error, "code", None)
+    response = getattr(error, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    reason = getattr(error, "reason", None)
+    if reason in (None, ""):
+        reason = str(error)
+    reason_text = " ".join(str(reason or "").split())[:180]
+    if status is not None:
+        note = f"{error_type}(status={status})"
+    else:
+        note = error_type
+    if reason_text and reason_text != error_type:
+        note = f"{note}: {reason_text}"
+    payload: Dict[str, Any] = {"note": note, "error_type": error_type}
+    if status is not None:
+        try:
+            payload["http_status"] = int(status)
+        except (TypeError, ValueError):
+            payload["http_status"] = str(status)[:24]
+    return payload
+
+
+def _fail(category: str, source: str, metric_key: str, note: Any) -> Dict[str, Any]:
+    return _metric(category, source, metric_key, None, status="unavailable", extra=_error_payload(note))
+
+
+def _upstream_time(item: Dict[str, Any]) -> Any:
+    payload = item.get("payload") or {}
+    if not isinstance(payload, dict):
+        return None
+    for key in ("upstream_time", "event_ts", "timestamp", "effectiveDate"):
+        if payload.get(key) not in (None, ""):
+            return payload[key]
+    return None
+
+
+def _stable_time_token(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 10_000_000_000:
+            number /= 1000.0
+        return str(int(number))
+    text = " ".join(str(value).strip().split())
+    if text.isdigit() and len(text) in (10, 13):
+        return _stable_time_token(int(text))
+    return text[:96] or None
+
+
+def _published_time(item: Dict[str, Any], fallback: int) -> Any:
+    upstream = _upstream_time(item)
+    if isinstance(upstream, str) and upstream.strip().isdigit() and len(upstream.strip()) in (10, 13):
+        number = int(upstream.strip())
+        return number // 1000 if len(upstream.strip()) == 13 else number
+    return upstream if upstream not in (None, "") else fallback
+
+
+def _observation_id(item: Dict[str, Any], observed_at: int) -> str:
+    """Build a stable id from upstream time or a source-appropriate bucket."""
+    category = str(item.get("category") or "macro")
+    source = data_quality.canonical_source(str(item.get("source") or ""))
+    metric_key = str(item.get("metric_key") or "unknown")
+    upstream = _stable_time_token(_upstream_time(item))
+    if upstream is not None:
+        clock = f"upstream:{upstream}"
+    else:
+        seconds = (
+            _ERROR_BUCKET_SECONDS
+            if item.get("status") != "ok" or item.get("value") is None
+            else _OBSERVATION_BUCKET_SECONDS.get(category, 300)
+        )
+        clock = f"bucket:{int(observed_at) // seconds}"
+    raw_payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    fingerprint_payload = {
+        "value": item.get("value"),
+        "unit": item.get("unit") or "",
+        "status": item.get("status") or "unavailable",
+        "payload": raw_payload,
+    }
+    encoded = json.dumps(fingerprint_payload, sort_keys=True, ensure_ascii=False, default=str)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    return f"{source}:{category}:{metric_key}:{clock}:{digest}"
 
 
 def fetch_structure(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for asset, symbol in _SYMBOLS:
+    for asset, symbol in _BINANCE_FUTURES_SYMBOLS:
         try:
             prem = get(f"{_BINANCE_FAPI}/fapi/v1/premiumIndex?symbol={symbol}", _TIMEOUT)
             last = _num((prem or {}).get("markPrice"))
             index = _num((prem or {}).get("indexPrice"))
             funding = _num((prem or {}).get("lastFundingRate"))
+            upstream_time = (prem or {}).get("time")
             basis_bps = None
             if last and index and index != 0:
                 basis_bps = (last / index - 1.0) * 10000.0
-            rows.append(_metric("structure", "binance_fapi", f"{asset}.mark", last, unit="USDT", label=asset))
+            rows.append(_metric(
+                "structure", "binance_fapi", f"{asset}.mark", last,
+                unit="USDT", label=asset, extra={"upstream_time": upstream_time},
+            ))
             rows.append(_metric(
                 "structure", "binance_fapi", f"{asset}.funding",
                 funding * 100 if funding is not None else None,
-                unit="%", label=asset,
+                unit="%", label=asset, extra={"upstream_time": upstream_time},
             ))
             rows.append(_metric(
                 "structure", "binance_fapi", f"{asset}.basis_bps",
-                basis_bps, unit="bp", label=asset,
+                basis_bps, unit="bp", label=asset, extra={"upstream_time": upstream_time},
             ))
         except Exception as exc:
-            rows.append(_fail("structure", "binance_fapi", f"{asset}.premium", f"{type(exc).__name__}"))
+            rows.append(_fail("structure", "binance_fapi", f"{asset}.premium", exc))
         try:
             oi = get(f"{_BINANCE_FAPI}/fapi/v1/openInterest?symbol={symbol}", _TIMEOUT)
             rows.append(_metric(
                 "structure", "binance_fapi", f"{asset}.oi",
                 _num((oi or {}).get("openInterest")), unit="contracts", label=asset,
+                extra={"upstream_time": (oi or {}).get("time")},
             ))
         except Exception as exc:
-            rows.append(_fail("structure", "binance_fapi", f"{asset}.oi", f"{type(exc).__name__}"))
+            rows.append(_fail("structure", "binance_fapi", f"{asset}.oi", exc))
         try:
             ratio = get(
                 f"{_BINANCE_FAPI}/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=1h&limit=1",
@@ -129,10 +232,14 @@ def fetch_structure(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
             rows.append(_metric(
                 "structure", "binance_fapi", f"{asset}.ls_ratio",
                 _num(item.get("longShortRatio")), unit="x", label=asset,
-                extra={"longAccount": _num(item.get("longAccount")), "shortAccount": _num(item.get("shortAccount"))},
+                extra={
+                    "longAccount": _num(item.get("longAccount")),
+                    "shortAccount": _num(item.get("shortAccount")),
+                    "upstream_time": item.get("timestamp"),
+                },
             ))
         except Exception as exc:
-            rows.append(_fail("structure", "binance_fapi", f"{asset}.ls_ratio", f"{type(exc).__name__}"))
+            rows.append(_fail("structure", "binance_fapi", f"{asset}.ls_ratio", exc))
     return rows
 
 
@@ -145,32 +252,44 @@ def fetch_sentiment(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
         return [_metric(
             "sentiment", "alternative.me", "crypto_fng",
             value, unit="index",
-            extra={"classification": classification, "attribution": "alternative.me"},
+            extra={
+                "classification": classification,
+                "attribution": "alternative.me",
+                "upstream_time": item.get("timestamp"),
+            },
         )]
     except Exception as exc:
-        return [_fail("sentiment", "alternative.me", "crypto_fng", f"{type(exc).__name__}")]
+        return [_fail("sentiment", "alternative.me", "crypto_fng", exc)]
 
 
 def fetch_fed(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     effr = None
+    effr_time = None
     try:
         body = get(_NYFED_EFFR, _TIMEOUT)
         ref = ((body or {}).get("refRates") or [None])[0] or {}
         effr = _num(ref.get("percentRate"))
+        effr_time = ref.get("effectiveDate")
         rows.append(_metric(
             "fed", "nyfed", "effr",
             effr, unit="%",
-            extra={"effectiveDate": ref.get("effectiveDate"), "type": ref.get("type")},
+            extra={
+                "effectiveDate": effr_time,
+                "type": ref.get("type"),
+                "upstream_time": effr_time,
+            },
         ))
     except Exception as exc:
-        rows.append(_fail("fed", "nyfed", "effr", f"{type(exc).__name__}"))
+        rows.append(_fail("fed", "nyfed", "effr", exc))
 
     implied = None
+    implied_time = None
     try:
         body = get(_YAHOO_ZQ, _TIMEOUT)
         result = (((body or {}).get("chart") or {}).get("result") or [None])[0] or {}
         meta = result.get("meta") or {}
+        implied_time = meta.get("regularMarketTime")
         implied_price = _num(meta.get("regularMarketPrice"))
         if implied_price is None:
             closes = (((result.get("indicators") or {}).get("quote") or [{}])[0] or {}).get("close") or []
@@ -183,10 +302,14 @@ def fetch_fed(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
         rows.append(_metric(
             "fed", "yahoo_zq", "implied_ff",
             implied, unit="%",
-            extra={"futures_price": implied_price, "symbol": "ZQ=F"},
+            extra={
+                "futures_price": implied_price,
+                "symbol": "ZQ=F",
+                "upstream_time": implied_time,
+            },
         ))
     except Exception as exc:
-        rows.append(_fail("fed", "yahoo_zq", "implied_ff", f"{type(exc).__name__}"))
+        rows.append(_fail("fed", "yahoo_zq", "implied_ff", exc))
 
     if effr is not None and implied is not None:
         spread_bp = (implied - effr) * 100.0
@@ -206,6 +329,9 @@ def fetch_fed(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
                 "next_move": next_move,
                 "hike_probability_proxy": round(hike_probability_proxy, 4),
                 "method": "ZQ implied − EFFR；非 CME FedWatch 官方概率",
+                "upstream_time": implied_time or effr_time,
+                "effr_time": effr_time,
+                "implied_time": implied_time,
             },
         ))
     else:
@@ -215,7 +341,7 @@ def fetch_fed(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
 
 def fetch_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for asset, symbol in _SYMBOLS:
+    for asset, symbol in _BINANCE_FUTURES_SYMBOLS:
         try:
             body = get(
                 f"{_BINANCE_FAPI}/futures/data/takerlongshortRatio?symbol={symbol}&period=1h&limit=1",
@@ -231,10 +357,15 @@ def fetch_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
             rows.append(_metric(
                 "flow", "binance_taker", f"{asset}.taker_buy_sell",
                 ratio, unit="x", label=asset,
-                extra={"buyVol": buy, "sellVol": sell, "netVol": net},
+                extra={
+                    "buyVol": buy,
+                    "sellVol": sell,
+                    "netVol": net,
+                    "upstream_time": item.get("timestamp"),
+                },
             ))
         except Exception as exc:
-            rows.append(_fail("flow", "binance_taker", f"{asset}.taker_buy_sell", f"{type(exc).__name__}"))
+            rows.append(_fail("flow", "binance_taker", f"{asset}.taker_buy_sell", exc))
 
     etf_url = str(getattr(config, "SOSOVALUE_ETF_URL", "") or "").strip()
     if not etf_url:
@@ -266,10 +397,16 @@ def fetch_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
         rows.append(_metric(
             "flow", "sosovalue", "btc_etf_net",
             value, unit="usd",
-            extra={"raw_keys": sorted(picked.keys())[:12] if isinstance(picked, dict) else []},
+            extra={
+                "raw_keys": sorted(picked.keys())[:12] if isinstance(picked, dict) else [],
+                "upstream_time": (
+                    picked.get("timestamp") or picked.get("date") or picked.get("time")
+                    if isinstance(picked, dict) else None
+                ),
+            },
         ))
     except Exception as exc:
-        rows.append(_fail("flow", "sosovalue", "btc_etf_net", f"{type(exc).__name__}"))
+        rows.append(_fail("flow", "sosovalue", "btc_etf_net", exc))
     return rows
 
 
@@ -289,17 +426,18 @@ def apply_quality(
     observed_at: Optional[int] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Attach source-governance results without changing the raw metric value."""
-    stamp = int(observed_at or _now())
+    stamp = int(observed_at if observed_at is not None else _now())
     governed: Dict[str, List[Dict[str, Any]]] = {}
     for category, values in layers.items():
         governed[category] = []
         for index, original in enumerate(values or []):
             item = dict(original)
+            event_id = _observation_id(item, stamp)
             decision = data_quality.assess(
                 source=str(item.get("source") or ""),
                 kind=str(item.get("category") or category),
-                event_id=f"{item.get('metric_key') or index}:{stamp}",
-                published_at=stamp,
+                event_id=event_id,
+                published_at=_published_time(item, stamp),
                 payload={"value": item.get("value"), **(item.get("payload") or {})},
                 observed_at=stamp,
             )
@@ -326,7 +464,7 @@ def persist_layers(
     ts: Optional[int] = None,
     connection: Optional[sqlite3.Connection] = None,
 ) -> int:
-    stamp = int(ts or _now())
+    stamp = int(ts if ts is not None else _now())
     rows = flatten(layers)
     if rows and any("quality_event_id" not in item for item in rows):
         layers = apply_quality(layers, observed_at=stamp)
@@ -347,7 +485,7 @@ def persist_layers(
             quality = data_quality.QualityDecision(
                 source=data_quality.canonical_source(str(item.get("source") or "")),
                 kind=str(item.get("category") or "macro"),
-                event_id=str(item.get("quality_event_id") or f"{item.get('metric_key')}:{stamp}"),
+                event_id=str(item.get("quality_event_id") or _observation_id(item, stamp)),
                 accepted=item.get("quality_status") != "blocked",
                 decision_eligible=bool(item.get("decision_eligible")),
                 authority_tier=str(item.get("authority_tier") or "unknown"),
@@ -360,18 +498,33 @@ def persist_layers(
             if item.get("status") == "ok" and item.get("value") is not None:
                 if not data_quality.observation_already_recorded(conn, quality, audit_payload):
                     data_quality.record(
-                        conn, quality, published_at=stamp, payload=audit_payload,
+                        conn, quality, published_at=_published_time(item, stamp), payload=audit_payload,
                         metadata={"metric_key": item.get("metric_key")},
                         quarantine=quality.quality_status == "blocked",
                         observed_at=stamp,
                     )
             stored_payload = {
                 **(item.get("payload") or {}),
+                "observation_id": quality.event_id,
                 "quality_status": item.get("quality_status"),
                 "quality_reason": item.get("quality_reason"),
                 "decision_eligible": bool(item.get("decision_eligible")),
                 "authority_tier": item.get("authority_tier"),
             }
+            previous = conn.execute(
+                """SELECT payload FROM macro_snapshots
+                   WHERE category=? AND source=? AND metric_key=?
+                   ORDER BY id DESC LIMIT 1""",
+                (item["category"], item["source"], item["metric_key"]),
+            ).fetchone()
+            if previous is not None:
+                previous_payload = previous["payload"] if isinstance(previous, sqlite3.Row) else previous[0]
+                try:
+                    previous_observation_id = json.loads(previous_payload or "{}").get("observation_id")
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    previous_observation_id = None
+                if previous_observation_id == quality.event_id:
+                    continue
             payload.append((
                 stamp,
                 item["category"],
@@ -382,6 +535,10 @@ def persist_layers(
                 item.get("status") or "unavailable",
                 json.dumps(stored_payload, ensure_ascii=False),
             ))
+        if not payload:
+            if owned:
+                conn.commit()
+            return 0
         cursor = conn.executemany(
             """INSERT INTO macro_snapshots(ts, category, source, metric_key, value, unit, status, payload)
                VALUES(?,?,?,?,?,?,?,?)""",
@@ -481,6 +638,10 @@ def latest_snapshot(limit: int = 80, connection: Optional[sqlite3.Connection] = 
         rows = conn.execute(
             """SELECT ts, category, source, metric_key, value, unit, status, payload
                FROM macro_snapshots
+               WHERE id IN (
+                   SELECT MAX(id) FROM macro_snapshots
+                   GROUP BY category, source, metric_key
+               )
                ORDER BY id DESC
                LIMIT ?""",
             (max(1, int(limit)),),

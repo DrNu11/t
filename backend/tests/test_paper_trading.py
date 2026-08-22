@@ -32,9 +32,19 @@ def test_paper_trading_tracks_and_asset_filter(temp_db):
     assert run[1]
 
 
-def test_paper_trading_gate_toggle(temp_db):
+def test_paper_trading_gate_is_locked_by_default(temp_db, monkeypatch):
+    monkeypatch.setattr(paper_trading.config, "PAPER_ALLOW_GATE_BYPASS", False)
+    started = paper_trading.set_settings(True, ["crypto"], temp_db, gate_enabled=False)
+    assert started["gate_enabled"] is True
+    assert started["gate_locked"] is True
+    assert "启用多证据" in started["active_run"]["activation_reason"]
+
+
+def test_paper_trading_gate_toggle_requires_explicit_research_opt_in(temp_db, monkeypatch):
+    monkeypatch.setattr(paper_trading.config, "PAPER_ALLOW_GATE_BYPASS", True)
     started = paper_trading.set_settings(True, ["crypto"], temp_db, gate_enabled=False)
     assert started["gate_enabled"] is False
+    assert started["gate_locked"] is False
     assert "宽松" in started["active_run"]["activation_reason"]
     tightened = paper_trading.set_settings(True, ["crypto"], temp_db, gate_enabled=True)
     assert tightened["gate_enabled"] is True

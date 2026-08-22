@@ -1,9 +1,305 @@
 """共享的多证据交易闸门，不依赖 FastAPI。"""
 
 import json
-from typing import Any, Dict
+import math
+from typing import Any, Dict, Optional
 
 import evidence
+from decision_features import normalize_analysis
+
+
+_DEFAULT_IMPACT_WINDOW = {
+    "short": {"min_minutes": 0, "max_minutes": 120},
+    "medium": {"min_minutes": 120, "max_minutes": 4320},
+    "long": {"min_minutes": 4320, "max_minutes": 43200},
+}
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    """Parse a finite JSON number, rejecting bools and malformed strings."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _bounded_number(value: Any, low: float = 0.0, high: float = 1.0) -> Optional[float]:
+    number = _finite_number(value)
+    if number is None or number < low or number > high:
+        return None
+    return number
+
+
+def _probability(value: Any) -> Optional[float]:
+    """Accept JSON ratios and explicit percentage strings, never guess units."""
+
+    if isinstance(value, str) and value.strip().endswith("%"):
+        number = _finite_number(value.strip()[:-1])
+        if number is None or number < 0.0 or number > 100.0:
+            return None
+        return number / 100.0
+    return _bounded_number(value)
+
+
+def _boolean(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y", "是"}
+    return False
+
+
+def _canonical(value: Any, aliases: Dict[str, str], default: str) -> str:
+    text = str(value or "").strip().lower().replace("_", "-")
+    return aliases.get(text, default)
+
+
+def _normalise_window(value: Any) -> Dict[str, Dict[str, int]]:
+    """Validate LLM-provided impact intervals and fill unsafe gaps."""
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            value = None
+    supplied = value if isinstance(value, dict) else {}
+    result: Dict[str, Dict[str, int]] = {}
+    for horizon, defaults in _DEFAULT_IMPACT_WINDOW.items():
+        raw = supplied.get(horizon)
+        raw = raw if isinstance(raw, dict) else {}
+        minimum = _finite_number(raw.get("min_minutes"))
+        maximum = _finite_number(raw.get("max_minutes"))
+        if (
+            minimum is None
+            or maximum is None
+            or minimum < 0
+            or maximum < minimum
+            or maximum > 525_600
+        ):
+            result[horizon] = dict(defaults)
+        else:
+            result[horizon] = {
+                "min_minutes": int(round(minimum)),
+                "max_minutes": int(round(maximum)),
+            }
+    return result
+
+
+def normalize_ai_analysis(
+    result: Dict[str, Any],
+    *,
+    score: Any = None,
+    action: Any = None,
+) -> Dict[str, Any]:
+    """Validate LLM analysis fields and deterministically fill legacy gaps.
+
+    Dynamic fields are accepted only when their type and range are valid.  A
+    legacy model response therefore cannot silently become the old all-50/50,
+    zero-force, medium-horizon record: its signed score and event metadata are
+    converted into a conservative, auditable feature set.
+    """
+
+    source = result if isinstance(result, dict) else {}
+    score_value = _finite_number(score)
+    if score_value is None:
+        score_value = _finite_number(source.get("sentiment_score"))
+    score_value = max(-1.0, min(1.0, score_value or 0.0))
+
+    action_value = str(action or source.get("suggested_action") or "HOLD").strip().upper()
+    if action_value not in {"BUY", "SELL", "HOLD"}:
+        action_value = "HOLD"
+
+    strength = _canonical(source.get("event_strength"), {
+        "low": "low", "weak": "low", "低": "low",
+        "medium": "medium", "moderate": "medium", "mid": "medium", "中": "medium",
+        "high": "high", "strong": "high", "critical": "high", "高": "high",
+    }, "medium")
+    prediction = _canonical(source.get("prediction_type"), {
+        "continuation": "continuation", "trend": "continuation", "延续": "continuation",
+        "reversal": "reversal", "mean-reversion": "reversal", "反转": "reversal",
+        "breakout": "breakout", "shock": "breakout", "突破": "breakout",
+    }, "continuation")
+    phase = _canonical(source.get("event_phase"), {
+        "early": "early", "initial": "early", "breaking": "early", "早期": "early", "突发": "early",
+        "mid": "mid", "middle": "mid", "developing": "mid", "中期": "mid",
+        "late": "late", "priced-in": "late", "mature": "late", "后期": "late",
+    }, "mid")
+    market_confirmation = _canonical(source.get("market_confirmation"), {
+        "positive": "positive", "confirmed": "positive", "yes": "positive",
+        "negative": "negative", "rejected": "negative", "opposite": "negative",
+        "unknown": "unknown", "none": "unknown", "n/a": "unknown",
+    }, "unknown")
+    direct = _boolean(source.get("direct_catalyst"))
+
+    expected_raw = _canonical(source.get("expected_horizon"), {
+        "intraday": "intraday", "short": "intraday", "<24h": "intraday",
+        "1-3d": "1-3d", "swing": "1-3d", "medium": "1-3d",
+        "1w+": "1w+", "long": "1w+", "macro": "1w+",
+    }, "")
+    timeframe_raw = _canonical(source.get("timeframe_match"), {
+        "intraday": "intraday", "short": "intraday",
+        "swing": "swing", "medium": "swing", "1-3d": "swing",
+        "macro": "macro", "long": "macro", "1w+": "macro",
+    }, "")
+
+    explicit_type = _canonical(source.get("analysis_type"), {
+        "conflict": "conflict", "shock": "conflict", "event": "conflict",
+        "冲突": "conflict", "突发": "conflict", "冲击": "conflict",
+        "trend": "trend", "trend-force": "trend", "force": "trend",
+        "momentum": "trend", "趋势": "trend", "力量": "trend",
+    }, "")
+    bull = _probability(source.get("bullish_probability"))
+    bear = _probability(source.get("bearish_probability"))
+    supplied_bull_force = _bounded_number(source.get("bullish_force"))
+    supplied_bear_force = _bounded_number(source.get("bearish_force"))
+    # Detect the exact legacy/default signature seen in production.  A
+    # directional score plus 50/50 and zero/zero is internally inconsistent,
+    # so those values are not accepted as genuine LLM analysis.
+    stale_default_signature = bool(
+        bull == 0.5
+        and bear == 0.5
+        and supplied_bull_force == 0.0
+        and supplied_bear_force == 0.0
+        and abs(score_value) >= 0.10
+    )
+    if stale_default_signature:
+        bull = bear = None
+        supplied_bull_force = supplied_bear_force = None
+        explicit_type = ""
+
+    analysis_type = explicit_type or (
+        "conflict"
+        if direct or strength == "high" or (prediction == "breakout" and phase == "early")
+        else "trend"
+    )
+
+    def _fallback_probabilities() -> tuple[float, float]:
+        signed_score = score_value
+        if abs(signed_score) < 1e-9 and action_value in {"BUY", "SELL"}:
+            base = {"low": 0.15, "medium": 0.30, "high": 0.50}[strength]
+            signed_score = base if action_value == "BUY" else -base
+        reliability = {"low": 0.65, "medium": 0.82, "high": 1.0}[strength]
+        reliability *= {"early": 1.0, "mid": 0.88, "late": 0.70}[phase]
+        reliability *= {"continuation": 0.90, "reversal": 0.78, "breakout": 1.0}[prediction]
+        if direct:
+            reliability = min(1.0, reliability + 0.10)
+        edge = max(-0.90, min(0.90, signed_score * reliability))
+        return 0.5 + edge / 2.0, 0.5 - edge / 2.0
+
+    probability_fallback = False
+    if bull is None and bear is None:
+        probability_fallback = True
+        bull, bear = _fallback_probabilities()
+    elif bull is None:
+        bull = 1.0 - bear
+    elif bear is None:
+        bear = 1.0 - bull
+    else:
+        total = bull + bear
+        if total <= 0.0:
+            probability_fallback = True
+            bull, bear = _fallback_probabilities()
+        else:
+            bull, bear = bull / total, bear / total
+
+    uncertainty = _bounded_number(source.get("uncertainty"))
+    uncertainty_fallback = uncertainty is None
+    if uncertainty is None:
+        uncertainty = 1.0 - abs(bull - bear)
+
+    strength_factor = {"low": 0.35, "medium": 0.60, "high": 0.85}[strength]
+    phase_factor = {"early": 1.0, "mid": 0.85, "late": 0.65}[phase]
+    prediction_factor = {"continuation": 1.0, "reversal": 0.82, "breakout": 0.95}[prediction]
+    intensity = strength_factor * phase_factor * prediction_factor
+    intensity += 0.15 * abs(score_value) + (0.10 if direct else 0.0)
+    intensity = max(0.10, min(1.0, intensity))
+    bull_force = supplied_bull_force
+    bear_force = supplied_bear_force
+    force_fallback = bull_force is None or bear_force is None
+    if bull_force is None:
+        bull_force = bull * intensity
+    if bear_force is None:
+        bear_force = bear * intensity
+
+    explicit_horizon = _canonical(source.get("impact_horizon"), {
+        "short": "short", "intraday": "short", "minutes": "short", "短期": "short",
+        "medium": "medium", "swing": "medium", "1-3d": "medium", "中期": "medium",
+        "long": "long", "macro": "long", "1w+": "long", "长期": "long",
+    }, "")
+    if stale_default_signature:
+        explicit_horizon = ""
+    if explicit_horizon:
+        horizon = explicit_horizon
+    elif expected_raw:
+        horizon = {"intraday": "short", "1-3d": "medium", "1w+": "long"}[expected_raw]
+    elif timeframe_raw:
+        horizon = {"intraday": "short", "swing": "medium", "macro": "long"}[timeframe_raw]
+    elif direct or prediction == "breakout" or prediction == "reversal" or phase == "late":
+        horizon = "short"
+    elif strength == "high" and prediction == "continuation":
+        horizon = "long"
+    else:
+        horizon = "medium"
+
+    expected = expected_raw or {"short": "intraday", "medium": "1-3d", "long": "1w+"}[horizon]
+    timeframe = timeframe_raw or {"short": "intraday", "medium": "swing", "long": "macro"}[horizon]
+
+    # Retain the legacy trade-plan fields, but overwrite every dynamic value
+    # with the validated result above.
+    base = normalize_analysis(source, score=score_value, action=action_value)
+    base.update({
+        "analysis_type": analysis_type,
+        "bullish_probability": round(bull, 6),
+        "bearish_probability": round(bear, 6),
+        "uncertainty": round(uncertainty, 6),
+        "bullish_force": round(bull_force, 6),
+        "bearish_force": round(bear_force, 6),
+        "impact_horizon": horizon,
+        "impact_window": _normalise_window(source.get("impact_window")),
+        "dual_side_candidate": bool(
+            action_value in {"BUY", "SELL"}
+            and uncertainty >= 0.40
+            and abs(bull - bear) <= 0.20
+        ),
+        "prediction_type": prediction,
+        "event_phase": phase,
+        "market_confirmation": market_confirmation,
+        "expected_horizon": expected,
+        "event_strength": strength,
+        "direct_catalyst": direct,
+        "timeframe_match": timeframe,
+        "invalidation_condition": str(source.get("invalidation_condition") or "").strip()[:200],
+        "analysis_basis": {
+            "mode": "deterministic_fallback" if any((
+                not explicit_type,
+                probability_fallback,
+                uncertainty_fallback,
+                force_fallback,
+                not explicit_horizon,
+            )) else "llm",
+            "fallback_fields": [
+                name for name, used in (
+                    ("analysis_type", not explicit_type),
+                    ("probabilities", probability_fallback),
+                    ("uncertainty", uncertainty_fallback),
+                    ("forces", force_fallback),
+                    ("impact_horizon", not explicit_horizon),
+                ) if used
+            ],
+            "score": round(score_value, 6),
+            "event_strength": strength,
+            "prediction_type": prediction,
+            "event_phase": phase,
+            "direct_catalyst": direct,
+        },
+    })
+    return base
 
 
 def _clamp(value: Any, low: float = -1.0, high: float = 1.0) -> float:

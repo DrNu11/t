@@ -2,12 +2,16 @@
 and parent/child signal aggregation helpers."""
 
 import json
+import sqlite3
 
+import decision_guard
+import engine.ai_worker as ai_worker_module
 from engine.utils import _content_hash, _detect_vip, _is_content_junk
 from engine.webhook import _is_english_text
 from engine.ai_worker import (
+    _analysis_features_for_persist, _build_performance_context,
     _bump_parent_score, _call_llm_sync, _find_active_parent, build_model_config,
-    direction_consistent, reconcile_score_action,
+    direction_consistent, quality_allows_paper_position, reconcile_score_action,
 )
 
 
@@ -217,3 +221,163 @@ def test_reconcile_flips_opposite_score_to_action():
     assert direction_consistent("SELL", -0.45) is True
     assert direction_consistent("BUY", 0.05) is True
     assert direction_consistent("SELL", 0.45) is False
+
+
+def test_reconcile_rejects_non_finite_scores():
+    assert reconcile_score_action(float("nan"), "HOLD") == (0.0, "HOLD")
+    assert reconcile_score_action(float("inf"), "BUY") == (0.05, "BUY")
+
+
+def test_only_verified_news_can_open_paper_position():
+    assert quality_allows_paper_position("verified") is True
+    assert quality_allows_paper_position(" VERIFIED ") is True
+    assert quality_allows_paper_position("legacy") is False
+    assert quality_allows_paper_position("candidate") is False
+    assert quality_allows_paper_position("unverified") is False
+    assert quality_allows_paper_position(None) is False
+
+
+def test_news_llm_legacy_output_gets_dynamic_analysis(monkeypatch):
+    """Old model contracts must not persist as all-default dynamic fields."""
+
+    class FakeResponse:
+        def read(self):
+            result = {
+                "sentiment_score": -0.62,
+                "suggested_action": "SELL",
+                "reasoning": "突发政策冲击，短期风险偏空",
+                "market_category": "GOLD",
+                "target_asset": "XAU",
+                "reasoning_path": "政策冲击 -> 风险重定价",
+                "event_strength": "high",
+                "direct_catalyst": "true",
+                "prediction_type": "reversal",
+                "event_phase": "early",
+                "expected_horizon": "intraday",
+                "timeframe_match": "intraday",
+            }
+            body = {"choices": [{"message": {"content": json.dumps(result)}}]}
+            return json.dumps(body).encode()
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "engine.ai_worker.urllib.request.build_opener",
+        lambda *args: FakeOpener(),
+    )
+    model = build_model_config("DeepSeek-V4-Flash-0731")
+    result = _call_llm_sync("offline breaking policy news", model)
+
+    assert result["prediction_type"] == "reversal"
+    assert result["event_phase"] == "early"
+    assert result["analysis_type"] == "conflict"
+    assert result["impact_horizon"] == "short"
+    assert result["bearish_probability"] > result["bullish_probability"]
+    assert result["bearish_force"] > result["bullish_force"] > 0.0
+    assert abs(
+        result["bullish_probability"] + result["bearish_probability"] - 1.0
+    ) < 1e-6
+
+
+def test_vip_score_is_normalized_once_with_provenance_preserved(monkeypatch):
+    raw_result = {
+        "sentiment_score": 0.4,
+        "suggested_action": "BUY",
+        "reasoning": "关税突发上调，风险偏好受刺激",
+        "market_category": "CRYPTO",
+        "target_asset": "BTC",
+        "event_strength": "medium",
+        "prediction_type": "continuation",
+        "event_phase": "mid",
+        "direct_catalyst": False,
+    }
+
+    class FakeResponse:
+        def read(self):
+            body = {"choices": [{"message": {"content": json.dumps(raw_result)}}]}
+            return json.dumps(body).encode()
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse()
+
+    calls = []
+    original = decision_guard.normalize_ai_analysis
+
+    def tracked_normalize(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "engine.ai_worker.urllib.request.build_opener",
+        lambda *args: FakeOpener(),
+    )
+    monkeypatch.setattr(
+        ai_worker_module.decision_guard, "normalize_ai_analysis", tracked_normalize,
+    )
+
+    result = _call_llm_sync(
+        "Trump announces a major tariff change for crypto markets",
+        build_model_config("DeepSeek-V4-Flash-0731"),
+    )
+    persisted = _analysis_features_for_persist(
+        result, result["sentiment_score"], result["suggested_action"],
+    )
+
+    assert result["sentiment_score"] == 0.5
+    assert len(calls) == 1
+    assert persisted["analysis_basis"]["mode"] == "deterministic_fallback"
+    assert persisted["analysis_basis"]["score"] == 0.5
+    expected = original(raw_result, score=0.5, action="BUY")
+    assert persisted["bullish_probability"] == expected["bullish_probability"]
+    assert persisted["bullish_force"] == expected["bullish_force"]
+
+
+def test_historical_performance_prompt_uses_only_formal_decisions(
+    temp_db, monkeypatch,
+):
+    def seed(verdict, *, quality="verified", gate_reason=None, run_id=1):
+        news_id = temp_db.execute(
+            """INSERT INTO raw_news
+                   (source, content, timestamp, status, quality_status)
+               VALUES ('test', 'history', '2026-08-22 10:00:00', 'DONE', ?)""",
+            (quality,),
+        ).lastrowid
+        temp_db.execute(
+            """INSERT INTO ai_decisions
+                   (news_id, sentiment_score, suggested_action, reasoning,
+                    target_asset, prediction_type, settled, is_correct,
+                    forward_pnl, evidence_action, trade_gate_reason,
+                    paper_trading_run_id)
+               VALUES (?, 0.6, 'BUY', 'history', 'BTC', 'continuation',
+                       1, ?, ?, 'BUY', ?, ?)""",
+            (
+                news_id,
+                verdict,
+                -1.0 if verdict == "LOSS" else 1.0,
+                gate_reason or "证据充分，允许输出方向性结论",
+                run_id,
+            ),
+        )
+
+    for _ in range(8):
+        seed("LOSS")
+    for _ in range(8):
+        seed("WIN", quality="unverified")
+        seed("WIN", gate_reason="旧宽松闸门通过")
+    temp_db.commit()
+
+    db_path = temp_db.execute("PRAGMA database_list").fetchone()[2]
+
+    def open_test_db():
+        connection = sqlite3.connect(db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    monkeypatch.setattr(ai_worker_module, "_open_db", open_test_db)
+    context = _build_performance_context()
+
+    assert "BTC continuation BUY: sample: 8 win rate: 0%" in context
+    assert "BTC continuation BUY: sample: 24" not in context

@@ -1,5 +1,7 @@
+import pytest
+
 from providers.contracts import NewsEvent
-from providers.jin10 import Jin10Provider
+from providers.jin10 import Jin10Provider, Jin10SchemaError
 
 
 def test_news_event_projects_to_existing_watcher_shape():
@@ -66,3 +68,105 @@ def test_jin10_is_disabled_without_authorization(monkeypatch):
     provider = Jin10Provider(enabled=False, api_key="")
     assert provider.fetch_news() == []
     assert provider.fetch_quotes() == []
+
+
+def test_jin10_calendar_validates_and_normalises_to_utc(monkeypatch):
+    payload = {"data": {"list": [{
+        "id": "us-cpi-2026-08",
+        "name": "美国 CPI 年率",
+        "pub_time": "2026-08-21 20:30:00",
+        "actual": "2.8",
+        "previous": "2.7",
+        "consensus": "2.8",
+        "unit": "%",
+        "country": "美国",
+        "star": "5",
+        "time_period": "2026年7月",
+    }]}}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    def fake_get(url, **kwargs):
+        assert url == "https://licensed.example/calendar"
+        assert kwargs["headers"]["secret-key"] == "test-key"
+        return Response()
+
+    monkeypatch.setattr("providers.jin10.requests.get", fake_get)
+    provider = Jin10Provider(
+        enabled=True,
+        api_key="test-key",
+        calendar_url="https://licensed.example/calendar",
+    )
+    events = provider.fetch_macro()
+    assert len(events) == 1
+    assert events[0].event_id == "us-cpi-2026-08"
+    assert events[0].published_at == "2026-08-21T12:30:00Z"
+    assert events[0].actual == 2.8
+    assert events[0].impact == 5
+
+
+@pytest.mark.parametrize("payload", [
+    {},
+    {"data": {"unexpected": []}},
+    {"data": "not-a-row-list"},
+    {"data": ["not-an-object"]},
+])
+def test_jin10_calendar_rejects_unknown_http_200_shapes(monkeypatch, payload):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr("providers.jin10.requests.get", lambda *args, **kwargs: Response())
+    provider = Jin10Provider(
+        enabled=True,
+        api_key="test-key",
+        calendar_url="https://licensed.example/calendar",
+    )
+    with pytest.raises(Jin10SchemaError):
+        provider.fetch_macro()
+
+
+def test_jin10_calendar_rejects_malformed_rows(monkeypatch):
+    payload = {"data": [{
+        "id": "bad-cpi",
+        "name": "美国 CPI 年率",
+        "pub_time": "not-a-date",
+        "actual": "not-a-number",
+    }]}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr("providers.jin10.requests.get", lambda *args, **kwargs: Response())
+    provider = Jin10Provider(
+        enabled=True,
+        api_key="test-key",
+        calendar_url="https://licensed.example/calendar",
+    )
+    with pytest.raises(Jin10SchemaError):
+        provider.fetch_macro()
+
+
+def test_jin10_calendar_disabled_without_key_makes_no_request(monkeypatch):
+    monkeypatch.setattr(
+        "providers.jin10.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network call")),
+    )
+    provider = Jin10Provider(
+        enabled=True,
+        api_key="",
+        calendar_url="https://licensed.example/calendar",
+    )
+    assert provider.fetch_macro() == []

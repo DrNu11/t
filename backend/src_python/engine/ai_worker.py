@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import sqlite3
@@ -42,7 +43,7 @@ import evidence
 import hermes_agent
 import macro_context
 import timeseries
-from decision_features import merge_into_context, normalize_analysis
+from decision_features import merge_into_context
 
 from .alerts import send_feishu_alert
 from .prices import _get_current_price
@@ -69,6 +70,8 @@ def reconcile_score_action(score: float, action: str) -> tuple[float, str]:
     try:
         score = float(score)
     except (TypeError, ValueError):
+        score = 0.0
+    if not math.isfinite(score):
         score = 0.0
     score = max(-1.0, min(1.0, score))
 
@@ -103,6 +106,62 @@ def direction_consistent(action: str, score: float) -> bool:
     if action == "SELL":
         return score < 0
     return False
+
+
+def quality_allows_paper_position(quality_status: Any) -> bool:
+    """Only verified news may open a tracked paper-trading position.
+
+    ``ALLOW_LEGACY_DECISIONS`` can deliberately admit old rows for research
+    analysis, but it must never weaken this final position boundary.  Quick
+    simulations remain the isolated place for candidate/unverified samples.
+    """
+
+    return str(quality_status or "").strip().lower() == "verified"
+
+
+def _apply_vip_score_boost(
+    score: float, action: str, news_content: str,
+) -> tuple[float, str]:
+    """Apply the VIP multiplier before dynamic fields are normalised."""
+
+    vip_tag, _ = _detect_vip(news_content or "")
+    if vip_tag and action in {"BUY", "SELL"}:
+        boosted = round(float(score) * VIP_SCORE_BOOST, 4)
+        if abs(boosted) <= 1.0:
+            return boosted, vip_tag
+    return float(score), vip_tag
+
+
+def _analysis_features_for_persist(
+    result: Dict[str, Any], score: float, action: str,
+) -> Dict[str, Any]:
+    """Reuse the final-score normalisation, or fail closed for legacy callers.
+
+    The normal LLM path caches the exact feature set produced after score/action
+    reconciliation and VIP adjustment.  Re-normalising those derived fields
+    would make deterministic fallbacks look like LLM provenance and leave their
+    probabilities tied to the pre-VIP score.  Hand-built legacy worker results
+    have no cache and are normalised once here instead.
+    """
+
+    cached = result.get("_analysis_features") if isinstance(result, dict) else None
+    if isinstance(cached, dict):
+        basis = cached.get("analysis_basis")
+        try:
+            basis_score = float(basis.get("score")) if isinstance(basis, dict) else math.nan
+            cached_action = str(result.get("suggested_action") or "").upper()
+            if (
+                math.isfinite(basis_score)
+                and math.isclose(basis_score, float(score), abs_tol=1e-9)
+                and cached_action == str(action or "").upper()
+            ):
+                return dict(cached)
+        except (TypeError, ValueError):
+            pass
+
+    raw_source = result.get("_analysis_source") if isinstance(result, dict) else None
+    source = raw_source if isinstance(raw_source, dict) else result
+    return decision_guard.normalize_ai_analysis(source, score=score, action=action)
 
 # ---------------------------------------------------------------------------
 # Optional imports — not required; kept for compatibility
@@ -380,9 +439,15 @@ def _build_performance_context() -> str:
         return ""
 
     try:
+        # Old/partial schemas cannot prove source quality or gate provenance.
+        # Returning no block is safer than letting those rows train the model.
+        if not evidence.formal_ai_history_available(conn):
+            return ""
+
         lines: List[str] = []
         lines.append("[Historical Performance]")
         lines.append("Similar signals:")
+        formal_filter = evidence.formal_ai_history_predicate("ad", "rn")
 
         # Query: for each (asset, action, prediction_type) combo
         for asset in _PERF_ASSETS:
@@ -390,32 +455,42 @@ def _build_performance_context() -> str:
                 # ── Overall (all prediction_types) ──
                 overall = conn.execute(
                     "SELECT COUNT(*) AS n, "
-                    "  SUM(CASE WHEN is_correct = 'WIN' THEN 1 ELSE 0 END) AS wins, "
-                    "  SUM(CASE WHEN is_correct = 'LOSS' THEN 1 ELSE 0 END) AS losses, "
-                    "  AVG(CASE WHEN forward_pnl IS NOT NULL THEN forward_pnl ELSE NULL END) AS avg_pnl "
-                    "FROM ai_decisions "
-                    "WHERE settled = 1 "
-                    "  AND is_correct IN ('WIN', 'LOSS') "
-                    "  AND target_asset = ? "
-                    "  AND suggested_action = ? "
-                    "  AND created_at >= datetime('now', 'localtime', ?)",
-                    (asset, action, f"-{_PERF_LOOKBACK_DAYS} days"),
+                    "  SUM(CASE WHEN UPPER(ad.is_correct) = 'WIN' THEN 1 ELSE 0 END) AS wins, "
+                    "  SUM(CASE WHEN UPPER(ad.is_correct) = 'LOSS' THEN 1 ELSE 0 END) AS losses, "
+                    "  AVG(CASE WHEN ad.forward_pnl IS NOT NULL THEN ad.forward_pnl ELSE NULL END) AS avg_pnl "
+                    "FROM ai_decisions ad "
+                    "INNER JOIN raw_news rn ON rn.id = ad.news_id "
+                    "WHERE ad.settled = 1 "
+                    "  AND UPPER(ad.is_correct) IN ('WIN', 'LOSS') "
+                    f"  AND {formal_filter} "
+                    "  AND UPPER(ad.target_asset) = ? "
+                    "  AND UPPER(ad.suggested_action) = ? "
+                    "  AND ad.created_at >= datetime('now', 'localtime', ?)",
+                    (
+                        evidence.PASSED_TRADE_GATE_REASON,
+                        asset, action, f"-{_PERF_LOOKBACK_DAYS} days",
+                    ),
                 ).fetchone()
 
                 for pt in _PERF_PREDICTION_TYPES:
                     row = conn.execute(
                         "SELECT COUNT(*) AS n, "
-                        "  SUM(CASE WHEN is_correct = 'WIN' THEN 1 ELSE 0 END) AS wins, "
-                        "  SUM(CASE WHEN is_correct = 'LOSS' THEN 1 ELSE 0 END) AS losses, "
-                        "  AVG(CASE WHEN forward_pnl IS NOT NULL THEN forward_pnl ELSE NULL END) AS avg_pnl "
-                        "FROM ai_decisions "
-                        "WHERE settled = 1 "
-                        "  AND is_correct IN ('WIN', 'LOSS') "
-                        "  AND target_asset = ? "
-                        "  AND suggested_action = ? "
-                        "  AND prediction_type = ? "
-                        "  AND created_at >= datetime('now', 'localtime', ?)",
-                        (asset, action, pt, f"-{_PERF_LOOKBACK_DAYS} days"),
+                        "  SUM(CASE WHEN UPPER(ad.is_correct) = 'WIN' THEN 1 ELSE 0 END) AS wins, "
+                        "  SUM(CASE WHEN UPPER(ad.is_correct) = 'LOSS' THEN 1 ELSE 0 END) AS losses, "
+                        "  AVG(CASE WHEN ad.forward_pnl IS NOT NULL THEN ad.forward_pnl ELSE NULL END) AS avg_pnl "
+                        "FROM ai_decisions ad "
+                        "INNER JOIN raw_news rn ON rn.id = ad.news_id "
+                        "WHERE ad.settled = 1 "
+                        "  AND UPPER(ad.is_correct) IN ('WIN', 'LOSS') "
+                        f"  AND {formal_filter} "
+                        "  AND UPPER(ad.target_asset) = ? "
+                        "  AND UPPER(ad.suggested_action) = ? "
+                        "  AND ad.prediction_type = ? "
+                        "  AND ad.created_at >= datetime('now', 'localtime', ?)",
+                        (
+                            evidence.PASSED_TRADE_GATE_REASON,
+                            asset, action, pt, f"-{_PERF_LOOKBACK_DAYS} days",
+                        ),
                     ).fetchone()
 
                     n = row["n"] or 0
@@ -653,46 +728,10 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
                 else:
                     result = {"reasoning_path": "关键词推断 → 中性观望", "sentiment_score": 0.05, "suggested_action": "HOLD", "reasoning": "关键词推断:观望", "market_category": "OTHER", "target_asset": "NONE", "event_strength": "low", "direct_catalyst": False, "timeframe_match": "intraday"}
 
-        # ── 元数据字段默认值 (LLM 可能不返回或返回无效值) ──
-        _META_DEFAULTS: Dict[str, Any] = {
-            "prediction_type":        ("reversal", "continuation", "breakout"),
-            "event_phase":            ("early", "mid", "late"),
-            "market_confirmation":    ("positive", "negative", "unknown"),
-            "expected_horizon":       ("intraday", "1-3d", "1w+"),
-            "invalidation_condition": "",
-            # Phase 2: Event Quality Layer
-            "event_strength":         ("low", "medium", "high"),
-            "timeframe_match":        ("intraday", "swing", "macro"),
-        }
-        for key, valid in _META_DEFAULTS.items():
-            if key not in result or not isinstance(result[key], str):
-                # If valid is a tuple, take the last (most conservative) value; if str, use empty
-                result[key] = valid[-1] if isinstance(valid, tuple) else valid
-            elif isinstance(valid, tuple):
-                val_lower = result[key].strip().lower()
-                # Check if the value matches any valid option (fuzzy)
-                ok = False
-                for v in valid:
-                    if v in val_lower or val_lower == v:
-                        result[key] = v  # normalize to canonical form
-                        ok = True
-                        break
-                if not ok:
-                    result[key] = valid[-1]  # default conservative
-
-        # direct_catalyst 布尔值特殊处理 (LLM 可能返回 JSON true/false 或字符串)
-        dc = result.get("direct_catalyst")
-        if isinstance(dc, bool):
-            pass  # already correct
-        elif isinstance(dc, str) and dc.strip().lower() in ("true", "1", "yes"):
-            result["direct_catalyst"] = True
-        else:
-            result["direct_catalyst"] = False
-
-        # Extend legacy model output with validated dynamic direction/force/
-        # horizon fields.  The old score/action fields remain untouched.
-        result.update(normalize_analysis(result))
-
+        # Preserve missing/invalid metadata here.  Final score/action are
+        # reconciled below, then normalize_ai_analysis performs one strict,
+        # auditable normalisation pass.  Filling generic defaults at this
+        # stage used to erase the distinction between old and real LLM data.
         return result
 
     # ==================================================================
@@ -729,6 +768,19 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
             direct_reasoning = f"{action} 直觉判断"
         print(f"  [{model_cfg['label']}] {action} | {direct_reasoning}")
         score, action = reconcile_score_action(0.0, action)
+        score, vip_tag = _apply_vip_score_boost(score, action, news_content)
+        analysis_source = {
+            "sentiment_score": score,
+            "suggested_action": action,
+            "event_strength": "medium",
+            "direct_catalyst": False,
+            "timeframe_match": "intraday",
+        }
+        features = decision_guard.normalize_ai_analysis(
+            analysis_source,
+            score=score,
+            action=action,
+        )
         return {
             "sentiment_score": score,
             "suggested_action": action,
@@ -739,27 +791,21 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
             "reasoning_path": "",
             "model_label": model_cfg["label"],
             "model_id": model_cfg["id"],
-            # Phase 2: Event Quality Layer (Doubao 不输出这些 → 默认值)
-            "event_strength": "medium",
-            "direct_catalyst": False,
-            "timeframe_match": "intraday",
-            **normalize_analysis({"sentiment_score": score, "suggested_action": action}),
+            **features,
+            "_vip_tag": vip_tag,
+            "_analysis_source": analysis_source,
+            "_analysis_features": features,
         }
 
     # Validate & normalise fields
-    score = float(result.get("sentiment_score", 0))
-    score = max(-1.0, min(1.0, score))
-    # Safety net: never store exactly 0.0 — it's useless for aggregation
-    if abs(score) < 0.001:
-        score = 0.05  # tiny bullish bias, better than zero
-    action = str(result.get("suggested_action", "HOLD")).upper()
-    if action not in ("BUY", "SELL", "HOLD"):
-        action = "HOLD"
-    # Consistency: model may output HOLD with strong score — override
-    if score > 0.3 and action == "HOLD":
-        action = "BUY"
-    elif score < -0.3 and action == "HOLD":
-        action = "SELL"
+    score, action = reconcile_score_action(
+        result.get("sentiment_score", 0),
+        str(result.get("suggested_action", "HOLD")),
+    )
+    # The dynamic analysis must be derived from the same final score that is
+    # persisted.  VIP amplification used to happen later, leaving probability,
+    # force and analysis_basis.score internally inconsistent.
+    score, vip_tag = _apply_vip_score_boost(score, action, news_content)
     reasoning = str(result.get("reasoning", "")).strip()[:80]
     # Empty reasoning fallback
     if not reasoning:
@@ -785,7 +831,7 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
         short = news_content[:60].replace('\n', ' ')
         print(f"  [{model_cfg['label']}] (无CoT) 新闻: {short}")
 
-    features = normalize_analysis(result, score=score, action=action)
+    features = decision_guard.normalize_ai_analysis(result, score=score, action=action)
     return {
         "sentiment_score": score,
         "suggested_action": action,
@@ -796,11 +842,10 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
         "reasoning_path": reasoning_path,
         "model_label": model_cfg["label"],
         "model_id": model_cfg["id"],
-        # Phase 2: Event Quality Layer
-        "event_strength": result.get("event_strength", "medium"),
-        "direct_catalyst": bool(result.get("direct_catalyst", False)),
-        "timeframe_match": result.get("timeframe_match", "intraday"),
         **features,
+        "_vip_tag": vip_tag,
+        "_analysis_source": dict(result),
+        "_analysis_features": features,
     }
 
 
@@ -1259,13 +1304,19 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                     score = res["sentiment_score"]
                     action = res["suggested_action"]
 
-                    # VIP score boost — multiply |score| by 1.25 when VIP matched
+                    # The score was VIP-adjusted before the single dynamic
+                    # normalisation pass.  Persistence only records the tag;
+                    # legacy hand-built results are adjusted here before
+                    # their one fallback normalisation.
                     news_text_for_vip = content_map.get(nid, "")
-                    vip_tag, vip_name = _detect_vip(news_text_for_vip)
-                    if vip_tag and action in ("BUY", "SELL"):
-                        boosted = round(score * VIP_SCORE_BOOST, 4)
-                        if abs(boosted) <= 1.0:
-                            score = boosted
+                    if isinstance(res.get("_analysis_features"), dict):
+                        vip_tag = str(
+                            res.get("_vip_tag") or _detect_vip(news_text_for_vip)[0]
+                        )
+                    else:
+                        score, vip_tag = _apply_vip_score_boost(
+                            score, action, news_text_for_vip,
+                        )
                     category = res.get("market_category", "OTHER")
                     asset = res.get("target_asset", "NONE")
 
@@ -1282,17 +1333,17 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                             )
                             parent_cache[agg_key] = parent_id
 
-                    # ── 元数据提取 (LLM 可能不返回 → 默认值兜底) ──
-                    pred_type = res.get("prediction_type", "continuation")
-                    evt_phase = res.get("event_phase", "mid")
-                    mkt_confirm = res.get("market_confirmation", "unknown")
-                    exp_horizon = res.get("expected_horizon", "1-3d")
-                    inval_cond = res.get("invalidation_condition", "")
-                    # Phase 2: Event Quality Layer
-                    evt_strength = res.get("event_strength", "medium")
-                    direct_cat = 1 if res.get("direct_catalyst", False) else 0
-                    tf_match = res.get("timeframe_match", "intraday")
-                    features = normalize_analysis(res, score=score, action=action)
+                    # Normal worker results carry the exact post-VIP feature
+                    # set.  Legacy hand-built results are normalised here once.
+                    features = _analysis_features_for_persist(res, score, action)
+                    pred_type = features["prediction_type"]
+                    evt_phase = features["event_phase"]
+                    mkt_confirm = features["market_confirmation"]
+                    exp_horizon = features["expected_horizon"]
+                    inval_cond = features["invalidation_condition"]
+                    evt_strength = features["event_strength"]
+                    direct_cat = 1 if features["direct_catalyst"] else 0
+                    tf_match = features["timeframe_match"]
                     per_decision_context = merge_into_context(decision_context, features)
 
                     cur = conn.execute(
@@ -1396,14 +1447,33 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                         (action == "BUY" and score > 0)
                         or (action == "SELL" and score < 0)
                     )
+                    # Re-read the source quality at the final transaction
+                    # boundary.  The row may have been downgraded after the
+                    # batch claim, and research-mode legacy admission must not
+                    # leak into tracked paper positions.
+                    news_quality_row = conn.execute(
+                        "SELECT quality_status FROM raw_news WHERE id = ?",
+                        (nid,),
+                    ).fetchone()
+                    news_quality_status = (
+                        news_quality_row["quality_status"]
+                        if news_quality_row and "quality_status" in news_quality_row.keys()
+                        else "unverified"
+                    )
+                    quality_verified = quality_allows_paper_position(
+                        news_quality_status,
+                    )
                     gate_passed = (
                         guard["confidence_detail"]["passed_gate"]
                         and guard["action"] == action
                         and direction_consistent
                     )
-                    gate_reason = guard["verdict"] if gate_passed else (
-                        "LLM 方向与分数符号矛盾" if not direction_consistent else guard["verdict"]
-                    )
+                    if not quality_verified:
+                        gate_reason = f"新闻质量未验证:{news_quality_status or 'unverified'}"
+                    else:
+                        gate_reason = guard["verdict"] if gate_passed else (
+                            "LLM 方向与分数符号矛盾" if not direction_consistent else guard["verdict"]
+                        )
                     conn.execute(
                         """UPDATE ai_decisions
                            SET paper_trading_run_id=?, agent_model_id=?,
@@ -1432,6 +1502,7 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                     auto_trade = (
                         trading_settings["is_running"]
                         and active_run is not None
+                        and quality_verified
                         and paper_trading.asset_allowed(asset, trading_settings)
                         and action in ("BUY", "SELL")
                         and asset not in ("", "NONE")

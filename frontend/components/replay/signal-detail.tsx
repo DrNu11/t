@@ -37,6 +37,9 @@ export function SignalDetail({ signal }: Props) {
     }
     return c as Record<string, ConsensusModel>
   }, [signal.extra_models_consensus])
+  const paperLabel = signal.decision_eligible
+    ? `模拟盘 · ${signal.settled ? '已结算' : signal.tracking_quality === 'TRACKABLE' ? '实时跟踪' : '历史不可跟踪'}`
+    : `研究隔离 · ${signal.settled ? '已归档' : '不计入持仓'}`
 
   return (
     <div className="thin-scroll flex h-full min-h-0 flex-col gap-3 overflow-y-auto rounded-md border border-border bg-card p-3">
@@ -50,8 +53,8 @@ export function SignalDetail({ signal }: Props) {
         <span className={`rounded border px-2 py-0.5 font-mono text-xs font-semibold ${verdictColor(signal.is_correct)}`}>
           {signal.is_correct || 'PENDING'}
         </span>
-        <span className="ml-auto rounded border border-hold/50 bg-hold/10 px-2 py-0.5 font-mono text-[10px] text-hold">
-          模拟盘 · {signal.settled ? '已结算' : '实时跟踪'}
+        <span className={`ml-auto rounded border px-2 py-0.5 font-mono text-[10px] ${signal.decision_eligible ? 'border-hold/50 bg-hold/10 text-hold' : 'border-border bg-secondary text-muted-foreground'}`}>
+          {paperLabel}
         </span>
       </div>
 
@@ -213,6 +216,10 @@ export function SignalDetail({ signal }: Props) {
           <KV label="event_phase" value={signal.event_phase || '—'} />
           <KV label="entry_time" value={fmtTime(signal.entry_time)} />
           <KV label="settled" value={String(signal.settled)} />
+          <KV label="quality_status" value={signal.quality_status || '—'} />
+          <KV label="decision_eligible" value={signal.decision_eligible ? 'true' : 'false'} />
+          <KV label="tracking_quality" value={signal.tracking_quality || '—'} />
+          <KV label="recorded_verdict" value={signal.recorded_is_correct || '—'} />
         </div>
         {signal.decision_context && (
           <pre className="thin-scroll mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded border border-border bg-secondary p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">

@@ -53,6 +53,7 @@ import quick_sim
 import backtest
 from providers.jin10 import get_jin10_provider
 from realtime_filter import evaluate_news
+from engine.forward import classify_directional_outcome
 from engine.prices import _fetch_eastmoney_xau, _fetch_sina_xau, _get_current_price
 
 BASE_DIR = config.BASE_DIR
@@ -1414,18 +1415,29 @@ async def _news_analysis(news_id: int) -> Dict[str, Any]:
         connection.row_factory = aiosqlite.Row
         cursor = await connection.execute(
             """
+            WITH eligible_history AS (
+                SELECT h.target_asset, h.is_correct
+                FROM ai_decisions h
+                INNER JOIN raw_news hr ON hr.id=h.news_id
+                WHERE h.settled=1
+                  AND LOWER(COALESCE(hr.quality_status, ''))='verified'
+                  AND UPPER(h.suggested_action) IN ('BUY','SELL')
+                  AND UPPER(COALESCE(h.evidence_action, 'HOLD'))=UPPER(h.suggested_action)
+                  AND COALESCE(h.trade_gate_reason, '')=?
+                  AND h.paper_trading_run_id IS NOT NULL
+            )
             SELECT rn.id AS news_id, rn.source, rn.content, rn.timestamp,
                    ad.id AS decision_id, ad.created_at, ad.sentiment_score,
                    UPPER(ad.suggested_action) AS suggested_action, ad.reasoning,
                    ad.reasoning_path, ad.market_category, ad.target_asset,
                    ad.market_confirmation, ad.decision_context, ad.cluster_size,
-                   (SELECT COUNT(*) FROM ai_decisions h WHERE h.settled=1 AND UPPER(h.target_asset)=UPPER(ad.target_asset)) AS history_total,
-                   (SELECT COUNT(*) FROM ai_decisions h WHERE h.settled=1 AND h.is_correct='WIN' AND UPPER(h.target_asset)=UPPER(ad.target_asset)) AS history_wins
+                   (SELECT COUNT(*) FROM eligible_history h WHERE UPPER(h.target_asset)=UPPER(ad.target_asset)) AS history_total,
+                   (SELECT COUNT(*) FROM eligible_history h WHERE UPPER(h.target_asset)=UPPER(ad.target_asset) AND UPPER(h.is_correct)='WIN') AS history_wins
             FROM raw_news rn
             LEFT JOIN ai_decisions ad ON ad.id=(SELECT MAX(x.id) FROM ai_decisions x WHERE x.news_id=rn.id)
             WHERE rn.id=?
             """,
-            (news_id,),
+            (_PASSED_TRADE_GATE_REASON, news_id),
         )
         row = await cursor.fetchone()
         await cursor.close()
@@ -1461,18 +1473,32 @@ def _settled_stats_sync(asset: str) -> Dict[str, Any]:
     try:
         sample = evidence.collect_settled_sample(asset, connection=connection)
         tokens = evidence.query_assets(sample["assets"]) if sample["assets"] else ()
+        eligibility_sql = """
+            ad.settled=1
+            AND UPPER(ad.is_correct) IN ('WIN','LOSS')
+            AND LOWER(COALESCE(rn.quality_status, ''))='verified'
+            AND UPPER(ad.suggested_action) IN ('BUY','SELL')
+            AND UPPER(COALESCE(ad.evidence_action, 'HOLD'))=UPPER(ad.suggested_action)
+            AND COALESCE(ad.trade_gate_reason, '')=?
+            AND ad.paper_trading_run_id IS NOT NULL
+        """
         if tokens:
             placeholders = ",".join("?" * len(tokens))
             row = connection.execute(
-                f"""SELECT AVG(forward_pnl) avg_pnl FROM ai_decisions
-                    WHERE settled=1 AND UPPER(is_correct) IN ('WIN','LOSS')
-                      AND UPPER(target_asset) IN ({placeholders})""",
-                tokens,
+                f"""SELECT AVG(ad.forward_pnl) avg_pnl
+                    FROM ai_decisions ad
+                    INNER JOIN raw_news rn ON rn.id=ad.news_id
+                    WHERE {eligibility_sql}
+                      AND UPPER(ad.target_asset) IN ({placeholders})""",
+                (_PASSED_TRADE_GATE_REASON, *tokens),
             ).fetchone()
         else:
             row = connection.execute(
-                """SELECT AVG(forward_pnl) avg_pnl FROM ai_decisions
-                   WHERE settled=1 AND UPPER(is_correct) IN ('WIN','LOSS')"""
+                f"""SELECT AVG(ad.forward_pnl) avg_pnl
+                    FROM ai_decisions ad
+                    INNER JOIN raw_news rn ON rn.id=ad.news_id
+                    WHERE {eligibility_sql}""",
+                (_PASSED_TRADE_GATE_REASON,),
             ).fetchone()
         return {
             "total": sample["total"],
@@ -2392,6 +2418,130 @@ async def trading_manager_logs(tail: int = 200, x_trading_token: str | None = He
 
 # -- Replay endpoints (信号复盘看板 · 模拟盘) ----------------------------
 
+_PASSED_TRADE_GATE_REASON = "证据充分，允许输出方向性结论"
+
+
+def _valid_replay_entry_time(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    try:
+        datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _replay_decision_eligible(item: Dict[str, Any]) -> bool:
+    """Fail-closed production/research lane split for replay records."""
+    action = str(item.get("action") or item.get("suggested_action") or "").upper()
+    evidence_action = str(item.get("evidence_action") or "HOLD").upper()
+    return (
+        action in {"BUY", "SELL"}
+        and str(item.get("quality_status") or "").lower() == "verified"
+        and evidence_action == action
+        and str(item.get("trade_gate_reason") or "") == _PASSED_TRADE_GATE_REASON
+        and item.get("paper_trading_run_id") is not None
+    )
+
+
+def _effective_replay_verdict(item: Dict[str, Any]) -> str:
+    """Return a compatible verdict, repairing legacy HOLD rows from signed PnL."""
+    recorded = str(item.get("is_correct") or "").upper()
+    if not int(item.get("settled") or 0):
+        return recorded
+    action = str(item.get("action") or item.get("suggested_action") or "").upper()
+    pnl = item.get("forward_pnl")
+    if action in {"BUY", "SELL"} and pnl is not None:
+        return classify_directional_outcome(
+            action, pnl, str(item.get("asset") or item.get("target_asset") or "")
+        )
+    return recorded
+
+
+def _summarize_replay_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build production stats while retaining excluded research diagnostics."""
+    production_settled: list[Dict[str, Any]] = []
+    research_settled: list[Dict[str, Any]] = []
+    tracking = 0
+    legacy_untrackable = 0
+    research_tracking = 0
+    research_legacy_untrackable = 0
+
+    for source in rows:
+        item = dict(source)
+        item["is_correct"] = _effective_replay_verdict(item)
+        eligible = _replay_decision_eligible(item)
+        if int(item.get("settled") or 0):
+            (production_settled if eligible else research_settled).append(item)
+        elif eligible:
+            if _valid_replay_entry_time(item.get("entry_time")):
+                tracking += 1
+            else:
+                legacy_untrackable += 1
+        else:
+            if _valid_replay_entry_time(item.get("entry_time")):
+                research_tracking += 1
+            else:
+                research_legacy_untrackable += 1
+
+    def settled_summary(items: list[Dict[str, Any]]) -> Dict[str, Any]:
+        wins = sum(item["is_correct"] == "WIN" for item in items)
+        losses = sum(item["is_correct"] == "LOSS" for item in items)
+        pnls = [float(item["forward_pnl"]) for item in items if item.get("forward_pnl") is not None]
+        mfes = [float(item["mfe_pct"]) for item in items if item.get("mfe_pct") is not None]
+        maes = [float(item["mae_pct"]) for item in items if item.get("mae_pct") is not None]
+        return {
+            "settled": len(items),
+            "wins": wins,
+            "losses": losses,
+            "holds": len(items) - wins - losses,
+            "winrate": round(wins / (wins + losses), 4) if wins + losses else 0.0,
+            "avg_pnl": round(sum(pnls) / len(pnls), 6) if pnls else None,
+            "avg_mfe": round(sum(mfes) / len(mfes), 6) if mfes else None,
+            "avg_mae": round(sum(maes) / len(maes), 6) if maes else None,
+            "best_trade": max(pnls) if pnls else None,
+            "worst_trade": min(pnls) if pnls else None,
+        }
+
+    overall = settled_summary(production_settled)
+    overall.update({
+        "tracking": tracking,
+        "legacy_untrackable": legacy_untrackable,
+        "total": len(production_settled) + tracking,
+    })
+    research = settled_summary(research_settled)
+    research.update({
+        "tracking": research_tracking,
+        "legacy_untrackable": research_legacy_untrackable,
+        "total": len(research_settled) + research_tracking,
+    })
+
+    def grouped(field: str) -> list[Dict[str, Any]]:
+        buckets: Dict[str, list[Dict[str, Any]]] = {}
+        for item in production_settled:
+            key = str(item.get(field) or "UNKNOWN").upper()
+            buckets.setdefault(key, []).append(item)
+        result = []
+        for key, items in sorted(buckets.items()):
+            summary = settled_summary(items)
+            result.append({
+                field: key,
+                "total": summary["settled"],
+                "wins": summary["wins"],
+                "losses": summary["losses"],
+                "holds": summary["holds"],
+                "winrate": summary["winrate"],
+                "avg_pnl": summary["avg_pnl"],
+            })
+        return result
+
+    return {
+        "overall": overall,
+        "research_excluded": research,
+        "by_asset": grouped("asset"),
+        "by_action": grouped("action"),
+    }
+
 def _build_simulated_klines(
     *,
     entry_time_ts: int,
@@ -2562,6 +2712,7 @@ async def get_replay_signals(
                 ad.news_id,
                 rn.timestamp AS news_time,
                 rn.source,
+                rn.quality_status,
                 rn.content AS news_text,
                 UPPER(ad.target_asset) AS asset,
                 UPPER(ad.suggested_action) AS action,
@@ -2588,6 +2739,9 @@ async def get_replay_signals(
                 ad.exit_reason,
                 ad.is_correct,
                 ad.settled,
+                ad.paper_trading_run_id,
+                ad.evidence_action,
+                ad.trade_gate_reason,
                 ad.mfe_pct,
                 ad.mae_pct,
                 ad.forward_pnl,
@@ -2649,11 +2803,31 @@ async def get_replay_signals(
                 d[k] = v.isoformat()
             elif not isinstance(v, str):
                 d[k] = str(v)
+        d["recorded_is_correct"] = d.get("is_correct") or ""
+        d["is_correct"] = _effective_replay_verdict(d)
+        d["decision_eligible"] = _replay_decision_eligible(d)
+        if int(d.get("settled") or 0):
+            d["tracking_quality"] = "SETTLED"
+        elif not d["decision_eligible"]:
+            # Keep historical/research rows visible for audit, but never show
+            # them as formal pending positions or attach live account PnL.
+            d["tracking_quality"] = "RESEARCH_EXCLUDED"
+        elif _valid_replay_entry_time(d.get("entry_time")):
+            d["tracking_quality"] = "TRACKABLE"
+        else:
+            d["tracking_quality"] = "LEGACY_UNTRACKABLE"
         out.append(d)
     return out
 
 
 def _paper_metrics(signal: Dict[str, Any], current_price: Optional[float]) -> Dict[str, Any]:
+    settled = bool(int(signal.get("settled") or 0))
+    tracking_quality = str(signal.get("tracking_quality") or "")
+    trackable = settled or tracking_quality == "TRACKABLE"
+    if not trackable:
+        # Preserve the row for audit, but do not turn a record with no reliable
+        # start time into a live position or account PnL.
+        current_price = None
     entry = float(signal.get("entry_price") or 0.0)
     action = str(signal.get("action") or "").upper()
     high = float(signal.get("max_price") or entry)
@@ -2679,7 +2853,7 @@ def _paper_metrics(signal: Dict[str, Any], current_price: Optional[float]) -> Di
     notional = float(params.get("notional_usdt") or 0.0)
     leverage = float(params.get("leverage") or 1.0)
     exit_reason = "tracking"
-    if int(signal.get("settled") or 0):
+    if settled:
         verdict = str(signal.get("is_correct") or "").upper()
         exit_reason = {
             "WIN": "take_profit_or_horizon",
@@ -2692,9 +2866,16 @@ def _paper_metrics(signal: Dict[str, Any], current_price: Optional[float]) -> Di
     if entry_time:
         try:
             started = datetime.fromisoformat(str(entry_time).replace("Z", "+00:00"))
-            end_value = signal.get("created_at") if not signal.get("settled") else signal.get("exit_time")
-            if end_value:
-                ended = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=TZ_SHANGHAI)
+            end_value = signal.get("exit_time") if settled else None
+            if end_value or not settled:
+                if not settled:
+                    ended = datetime.now(TZ_SHANGHAI)
+                else:
+                    ended = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
+                    if ended.tzinfo is None:
+                        ended = ended.replace(tzinfo=TZ_SHANGHAI)
                 hold_minutes = max(0.0, (ended - started).total_seconds() / 60.0)
         except (TypeError, ValueError):
             hold_minutes = None
@@ -2714,7 +2895,11 @@ def _paper_metrics(signal: Dict[str, Any], current_price: Optional[float]) -> Di
         "live_mfe_pct": round(max(0.0, mfe), 4),
         "live_mae_pct": round(max(0.0, mae), 4),
         "pricing_status": "LIVE" if current_price is not None else "UNAVAILABLE",
-        "paper_status": "SETTLED" if int(signal.get("settled") or 0) else "TRACKING",
+        "paper_status": (
+            "SETTLED" if settled
+            else "TRACKING" if trackable
+            else tracking_quality or "LEGACY_UNTRACKABLE"
+        ),
     }
 
 
@@ -2831,34 +3016,41 @@ def _llm_performance_sync(model_id: str) -> Dict[str, Any]:
     conn = db.get_connection()
     conn.row_factory = sqlite3.Row
     try:
-        row = conn.execute(
-            """SELECT COUNT(*) AS settled,
-                      SUM(CASE WHEN is_correct='WIN' THEN 1 ELSE 0 END) AS wins,
-                      SUM(CASE WHEN is_correct='LOSS' THEN 1 ELSE 0 END) AS losses,
-                      SUM(CASE WHEN is_correct IN ('HOLD','BREAKEVEN') THEN 1 ELSE 0 END) AS holds,
-                      AVG(forward_pnl) AS avg_pnl,
-                      SUM(forward_pnl) AS total_pnl
-               FROM ai_decisions
-               WHERE settled=1 AND entry_price>0""",
-        ).fetchone()
-        settled = int(row["settled"] or 0)
-        wins = int(row["wins"] or 0)
-        losses = int(row["losses"] or 0)
+        rows = [dict(row) for row in conn.execute(
+            """SELECT ad.settled, ad.entry_time, ad.is_correct, ad.forward_pnl,
+                      ad.mfe_pct, ad.mae_pct,
+                      UPPER(ad.target_asset) AS asset,
+                      UPPER(ad.suggested_action) AS action,
+                      ad.paper_trading_run_id, ad.evidence_action,
+                      ad.trade_gate_reason, rn.quality_status
+               FROM ai_decisions ad
+               INNER JOIN raw_news rn ON rn.id=ad.news_id
+               WHERE ad.settled=1 AND ad.entry_price>0"""
+        ).fetchall()]
+        summary = _summarize_replay_rows(rows)
+        overall = summary["overall"]
+        settled = int(overall["settled"])
+        wins = int(overall["wins"])
+        losses = int(overall["losses"])
         decided = wins + losses
         accuracy = wins / decided * 100 if decided else None
-        total_pnl = float(row["total_pnl"] or 0.0)
+        production_rows = [
+            row for row in rows if _replay_decision_eligible(row)
+        ]
+        total_pnl = sum(float(row.get("forward_pnl") or 0.0) for row in production_rows)
         return {
             "model_id": model_id,
             "settled": settled,
             "wins": wins,
             "losses": losses,
-            "holds": int(row["holds"] or 0),
+            "holds": int(overall["holds"]),
             "accuracy_pct": round(accuracy, 2) if accuracy is not None else None,
-            "avg_pnl_pct": round(float(row["avg_pnl"] or 0.0), 4) if settled else None,
+            "avg_pnl_pct": overall["avg_pnl"],
             "total_pnl_pct": round(total_pnl, 4),
             "profitable": total_pnl > 0 if settled else None,
             "verdict": "样本不足，继续收集真实结算结果" if decided < 10 else ("历史结算表现为正" if total_pnl > 0 else "历史结算表现未盈利"),
             "method": "以该 LLM 已建立且真实结算的模拟交易计算，不使用模型自评",
+            "research_excluded": summary["research_excluded"],
         }
     finally:
         conn.close()
@@ -2874,23 +3066,40 @@ def _run_feedback_sync(run_id: Optional[int]) -> Dict[str, Any]:
         if not run:
             return {"stage": "STOPPED", "message": "运行记录不存在", "evaluated": 0, "passed": 0, "rejected": 0, "latest": []}
         rows = conn.execute(
-            """SELECT id, target_asset, suggested_action, evidence_confidence,
-                      evidence_action, trade_gate_reason, entry_price, created_at
-               FROM ai_decisions
-               WHERE created_at>=? AND paper_trading_run_id=?
-               ORDER BY id DESC LIMIT 20""",
+            """SELECT ad.id, ad.target_asset,
+                      UPPER(ad.suggested_action) AS suggested_action,
+                      ad.evidence_confidence, ad.evidence_action,
+                      ad.trade_gate_reason, ad.entry_price, ad.created_at,
+                      ad.paper_trading_run_id, rn.quality_status
+               FROM ai_decisions ad
+               INNER JOIN raw_news rn ON rn.id=ad.news_id
+               WHERE ad.created_at>=? AND ad.paper_trading_run_id=?
+               ORDER BY ad.id DESC LIMIT 20""",
             (run["started_at"], run_id),
         ).fetchall()
         latest = [dict(row) for row in rows]
-        passed = sum(item["entry_price"] is not None for item in latest)
-        rejected = len(latest) - passed
+        for item in latest:
+            item["decision_eligible"] = _replay_decision_eligible(item)
+        production = [item for item in latest if item["decision_eligible"]]
+        research = [item for item in latest if not item["decision_eligible"]]
+        passed = sum(item["entry_price"] is not None for item in production)
+        rejected = len(production) - passed
         stage = "POSITION_OPEN" if passed else ("SIGNAL_REJECTED" if rejected else "WAITING_NEWS")
         message = (
             "已自动建仓并跟踪实时盈亏" if passed
             else "已收到信号，但未通过 LLM 多证据与策略闸门" if rejected
+            else "仅收到研究/未验证信号，已隔离且不计入模拟盘" if research
             else "运行正常，正在等待所选赛道的新新闻信号"
         )
-        return {"stage": stage, "message": message, "evaluated": len(latest), "passed": passed, "rejected": rejected, "latest": latest[:5]}
+        return {
+            "stage": stage,
+            "message": message,
+            "evaluated": len(latest),
+            "passed": passed,
+            "rejected": rejected,
+            "research_excluded": len(research),
+            "latest": latest[:5],
+        }
     finally:
         conn.close()
 
@@ -2898,7 +3107,11 @@ def _run_feedback_sync(run_id: Optional[int]) -> Dict[str, Any]:
 @app.get("/api/replay/positions")
 async def get_replay_positions(limit: int = 200):
     signals = await get_replay_signals(settled=-1, limit=limit)
-    assets = sorted({str(item["asset"]).upper() for item in signals if not item["settled"]})
+    assets = sorted({
+        str(item["asset"]).upper()
+        for item in signals
+        if not item["settled"] and item.get("tracking_quality") == "TRACKABLE"
+    })
     values = await asyncio.gather(
         *(asyncio.to_thread(_get_current_price, asset) for asset in assets),
         return_exceptions=True,
@@ -2922,11 +3135,20 @@ async def get_replay_positions(limit: int = 200):
         )
         for item in signals
     ]
+    production_positions = [item for item in positions if item.get("decision_eligible")]
+    research_positions = [item for item in positions if not item.get("decision_eligible")]
+    legacy_untrackable = [
+        item for item in positions
+        if not item["settled"] and item.get("tracking_quality") == "LEGACY_UNTRACKABLE"
+    ]
     realized = sum(
         float(item.get("current_pnl_usdt") or 0.0)
-        for item in positions if item["settled"]
+        for item in production_positions if item["settled"]
     )
-    tracking = [item for item in positions if not item["settled"]]
+    tracking = [
+        item for item in production_positions
+        if not item["settled"] and item.get("tracking_quality") == "TRACKABLE"
+    ]
     unrealized_values = [item.get("current_pnl_usdt") for item in tracking]
     unpriced = sum(value is None for value in unrealized_values)
     unrealized = sum(float(value or 0.0) for value in unrealized_values)
@@ -2934,8 +3156,8 @@ async def get_replay_positions(limit: int = 200):
         float((item.get("strategy_params") or strategy_store.default_params()).get("notional_usdt") or 0.0)
         for item in tracking
     )
-    fees = sum(float(item.get("fees_usdt") or 0.0) for item in positions)
-    slippage = sum(float(item.get("slippage_usdt") or 0.0) for item in positions)
+    fees = sum(float(item.get("fees_usdt") or 0.0) for item in production_positions)
+    slippage = sum(float(item.get("slippage_usdt") or 0.0) for item in production_positions)
     initial = config.PAPER_INITIAL_EQUITY_USDT
     equity = initial + realized + unrealized
     return {
@@ -2957,9 +3179,11 @@ async def get_replay_positions(limit: int = 200):
             "used_margin_usdt": round(used_margin, 4),
             "fees_usdt": round(fees, 4),
             "slippage_usdt": round(slippage, 4),
-            "trade_count": len(positions),
+            "trade_count": len(production_positions),
             "available_equity_usdt": round(equity - used_margin, 4) if not unpriced else None,
             "unpriced_positions": unpriced,
+            "research_positions_excluded": len(research_positions),
+            "legacy_untrackable_excluded": len(legacy_untrackable),
         },
         "updated_at_ms": int(time.time() * 1000),
         "is_paper_trading": True,
@@ -2970,83 +3194,43 @@ async def get_replay_positions(limit: int = 200):
 @app.get("/api/replay/stats")
 async def get_replay_stats(strategy_id: Optional[int] = None, version_id: Optional[int] = None):
     """当前策略模拟交易统计，胜率只使用有明确胜负的已结算交易。"""
-    strategy_filter = "entry_price IS NOT NULL AND entry_price > 0"
-    filter_params: tuple[Any, ...] = ()
+    clauses = ["ad.entry_price IS NOT NULL", "ad.entry_price > 0"]
+    filter_params: list[Any] = []
     if strategy_id is not None:
-        strategy_filter += " AND strategy_id = ?"
-        filter_params += (strategy_id,)
+        clauses.append("ad.strategy_id = ?")
+        filter_params.append(strategy_id)
     if version_id is not None:
-        strategy_filter += " AND strategy_version_id = ?"
-        filter_params += (version_id,)
+        clauses.append("ad.strategy_version_id = ?")
+        filter_params.append(version_id)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             f"""
-            SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN settled = 0 THEN 1 ELSE 0 END) AS tracking,
-                SUM(CASE WHEN settled = 1 THEN 1 ELSE 0 END) AS settled,
-                SUM(CASE WHEN is_correct = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                SUM(CASE WHEN is_correct = 'LOSS' THEN 1 ELSE 0 END) AS losses,
-                SUM(CASE WHEN is_correct IN ('HOLD', 'BREAKEVEN') THEN 1 ELSE 0 END) AS holds,
-                AVG(CASE WHEN settled = 1 THEN forward_pnl END) AS avg_pnl,
-                AVG(CASE WHEN settled = 1 THEN mfe_pct END) AS avg_mfe,
-                AVG(CASE WHEN settled = 1 THEN mae_pct END) AS avg_mae,
-                MAX(CASE WHEN settled = 1 THEN forward_pnl END) AS best_trade,
-                MIN(CASE WHEN settled = 1 THEN forward_pnl END) AS worst_trade
-            FROM ai_decisions
-            WHERE {strategy_filter}
+            SELECT ad.settled, ad.entry_time, ad.is_correct, ad.forward_pnl,
+                   ad.mfe_pct, ad.mae_pct,
+                   UPPER(ad.target_asset) AS asset,
+                   UPPER(ad.suggested_action) AS action,
+                   ad.paper_trading_run_id, ad.evidence_action,
+                   ad.trade_gate_reason, rn.quality_status
+            FROM ai_decisions ad
+            INNER JOIN raw_news rn ON rn.id=ad.news_id
+            WHERE {' AND '.join(clauses)}
             """,
             filter_params,
         )
-        overall = dict(await cur.fetchone())
+        rows = [dict(row) for row in await cur.fetchall()]
         await cur.close()
 
-        cur = await db.execute(
-            f"""
-            SELECT
-                UPPER(target_asset) AS asset,
-                COUNT(*) AS total,
-                SUM(CASE WHEN is_correct = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                SUM(CASE WHEN is_correct = 'LOSS' THEN 1 ELSE 0 END) AS losses,
-                AVG(forward_pnl) AS avg_pnl
-            FROM ai_decisions
-            WHERE settled = 1 AND {strategy_filter}
-            GROUP BY UPPER(target_asset)
-            ORDER BY total DESC
-            """,
-            filter_params,
-        )
-        by_asset = [dict(r) for r in await cur.fetchall()]
-        await cur.close()
-
-        cur = await db.execute(
-            f"""
-            SELECT
-                UPPER(suggested_action) AS action,
-                COUNT(*) AS total,
-                SUM(CASE WHEN is_correct = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                AVG(forward_pnl) AS avg_pnl
-            FROM ai_decisions
-            WHERE settled = 1 AND {strategy_filter}
-            GROUP BY UPPER(suggested_action)
-            """,
-            filter_params,
-        )
-        by_action = [dict(r) for r in await cur.fetchall()]
-        await cur.close()
-
-    decided = (overall.get("wins") or 0) + (overall.get("losses") or 0)
-    for key in ("total", "tracking", "settled", "wins", "losses", "holds"):
-        overall[key] = int(overall.get(key) or 0)
-    overall["winrate"] = round((overall.get("wins") or 0) / decided, 4) if decided else 0.0
+    summary = _summarize_replay_rows(rows)
     return {
-        "overall": overall,
+        "overall": summary["overall"],
         "strategy_id": strategy_id,
         "strategy_version_id": version_id,
-        "by_asset": by_asset,
-        "by_action": by_action,
+        "by_asset": summary["by_asset"],
+        "by_action": summary["by_action"],
+        "research_excluded": summary["research_excluded"],
         "is_paper_trading": True,
+        "method": "verified_gate_passed_directional_pnl_v2",
     }
 
 
@@ -3059,7 +3243,16 @@ async def get_replay_reflection(limit: int = 500):
     summary into a human-approved prompt.
     """
     signals = await get_replay_signals(settled=1, limit=min(max(limit, 20), 500))
-    decided = [item for item in signals if str(item.get("is_correct") or "").upper() in {"WIN", "LOSS"}]
+    production_signals = [item for item in signals if item.get("decision_eligible")]
+    research_signals = [item for item in signals if not item.get("decision_eligible")]
+    decided = [
+        item for item in production_signals
+        if str(item.get("is_correct") or "").upper() in {"WIN", "LOSS"}
+    ]
+    research_decided = [
+        item for item in research_signals
+        if str(item.get("is_correct") or "").upper() in {"WIN", "LOSS"}
+    ]
     wins = [item for item in decided if str(item.get("is_correct")).upper() == "WIN"]
     losses = [item for item in decided if str(item.get("is_correct")).upper() == "LOSS"]
 
@@ -3118,7 +3311,12 @@ async def get_replay_reflection(limit: int = 500):
         "by_asset": grouped("asset"),
         "failure_patterns": patterns,
         "recommendations": recommendations,
-        "method": "deterministic_replay_review_v1",
+        "research_excluded": {
+            "sample": len(research_decided),
+            "wins": sum(str(item.get("is_correct")).upper() == "WIN" for item in research_decided),
+            "losses": sum(str(item.get("is_correct")).upper() == "LOSS" for item in research_decided),
+        },
+        "method": "deterministic_verified_replay_review_v2",
     }
 
 

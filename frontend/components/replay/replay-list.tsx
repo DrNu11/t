@@ -32,8 +32,9 @@ export function ReplayList({ signals, loading, selectedId, onSelect, onReload }:
       return true
     })
   }, [signals, asset, action])
-  const pendingCount = filtered.filter((signal) => !signal.settled).length
-  const settledCount = filtered.length - pendingCount
+  const pendingCount = filtered.filter((signal) => !signal.settled && signal.tracking_quality === 'TRACKABLE').length
+  const settledCount = filtered.filter((signal) => Boolean(signal.settled) && signal.decision_eligible).length
+  const isolatedCount = filtered.length - pendingCount - settledCount
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
@@ -44,6 +45,9 @@ export function ReplayList({ signals, loading, selectedId, onSelect, onReload }:
         </span>
         <span className="rounded-md border border-border bg-secondary px-2 py-0.5 font-mono text-[10px] text-foreground">
           盈亏记录 {settledCount}
+        </span>
+        <span className="rounded-md border border-border bg-secondary px-2 py-0.5 font-mono text-[10px] text-muted-foreground">
+          研究/旧数据隔离 {isolatedCount}
         </span>
         <div className="ml-auto flex items-center gap-2">
           <Filter label="品种" value={asset} options={ASSET_OPTIONS} onChange={setAsset} />
@@ -66,6 +70,13 @@ export function ReplayList({ signals, loading, selectedId, onSelect, onReload }:
           <ul className="divide-y divide-border">
             {filtered.map((s) => {
               const selected = s.id === selectedId
+              const statusLabel = s.settled
+                ? (s.decision_eligible ? (s.is_correct || '已结算') : '研究归档')
+                : s.tracking_quality === 'TRACKABLE'
+                  ? '挂单中'
+                  : s.tracking_quality === 'RESEARCH_EXCLUDED'
+                    ? '研究隔离'
+                    : '历史不可跟踪'
               return (
                 <li
                   key={s.id}
@@ -91,7 +102,7 @@ export function ReplayList({ signals, loading, selectedId, onSelect, onReload }:
                           s.is_correct
                         )}`}
                       >
-                        {s.settled ? (s.is_correct || '已结算') : '挂单中'}
+                        {statusLabel}
                       </span>
                     </div>
                     <span className="font-mono text-[10px] text-muted-foreground">{fmtTime(s.entry_time)}</span>

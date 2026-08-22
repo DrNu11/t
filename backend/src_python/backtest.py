@@ -2,7 +2,7 @@
 """
 策略回测 — 只回放本平台已结算真实信号。
 
-数据源：`ai_decisions` 中 settled=1 且 entry_price>0、forward_pnl 非空的行。
+数据源：`ai_decisions` 中通过正式来源/证据闸门的已结算行。
 盈亏使用 forward_tracker 已写入的真实 exit/entry，不再生成模拟价格路径。
 仓位：notional_usdt × leverage，与交易模块口径一致。
 """
@@ -16,6 +16,7 @@ import db
 import strategy_store
 
 STRENGTH_RANK = {"weak": 1, "medium": 2, "strong": 3}
+_PASSED_TRADE_GATE_REASON = "证据充分，允许输出方向性结论"
 
 
 def load_settled_trades(
@@ -32,8 +33,12 @@ def load_settled_trades(
             "ad.entry_price IS NOT NULL AND ad.entry_price > 0",
             "ad.forward_pnl IS NOT NULL",
             "UPPER(ad.suggested_action) IN ('BUY', 'SELL')",
+            "LOWER(COALESCE(rn.quality_status, '')) = 'verified'",
+            "UPPER(COALESCE(ad.evidence_action, 'HOLD')) = UPPER(ad.suggested_action)",
+            "COALESCE(ad.trade_gate_reason, '') = ?",
+            "ad.paper_trading_run_id IS NOT NULL",
         ]
-        params: List[Any] = []
+        params: List[Any] = [_PASSED_TRADE_GATE_REASON]
         if asset:
             clauses.append("UPPER(ad.target_asset) = ?")
             params.append(asset.upper())
@@ -44,6 +49,7 @@ def load_settled_trades(
                    UPPER(ad.suggested_action) AS action, UPPER(ad.target_asset) AS asset,
                    ad.sentiment_score, ad.event_strength, ad.direct_catalyst, ad.market_confirmation
             FROM ai_decisions ad
+            INNER JOIN raw_news rn ON rn.id = ad.news_id
             WHERE {" AND ".join(clauses)}
             ORDER BY COALESCE(ad.entry_time, ad.created_at) ASC, ad.id ASC
             LIMIT ?
@@ -157,7 +163,7 @@ def run_backtest(
     return {
         "data_source": "ai_decisions.settled",
         "honest": True,
-        "note": "盈亏来自已结算信号的真实 entry/exit（forward_pnl），未使用模拟 K 线。",
+        "note": "盈亏来自通过来源与证据闸门的正式已结算信号，未使用模拟 K 线。",
         "params": clamped,
         "sample_size": len(trades),
         "taken": len(taken_rows),

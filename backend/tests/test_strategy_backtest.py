@@ -3,16 +3,39 @@
 import backtest
 import strategy_store
 
+PASSED_REASON = "证据充分，允许输出方向性结论"
 
-def _insert_trade(db, *, action, asset, score, pnl, strength="medium", catalyst=1, settled=1):
+
+def _insert_trade(
+    db,
+    *,
+    action,
+    asset,
+    score,
+    pnl,
+    strength="medium",
+    catalyst=1,
+    settled=1,
+    quality_status="verified",
+    evidence_action=None,
+    gate_reason=PASSED_REASON,
+    paper_run_id=1,
+):
     news_id = db.execute(
-        "INSERT INTO raw_news(source,content,timestamp,status) VALUES('t','n','2026-01-01','DONE')"
+        """INSERT INTO raw_news(source,content,timestamp,status,quality_status)
+           VALUES('t','n','2026-01-01','DONE',?)""",
+        (quality_status,),
     ).lastrowid
     db.execute(
         """INSERT INTO ai_decisions(news_id,sentiment_score,suggested_action,reasoning,target_asset,
-           entry_price,exit_price,forward_pnl,settled,is_correct,event_strength,direct_catalyst,entry_time)
-           VALUES(?,?,?, 'r', ?, 100, ?, ?, ?, ?, ?, ?, '2026-01-01 00:00:00')""",
-        (news_id, score, action, asset, 100 + pnl, pnl, settled, "WIN" if pnl > 0 else "LOSS", strength, catalyst),
+           entry_price,exit_price,forward_pnl,settled,is_correct,event_strength,direct_catalyst,entry_time,
+           evidence_action,trade_gate_reason,paper_trading_run_id)
+           VALUES(?,?,?, 'r', ?, 100, ?, ?, ?, ?, ?, ?, '2026-01-01 00:00:00', ?, ?, ?)""",
+        (
+            news_id, score, action, asset, 100 + pnl, pnl, settled,
+            "WIN" if pnl > 0 else "LOSS", strength, catalyst,
+            evidence_action or action, gate_reason, paper_run_id,
+        ),
     )
     db.commit()
 
@@ -50,6 +73,38 @@ def test_backtest_uses_real_forward_pnl(temp_db):
     assert report["skipped"] == 2
     assert report["total_pnl_usdt"] == 4.0  # 100 * 2 * 2%
     assert report["trades"][0]["forward_pnl_pct"] == 2.0
+
+
+def test_backtest_excludes_every_research_lane_gate_failure(temp_db):
+    _insert_trade(temp_db, action="BUY", asset="BTC", score=0.8, pnl=2.0)
+    _insert_trade(
+        temp_db, action="BUY", asset="BTC", score=0.8, pnl=50.0,
+        quality_status="unverified",
+    )
+    _insert_trade(
+        temp_db, action="BUY", asset="BTC", score=0.8, pnl=50.0,
+        evidence_action="HOLD",
+    )
+    _insert_trade(
+        temp_db, action="BUY", asset="BTC", score=0.8, pnl=50.0,
+        gate_reason="research_only",
+    )
+    _insert_trade(
+        temp_db, action="BUY", asset="BTC", score=0.8, pnl=50.0,
+        paper_run_id=None,
+    )
+
+    rows = backtest.load_settled_trades(connection=temp_db)
+    assert len(rows) == 1
+    assert rows[0]["forward_pnl"] == 2.0
+
+    params = strategy_store.default_params()
+    report = backtest.run_backtest(params, connection=temp_db)
+    assert report["data_source"] == "ai_decisions.settled"
+    assert report["sample_size"] == 1
+    assert report["total_pnl_usdt"] == round(
+        params["notional_usdt"] * params["leverage"] * 0.02, 4
+    )
 
 
 def test_current_strategy_can_be_switched(temp_db):

@@ -9,6 +9,7 @@ def test_paper_metrics_buy_and_sell():
     buy = api_server._paper_metrics({
         "entry_price": 100, "action": "BUY", "max_price": 105,
         "min_price": 98, "settled": 0, "strategy_params": params,
+        "tracking_quality": "TRACKABLE",
     }, 103)
     assert buy["current_pnl_pct"] == 3
     assert buy["current_pnl_usdt"] == 6
@@ -18,6 +19,7 @@ def test_paper_metrics_buy_and_sell():
     sell = api_server._paper_metrics({
         "entry_price": 100, "action": "SELL", "max_price": 104,
         "min_price": 95, "settled": 0, "strategy_params": params,
+        "tracking_quality": "TRACKABLE",
     }, 97)
     assert sell["current_pnl_pct"] == 3
     assert sell["current_pnl_usdt"] == 6
@@ -27,6 +29,7 @@ def test_paper_metrics_buy_and_sell():
     unavailable = api_server._paper_metrics({
         "entry_price": 100, "action": "BUY", "max_price": 100,
         "min_price": 100, "settled": 0, "strategy_params": params,
+        "tracking_quality": "TRACKABLE",
     }, None)
     assert unavailable["current_pnl_pct"] is None
     assert unavailable["current_pnl_usdt"] is None

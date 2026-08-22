@@ -7,7 +7,10 @@ No key is included in logs, fixtures, or source control.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import hashlib
 import html
+import math
 import re
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +20,8 @@ from .contracts import MacroEvent, MacroProvider, MarketProvider, MarketQuote, N
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
+_SOURCE_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
+_MISSING_NUMBERS = {"", "--", "-", "N/A", "NULL", "NONE"}
 _ASSET_HINTS = (
     (("黄金", "金价", "XAU", "GOLD"), "XAU"),
     (("比特币", "BTC", "Bitcoin"), "BTC"),
@@ -34,9 +39,10 @@ def _number(value: Any) -> Optional[float]:
     if value in (None, "", "--", "-"):
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _asset_hints(text: str, tags: Any = None) -> List[str]:
@@ -55,13 +61,108 @@ def _title_from_body(body: str, category: str) -> str:
     return (first or body)[:120]
 
 
-def _rows(payload: Any) -> List[Dict[str, Any]]:
+class Jin10SchemaError(ValueError):
+    """The authorized endpoint returned an envelope we cannot validate."""
+
+
+def _rows(payload: Any, *, strict: bool = False) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
+        if strict:
+            raise Jin10SchemaError("response must be a JSON object")
         return []
-    rows = payload.get("data", [])
+    if "data" not in payload:
+        if strict:
+            raise Jin10SchemaError("response is missing the data field")
+        return []
+    rows = payload.get("data")
     if isinstance(rows, dict):
-        rows = rows.get("data") or rows.get("list") or rows.get("items") or []
-    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        matched = [key for key in ("data", "list", "items") if key in rows]
+        if len(matched) != 1:
+            if strict:
+                raise Jin10SchemaError("data object must contain exactly one supported row list")
+            return []
+        rows = rows[matched[0]]
+    if not isinstance(rows, list):
+        if strict:
+            raise Jin10SchemaError("data field must contain a row list")
+        return []
+    if strict and any(not isinstance(row, dict) for row in rows):
+        raise Jin10SchemaError("calendar row must be a JSON object")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _normalise_datetime(value: Any) -> str:
+    """Return a timezone-explicit UTC timestamp for a Jin10 calendar row."""
+    if value in (None, ""):
+        raise Jin10SchemaError("calendar row is missing its event time")
+    parsed: Optional[datetime] = None
+    if isinstance(value, (int, float)):
+        epoch = float(value)
+        if epoch > 10_000_000_000:
+            epoch /= 1000.0
+        try:
+            parsed = datetime.fromtimestamp(epoch, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError) as exc:
+            raise Jin10SchemaError("calendar event time is out of range") from exc
+    else:
+        text = str(value).strip()
+        if re.fullmatch(r"\d{10}|\d{13}", text):
+            return _normalise_datetime(int(text))
+        if re.fullmatch(r"\d{8}", text):
+            try:
+                parsed = datetime.strptime(text, "%Y%m%d")
+            except ValueError as exc:
+                raise Jin10SchemaError("calendar event date is invalid") from exc
+        else:
+            iso_text = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+            try:
+                parsed = datetime.fromisoformat(iso_text)
+            except ValueError:
+                for pattern in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+                    try:
+                        parsed = datetime.strptime(text, pattern)
+                        break
+                    except ValueError:
+                        continue
+            if parsed is None:
+                raise Jin10SchemaError("calendar event time is not a supported date-time")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_SOURCE_TIMEZONE)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _calendar_number(value: Any, field: str) -> Optional[float]:
+    if value is None or str(value).strip().upper() in _MISSING_NUMBERS:
+        return None
+    number = _number(value)
+    if number is None:
+        raise Jin10SchemaError(f"calendar field {field} must be numeric or missing")
+    return number
+
+
+def _calendar_impact(value: Any) -> Optional[int]:
+    if value is None or str(value).strip().upper() in _MISSING_NUMBERS:
+        return None
+    try:
+        impact = int(value)
+    except (TypeError, ValueError) as exc:
+        raise Jin10SchemaError("calendar field star must be an integer") from exc
+    if impact < 0 or impact > 5:
+        raise Jin10SchemaError("calendar field star is outside 0..5")
+    return impact
+
+
+def _calendar_event_id(row: Dict[str, Any], indicator: str, published_at: str) -> str:
+    explicit = str(row.get("id") or "").strip()
+    if explicit:
+        return explicit
+    identity = "|".join((
+        indicator,
+        published_at,
+        _clean_text(row.get("country") or row.get("region")),
+        _clean_text(row.get("time_period") or row.get("full_time_period")),
+    ))
+    return "calendar:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 class Jin10Provider(NewsProvider, MarketProvider, MacroProvider):
@@ -99,7 +200,9 @@ class Jin10Provider(NewsProvider, MarketProvider, MacroProvider):
         )
         response.raise_for_status()
         payload = response.json()
-        return payload if isinstance(payload, dict) else {"data": []}
+        if not isinstance(payload, dict):
+            raise Jin10SchemaError("response must be a JSON object")
+        return payload
 
     def fetch_news(self, *, category: str = "1,2,3,4,5", last_id: Optional[str] = None, **_: Any) -> List[NewsEvent]:
         payload = self._get(self.flash_url, {"category": category, "last_id": last_id})
@@ -159,21 +262,25 @@ class Jin10Provider(NewsProvider, MarketProvider, MacroProvider):
             return []
         payload = self._get(self.calendar_url, {"category": category})
         events: List[MacroEvent] = []
-        for row in _rows(payload):
+        for row in _rows(payload, strict=True):
             indicator = _clean_text(row.get("name") or row.get("event_content") or row.get("title"))
             if not indicator:
-                continue
+                raise Jin10SchemaError("calendar row is missing its indicator name")
+            event_time = row.get("pub_time") or row.get("event_time")
+            if event_time in (None, "") and row.get("date") not in (None, ""):
+                event_time = f"{row.get('date')} {row.get('time') or '00:00:00'}"
+            published_at = _normalise_datetime(event_time)
             events.append(MacroEvent(
-                event_id=str(row.get("id") or indicator),
+                event_id=_calendar_event_id(row, indicator, published_at),
                 indicator=indicator,
                 source=self.source,
-                published_at=str(row.get("pub_time") or row.get("event_time") or ""),
-                actual=_number(row.get("actual")),
-                previous=_number(row.get("previous")),
-                consensus=_number(row.get("consensus")),
+                published_at=published_at,
+                actual=_calendar_number(row.get("actual"), "actual"),
+                previous=_calendar_number(row.get("previous"), "previous"),
+                consensus=_calendar_number(row.get("consensus"), "consensus"),
                 unit=_clean_text(row.get("unit")),
                 country=_clean_text(row.get("country") or row.get("region")),
-                impact=int(row["star"]) if str(row.get("star", "")).isdigit() else None,
+                impact=_calendar_impact(row.get("star")),
                 time_period=_clean_text(row.get("time_period") or row.get("full_time_period")),
             ))
         return events

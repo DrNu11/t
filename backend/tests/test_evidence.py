@@ -1,6 +1,7 @@
 """Smoke tests for src_python/evidence.py — 证据层 / 校验层 / 反幻觉层."""
 
 import json
+import sqlite3
 
 import decision_guard
 import evidence
@@ -98,40 +99,70 @@ def test_evaluate_passes_gate_with_strong_aligned_evidence():
     assert result["contradictions"] == []
 
 
-def _seed_settled(conn, asset, verdicts):
+def _seed_settled(
+    conn,
+    asset,
+    verdicts,
+    *,
+    quality_status="verified",
+    action="BUY",
+    evidence_action="BUY",
+    gate_reason=evidence.PASSED_TRADE_GATE_REASON,
+    run_id=1,
+):
     for verdict in verdicts:
         news_id = conn.execute(
-            "INSERT INTO raw_news (source, content, timestamp, status) VALUES ('test', ?, '2026-08-15 10:00:00', 'DONE')",
-            (f"{asset} {verdict}",),
+            """INSERT INTO raw_news
+                   (source, content, timestamp, status, quality_status)
+               VALUES ('test', ?, '2026-08-15 10:00:00', 'DONE', ?)""",
+            (f"{asset} {verdict}", quality_status),
         ).lastrowid
         conn.execute(
             """INSERT INTO ai_decisions
                    (news_id, sentiment_score, suggested_action, reasoning, target_asset,
-                    settled, is_correct)
-               VALUES (?, 0.8, 'BUY', 'test', ?, 1, ?)""",
-            (news_id, asset, verdict),
+                    settled, is_correct, evidence_action, trade_gate_reason,
+                    paper_trading_run_id)
+               VALUES (?, 0.8, ?, 'test', ?, 1, ?, ?, ?, ?)""",
+            (
+                news_id, action, asset, verdict, evidence_action,
+                gate_reason, run_id,
+            ),
         )
     conn.commit()
 
 
-def _seed_quick_sim(conn, asset, verdicts):
+def _seed_quick_sim(
+    conn,
+    asset,
+    verdicts,
+    *,
+    gate_passed=1,
+    quality_status="verified",
+    evidence_action="BUY",
+    gate_reason=evidence.PASSED_TRADE_GATE_REASON,
+    run_id=1,
+):
     for verdict in verdicts:
         news_id = conn.execute(
-            "INSERT INTO raw_news (source, content, timestamp, status) VALUES ('test', ?, '2026-08-15 10:00:00', 'DONE')",
-            (f"{asset} qs {verdict}",),
+            """INSERT INTO raw_news
+                   (source, content, timestamp, status, quality_status)
+               VALUES ('test', ?, '2026-08-15 10:00:00', 'DONE', ?)""",
+            (f"{asset} qs {verdict}", quality_status),
         ).lastrowid
         decision_id = conn.execute(
             """INSERT INTO ai_decisions
-                   (news_id, sentiment_score, suggested_action, reasoning, target_asset, settled)
-               VALUES (?, 0.8, 'BUY', 'test', ?, 0)""",
-            (news_id, asset),
+                   (news_id, sentiment_score, suggested_action, reasoning,
+                    target_asset, settled, evidence_action, trade_gate_reason,
+                    paper_trading_run_id)
+               VALUES (?, 0.8, 'BUY', 'test', ?, 0, ?, ?, ?)""",
+            (news_id, asset, evidence_action, gate_reason, run_id),
         ).lastrowid
         conn.execute(
             """INSERT INTO quick_sim_trades
                    (decision_id, news_id, asset, action, score, gate_passed, notional_usdt,
                     entry_price, entry_ts, horizon_minutes, verdict, settled)
-               VALUES (?, ?, ?, 'BUY', 0.8, 1, 100, 100, 1, 5, ?, 1)""",
-            (decision_id, news_id, asset, verdict),
+               VALUES (?, ?, ?, 'BUY', 0.8, ?, 100, 100, 1, 5, ?, 1)""",
+            (decision_id, news_id, asset, gate_passed, verdict),
         )
     conn.commit()
 
@@ -164,6 +195,71 @@ def test_collect_settled_sample_merges_quick_sim_without_double_count(temp_db):
     assert sample["total"] == 8
     assert sample["wins"] == 7
     assert sample["supplemented"] is False
+
+
+def test_collect_settled_sample_rejects_every_research_ai_lane(temp_db):
+    # Eight formal losses are the only rows allowed to teach the engine.
+    _seed_settled(temp_db, "BTC", ["LOSS"] * 8)
+    _seed_settled(
+        temp_db, "BTC", ["WIN"] * 2, quality_status="unverified",
+    )
+    _seed_settled(
+        temp_db, "BTC", ["WIN"] * 2, action="HOLD", evidence_action="HOLD",
+    )
+    _seed_settled(
+        temp_db, "BTC", ["WIN"] * 2, evidence_action="HOLD",
+    )
+    _seed_settled(
+        temp_db, "BTC", ["WIN"] * 2, gate_reason="旧宽松闸门通过",
+    )
+    _seed_settled(temp_db, "BTC", ["WIN"] * 2, run_id=None)
+
+    sample = evidence.collect_settled_sample("BTC", connection=temp_db)
+
+    assert sample["scope"] == "asset"
+    assert sample["total"] == 8
+    assert sample["wins"] == 0
+
+
+def test_collect_settled_sample_only_accepts_gate_passed_quick_sim(temp_db):
+    _seed_quick_sim(temp_db, "XAU", ["LOSS"] * 8, gate_passed=1)
+    _seed_quick_sim(temp_db, "XAU", ["WIN"] * 6, gate_passed=0)
+    _seed_quick_sim(
+        temp_db, "XAU", ["WIN"] * 6,
+        gate_passed=1, quality_status="unverified",
+    )
+
+    sample = evidence.collect_settled_sample("XAU", connection=temp_db)
+
+    assert sample["total"] == 8
+    assert sample["wins"] == 0
+
+
+def test_collect_settled_sample_fails_closed_on_legacy_schema():
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute(
+            "CREATE TABLE raw_news (id INTEGER PRIMARY KEY, quality_status TEXT)"
+        )
+        connection.execute(
+            """CREATE TABLE ai_decisions (
+                   id INTEGER PRIMARY KEY, news_id INTEGER, settled INTEGER,
+                   is_correct TEXT, target_asset TEXT, suggested_action TEXT
+               )"""
+        )
+        connection.execute(
+            "INSERT INTO raw_news VALUES (1, 'verified')"
+        )
+        connection.execute(
+            "INSERT INTO ai_decisions VALUES (1, 1, 1, 'WIN', 'BTC', 'BUY')"
+        )
+
+        sample = evidence.collect_settled_sample("BTC", connection=connection)
+
+        assert sample["total"] == 0
+        assert sample["wins"] == 0
+    finally:
+        connection.close()
 
 
 def test_decision_guard_uses_auto_sample_scope():

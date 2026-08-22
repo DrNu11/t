@@ -31,6 +31,7 @@ BUCKET_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d"
 
 # 默认保留期：超过该天数的 tick 会被 prune_market_ticks 清掉
 DEFAULT_RETENTION_DAYS = 90
+_PASSED_TRADE_GATE_REASON = "证据充分，允许输出方向性结论"
 
 
 def _now() -> int:
@@ -234,19 +235,56 @@ def query_news_events(
 
 def record_signal_performance(rows: Iterable[Dict[str, Any]],
                               connection: Optional[sqlite3.Connection] = None) -> int:
-    """把已结算信号的前向表现落成时序点，(decision_id, ts) 幂等。"""
-    ts = _now()
-    values = [
-        (int(row["decision_id"]), str(row.get("asset") or "NONE").upper(), ts,
-         str(row.get("action") or "HOLD").upper(), str(row.get("is_correct") or ""),
-         row.get("forward_pnl"), row.get("mfe_pct"), row.get("mae_pct"))
-        for row in rows
-    ]
-    if not values:
+    """仅把通过正式闸门的已结算信号落成时序点。
+
+    输入行只信任 ``decision_id``；方向、胜负和盈亏均从已关联的
+    ``ai_decisions``/``raw_news`` 重读，关联缺失或资格不足时 fail-closed。
+    """
+    decision_ids: List[int] = []
+    for row in rows:
+        try:
+            decision_ids.append(int(row["decision_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    decision_ids = sorted(set(decision_ids))
+    if not decision_ids:
         return 0
     owned = connection is None
     connection = connection or _connect()
     try:
+        canonical_rows: List[sqlite3.Row] = []
+        for offset in range(0, len(decision_ids), 900):
+            chunk = decision_ids[offset:offset + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            canonical_rows.extend(connection.execute(
+                f"""SELECT ad.id AS decision_id,
+                           UPPER(ad.target_asset) AS asset,
+                           UPPER(ad.suggested_action) AS action,
+                           UPPER(ad.is_correct) AS is_correct,
+                           ad.forward_pnl, ad.mfe_pct, ad.mae_pct
+                    FROM ai_decisions ad
+                    INNER JOIN raw_news rn ON rn.id = ad.news_id
+                    WHERE ad.id IN ({placeholders})
+                      AND ad.settled = 1
+                      AND UPPER(ad.is_correct) IN ('WIN', 'LOSS', 'HOLD')
+                      AND ad.forward_pnl IS NOT NULL
+                      AND UPPER(ad.suggested_action) IN ('BUY', 'SELL')
+                      AND UPPER(ad.target_asset) NOT IN ('', 'NONE')
+                      AND LOWER(COALESCE(rn.quality_status, '')) = 'verified'
+                      AND UPPER(COALESCE(ad.evidence_action, 'HOLD')) = UPPER(ad.suggested_action)
+                      AND COALESCE(ad.trade_gate_reason, '') = ?
+                      AND ad.paper_trading_run_id IS NOT NULL""",
+                [*chunk, _PASSED_TRADE_GATE_REASON],
+            ).fetchall())
+        ts = _now()
+        values = [
+            (int(row["decision_id"]), str(row["asset"]), ts,
+             str(row["action"]), str(row["is_correct"]), row["forward_pnl"],
+             row["mfe_pct"], row["mae_pct"])
+            for row in canonical_rows
+        ]
+        if not values:
+            return 0
         cursor = connection.executemany(
             """INSERT OR IGNORE INTO signal_performance(decision_id, asset, ts, action, is_correct,
                                                         forward_pnl, mfe_pct, mae_pct)
@@ -353,16 +391,31 @@ def query_factor_history(asset: Optional[str] = None, limit: int = 100,
 
 def rolling_winrate(asset: Optional[str] = None, window: int = 20,
                     connection: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """按最近 `window` 条已结算信号算滚动胜率与累计盈亏。"""
+    """按最近 `window` 条正式已结算信号算滚动胜率。"""
     owned = connection is None
     connection = connection or _connect()
     try:
-        sql = """SELECT is_correct, forward_pnl FROM signal_performance"""
-        params: List[Any] = []
+        sql = """SELECT ad.id,
+                         UPPER(ad.is_correct) AS is_correct,
+                         ad.forward_pnl,
+                         MAX(sp.ts) AS performance_ts
+                  FROM signal_performance sp
+                  INNER JOIN ai_decisions ad ON ad.id = sp.decision_id
+                  INNER JOIN raw_news rn ON rn.id = ad.news_id
+                  WHERE ad.settled = 1
+                    AND UPPER(ad.is_correct) IN ('WIN', 'LOSS', 'HOLD')
+                    AND ad.forward_pnl IS NOT NULL
+                    AND UPPER(ad.suggested_action) IN ('BUY', 'SELL')
+                    AND UPPER(ad.target_asset) NOT IN ('', 'NONE')
+                    AND LOWER(COALESCE(rn.quality_status, '')) = 'verified'
+                    AND UPPER(COALESCE(ad.evidence_action, 'HOLD')) = UPPER(ad.suggested_action)
+                    AND COALESCE(ad.trade_gate_reason, '') = ?
+                    AND ad.paper_trading_run_id IS NOT NULL"""
+        params: List[Any] = [_PASSED_TRADE_GATE_REASON]
         if asset:
-            sql += " WHERE asset=?"
+            sql += " AND UPPER(ad.target_asset)=?"
             params.append(asset.upper())
-        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        sql += " GROUP BY ad.id ORDER BY performance_ts DESC, ad.id DESC LIMIT ?"
         params.append(max(1, min(window, 1000)))
         rows = connection.execute(sql, params).fetchall()
         total = len(rows)

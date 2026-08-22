@@ -76,8 +76,11 @@ def get_settings(connection=None) -> Dict[str, Any]:
             return {
                 "is_running": False, "tracks": [], "started_at": None,
                 "active_run_id": None, "active_run": None, "gate_enabled": True,
+                "gate_locked": not config.PAPER_ALLOW_GATE_BYPASS,
                 "updated_at": None,
             }
+        stored_gate_enabled = bool(row[5] if row[5] is not None else 1)
+        gate_locked = not config.PAPER_ALLOW_GATE_BYPASS
         return {
             "is_running": bool(row[0]),
             "tracks": json.loads(row[1] or "[]"),
@@ -85,7 +88,10 @@ def get_settings(connection=None) -> Dict[str, Any]:
             "active_run_id": row[3],
             "active_run": _run_payload(conn, row[3]),
             "updated_at": row[4],
-            "gate_enabled": bool(row[5] if row[5] is not None else 1),
+            # A legacy persisted "wide" setting must not silently survive a
+            # deployment that has returned to the default fail-closed policy.
+            "gate_enabled": True if gate_locked else stored_gate_enabled,
+            "gate_locked": gate_locked,
         }
     finally:
         if own:
@@ -111,7 +117,8 @@ def set_settings(
         previous = get_settings(conn)
         active_run_id = previous["active_run_id"]
         started_at: Optional[str] = previous["started_at"]
-        next_gate = previous.get("gate_enabled", True) if gate_enabled is None else bool(gate_enabled)
+        requested_gate = previous.get("gate_enabled", True) if gate_enabled is None else bool(gate_enabled)
+        next_gate = True if not config.PAPER_ALLOW_GATE_BYPASS else requested_gate
         if is_running and not previous["is_running"]:
             current = strategy_store.get_current_strategy(conn)
             activated = strategy_store.set_current_strategy(

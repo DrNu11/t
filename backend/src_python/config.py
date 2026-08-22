@@ -208,6 +208,9 @@ JIN10_REQUEST_TIMEOUT = max(1.0, float(os.getenv("JIN10_REQUEST_TIMEOUT", "5")))
 JIN10_POLL_SECONDS = max(10, int(os.getenv("JIN10_POLL_SECONDS", "15")))
 ALLOW_LEGACY_DECISIONS = _env_bool("TRIDENT_ALLOW_LEGACY_DECISIONS", False)
 ALLOW_LEGACY_PRICE_FALLBACKS = _env_bool("TRIDENT_ALLOW_LEGACY_PRICE_FALLBACKS", False)
+# A disabled evidence gate is useful only for explicitly isolated research.
+# Production/paper decision streams fail closed unless an operator opts in.
+PAPER_ALLOW_GATE_BYPASS = _env_bool("TRIDENT_PAPER_ALLOW_GATE_BYPASS", False)
 MACRO_CALENDAR_ENABLED = _env_bool("MACRO_CALENDAR_ENABLED", False)
 MACRO_CALENDAR_POLL_SECONDS = max(15, int(os.getenv("MACRO_CALENDAR_POLL_SECONDS", "60")))
 NEWS_SOURCE_POLL_SECONDS = max(10, int(os.getenv("NEWS_SOURCE_POLL_SECONDS", "15")))

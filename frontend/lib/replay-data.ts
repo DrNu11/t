@@ -61,6 +61,10 @@ export type SimSignal = {
   strategy_name: string | null
   strategy_version: number | null
   strategy_params: Record<string, number | string | boolean> | null
+  quality_status?: string | null
+  decision_eligible?: boolean
+  recorded_is_correct?: 'WIN' | 'LOSS' | 'HOLD' | 'BREAKEVEN' | '' | null
+  tracking_quality?: 'SETTLED' | 'TRACKABLE' | 'RESEARCH_EXCLUDED' | 'LEGACY_UNTRACKABLE' | string
   current_price?: number | null
   current_pnl_pct?: number | null
   current_pnl_usdt?: number | null
@@ -74,7 +78,7 @@ export type SimSignal = {
   live_mfe_pct?: number
   live_mae_pct?: number
   pricing_status?: 'LIVE' | 'UNAVAILABLE'
-  paper_status?: 'TRACKING' | 'SETTLED'
+  paper_status?: 'TRACKING' | 'SETTLED' | 'RESEARCH_EXCLUDED' | 'LEGACY_UNTRACKABLE' | string
 }
 
 export type PaperTrack = 'crypto' | 'gold' | 'oil'
@@ -83,6 +87,7 @@ export type PaperTradingSettings = {
   is_running: boolean
   tracks: PaperTrack[]
   gate_enabled?: boolean
+  gate_locked?: boolean
   started_at: string | null
   active_run_id: number | null
   active_run: null | {
@@ -222,6 +227,8 @@ export type ReplayPositions = {
     fees_usdt?: number
     slippage_usdt?: number
     trade_count?: number
+    research_positions_excluded?: number
+    legacy_untrackable_excluded?: number
   }
   updated_at_ms: number
   pricing_note: string
@@ -272,10 +279,10 @@ export type NewsSourceSettings = {
   sources: Record<NewsSourceKey, boolean>
 }
 
-export type ReplayStats = {
-  overall: {
+export type ReplayStatsSummary = {
     total: number
     tracking: number
+    legacy_untrackable?: number
     settled: number
     wins: number
     losses: number
@@ -286,11 +293,15 @@ export type ReplayStats = {
     best_trade: number | null
     worst_trade: number | null
     winrate: number
-  }
+}
+
+export type ReplayStats = {
+  overall: ReplayStatsSummary
   strategy_id: number
   strategy_version_id: number
   by_asset: Array<{ asset: string; total: number; wins: number; losses: number; avg_pnl: number | null }>
   by_action: Array<{ action: string; total: number; wins: number; avg_pnl: number | null }>
+  research_excluded?: ReplayStatsSummary
   is_paper_trading: boolean
 }
 
@@ -304,6 +315,7 @@ export type ReplayReflection = {
   by_asset: Array<{ key: string; sample: number; wins: number; losses: number; winrate: number; avg_forward_pnl: number | null }>
   failure_patterns: Record<string, number>
   recommendations: string[]
+  research_excluded?: { sample: number; wins: number; losses: number }
   method: string
 }
 
@@ -335,6 +347,7 @@ function asTradingSettings(payload: Record<string, unknown>): PaperTradingSettin
     is_running: Boolean(payload.is_running),
     tracks: Array.isArray(payload.tracks) ? payload.tracks as PaperTrack[] : [],
     gate_enabled: payload.gate_enabled === undefined ? undefined : Boolean(payload.gate_enabled),
+    gate_locked: payload.gate_locked === undefined ? undefined : Boolean(payload.gate_locked),
     started_at: (payload.started_at as string | null) ?? null,
     active_run_id: (payload.active_run_id as number | null) ?? null,
     active_run: (payload.active_run as PaperTradingSettings['active_run']) ?? null,

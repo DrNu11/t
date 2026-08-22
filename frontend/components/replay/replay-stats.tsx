@@ -40,6 +40,8 @@ export function ReplayStats({ refreshKey }: { refreshKey: number }) {
 
   const { overall, by_asset } = stats
   const noData = (overall.total || 0) === 0
+  const research = stats.research_excluded
+  const researchCount = (research?.total ?? 0) + (research?.legacy_untrackable ?? 0)
 
   return (
     <div className="space-y-3">
@@ -51,6 +53,14 @@ export function ReplayStats({ refreshKey }: { refreshKey: number }) {
           PAPER TRADING
         </span>
       </div>
+
+      {research && (researchCount > 0 || (overall.legacy_untrackable ?? 0) > 0) && (
+        <div className="rounded-md border border-hold/30 bg-hold/5 px-3 py-2 font-mono text-[10px] text-muted-foreground">
+          官方胜率仅统计已验证且通过交易闸门的样本；已隔离研究数据 {researchCount} 条
+          {research.settled ? `（其中历史结算 ${research.settled} 条）` : ''}
+          {(overall.legacy_untrackable ?? 0) > 0 ? `，无可靠入场时间 ${overall.legacy_untrackable} 条` : ''}。
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
@@ -117,7 +127,10 @@ export function ReplayStats({ refreshKey }: { refreshKey: number }) {
         <div className="rounded-md border border-border bg-card p-3">
           <div className="mb-2 flex items-center justify-between">
             <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">交易过程复盘 · 正确/失败模式</div>
-            <span className="font-mono text-[10px] text-muted-foreground">样本 {reflection.sample}</span>
+            <span className="font-mono text-[10px] text-muted-foreground">
+              正式样本 {reflection.sample}
+              {reflection.research_excluded?.sample ? ` · 隔离 ${reflection.research_excluded.sample}` : ''}
+            </span>
           </div>
           <div className="grid gap-2 md:grid-cols-3">
             {reflection.by_analysis_type.map((row) => (

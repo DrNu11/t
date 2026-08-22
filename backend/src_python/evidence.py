@@ -62,6 +62,58 @@ _SCOPE_LABELS = {
     "market": "全市场自动补齐",
 }
 
+# A settled row is allowed to teach the evidence engine only when it crossed
+# the same fail-closed boundary as a formal paper-trading decision.  Keep the
+# exact verdict text in one place so research/legacy rows cannot drift into
+# the statistical sample through a looser predicate.
+PASSED_TRADE_GATE_REASON = "证据充分，允许输出方向性结论"
+
+_FORMAL_AI_COLUMNS = {
+    "id", "news_id", "settled", "is_correct", "target_asset",
+    "suggested_action", "evidence_action", "trade_gate_reason",
+    "paper_trading_run_id",
+}
+_FORMAL_NEWS_COLUMNS = {"id", "quality_status"}
+_QUICK_SIM_COLUMNS = {
+    "decision_id", "settled", "verdict", "asset", "gate_passed",
+}
+
+
+def _table_columns(connection, table: str) -> set[str]:
+    """Return SQLite table columns, treating unknown/legacy schema as empty."""
+
+    try:
+        return {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+    except (sqlite3.DatabaseError, TypeError, IndexError):
+        return set()
+
+
+def formal_ai_history_available(connection) -> bool:
+    """Whether the DB can prove every required formal-decision attribute."""
+
+    return (
+        _FORMAL_AI_COLUMNS <= _table_columns(connection, "ai_decisions")
+        and _FORMAL_NEWS_COLUMNS <= _table_columns(connection, "raw_news")
+    )
+
+
+def formal_ai_history_predicate(
+    decision_alias: str = "ad", news_alias: str = "rn",
+) -> str:
+    """Canonical SQL predicate for formal historical learning samples."""
+
+    return (
+        f"LOWER(TRIM(COALESCE({news_alias}.quality_status, ''))) = 'verified' "
+        f"AND UPPER(TRIM(COALESCE({decision_alias}.suggested_action, ''))) IN ('BUY', 'SELL') "
+        f"AND UPPER(TRIM(COALESCE({decision_alias}.evidence_action, 'HOLD'))) "
+        f"= UPPER(TRIM(COALESCE({decision_alias}.suggested_action, ''))) "
+        f"AND COALESCE({decision_alias}.trade_gate_reason, '') = ? "
+        f"AND {decision_alias}.paper_trading_run_id IS NOT NULL"
+    )
+
 
 def to_evidence_score(score: float) -> float:
     """Map a factor score in [-1, 1] onto the 0-10 evidence scale."""
@@ -131,51 +183,63 @@ def _count_pool(connection, sql: str, params: Sequence[Any] = ()) -> Tuple[int, 
 
 
 def _ai_pool(connection, assets: Sequence[str] = ()) -> Tuple[int, int]:
+    if not formal_ai_history_available(connection):
+        return 0, 0
     sql = """SELECT COUNT(*) AS total,
-                    SUM(CASE WHEN UPPER(is_correct)='WIN' THEN 1 ELSE 0 END) AS wins
-             FROM ai_decisions
-             WHERE settled=1 AND UPPER(is_correct) IN ('WIN','LOSS')"""
-    params: List[Any] = []
+                    SUM(CASE WHEN UPPER(ad.is_correct)='WIN' THEN 1 ELSE 0 END) AS wins
+             FROM ai_decisions ad
+             INNER JOIN raw_news rn ON rn.id = ad.news_id
+             WHERE ad.settled=1 AND UPPER(ad.is_correct) IN ('WIN','LOSS')
+               AND """ + formal_ai_history_predicate()
+    params: List[Any] = [PASSED_TRADE_GATE_REASON]
     tokens = query_assets(assets)
     if tokens:
         placeholders = ",".join("?" * len(tokens))
-        sql += f" AND UPPER(target_asset) IN ({placeholders})"
+        sql += f" AND UPPER(ad.target_asset) IN ({placeholders})"
         params.extend(tokens)
     return _count_pool(connection, sql, params)
 
 
 def _quick_sim_pool(connection, assets: Sequence[str] = (),
                     exclude_decision_ids: Optional[Sequence[int]] = None) -> Tuple[int, int]:
-    tables = {str(row[0]) for row in connection.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()}
-    if "quick_sim_trades" not in tables:
+    if (
+        not _QUICK_SIM_COLUMNS <= _table_columns(connection, "quick_sim_trades")
+        or not formal_ai_history_available(connection)
+    ):
         return 0, 0
     sql = """SELECT COUNT(*) AS total,
-                    SUM(CASE WHEN UPPER(verdict)='WIN' THEN 1 ELSE 0 END) AS wins
-             FROM quick_sim_trades
-             WHERE settled=1 AND UPPER(verdict) IN ('WIN','LOSS')"""
-    params: List[Any] = []
+                    SUM(CASE WHEN UPPER(qs.verdict)='WIN' THEN 1 ELSE 0 END) AS wins
+             FROM quick_sim_trades qs
+             INNER JOIN ai_decisions ad ON ad.id = qs.decision_id
+             INNER JOIN raw_news rn ON rn.id = ad.news_id
+             WHERE qs.settled=1 AND qs.gate_passed=1
+               AND UPPER(qs.verdict) IN ('WIN','LOSS')
+               AND """ + formal_ai_history_predicate()
+    params: List[Any] = [PASSED_TRADE_GATE_REASON]
     tokens = query_assets(assets)
     if tokens:
         placeholders = ",".join("?" * len(tokens))
-        sql += f" AND UPPER(asset) IN ({placeholders})"
+        sql += f" AND UPPER(qs.asset) IN ({placeholders})"
         params.extend(tokens)
     if exclude_decision_ids:
         placeholders = ",".join("?" * len(exclude_decision_ids))
-        sql += f" AND decision_id NOT IN ({placeholders})"
+        sql += f" AND qs.decision_id NOT IN ({placeholders})"
         params.extend(int(item) for item in exclude_decision_ids)
     return _count_pool(connection, sql, params)
 
 
 def _settled_decision_ids(connection, assets: Sequence[str] = ()) -> List[int]:
-    sql = """SELECT id FROM ai_decisions
-             WHERE settled=1 AND UPPER(is_correct) IN ('WIN','LOSS')"""
-    params: List[Any] = []
+    if not formal_ai_history_available(connection):
+        return []
+    sql = """SELECT ad.id FROM ai_decisions ad
+             INNER JOIN raw_news rn ON rn.id = ad.news_id
+             WHERE ad.settled=1 AND UPPER(ad.is_correct) IN ('WIN','LOSS')
+               AND """ + formal_ai_history_predicate()
+    params: List[Any] = [PASSED_TRADE_GATE_REASON]
     tokens = query_assets(assets)
     if tokens:
         placeholders = ",".join("?" * len(tokens))
-        sql += f" AND UPPER(target_asset) IN ({placeholders})"
+        sql += f" AND UPPER(ad.target_asset) IN ({placeholders})"
         params.extend(tokens)
     return [int(row[0]) for row in connection.execute(sql, params).fetchall()]
 

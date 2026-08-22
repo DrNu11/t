@@ -22,6 +22,7 @@ import config
 import db
 
 _SKILL_MIN_SAMPLE = int(getattr(config, "HERMES_SKILL_MIN_SAMPLE", 8))
+_PASSED_TRADE_GATE_REASON = "证据充分，允许输出方向性结论"
 _OBS_CONTENT_LIMIT = 400
 _BRIEF_LIMIT = 160
 _DESKS = ("news", "macro", "risk", "trader")
@@ -268,25 +269,37 @@ def persist_decision_observation(
 
 
 def refresh_skills(connection: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
-    """从已结算 WIN/LOSS 刷新技能。样本不足不写技能。"""
+    """仅从正式模拟盘已结算 WIN/LOSS 刷新技能。"""
     conn, owned = _owned_connection(connection)
     try:
-        if not _table_exists(conn, "hermes_skills") or not _table_exists(conn, "ai_decisions"):
+        if not _table_exists(conn, "hermes_skills"):
+            return []
+        if not _table_exists(conn, "ai_decisions") or not _table_exists(conn, "raw_news"):
+            conn.execute("DELETE FROM hermes_skills")
+            if owned:
+                conn.commit()
             return []
         rows = conn.execute(
-            """SELECT UPPER(target_asset) AS asset,
-                      UPPER(suggested_action) AS action,
-                      COALESCE(prediction_type, '') AS prediction_type,
+            """SELECT UPPER(ad.target_asset) AS asset,
+                      UPPER(ad.suggested_action) AS action,
+                      COALESCE(ad.prediction_type, '') AS prediction_type,
                       COUNT(*) AS sample_size,
-                      SUM(CASE WHEN UPPER(is_correct)='WIN' THEN 1 ELSE 0 END) AS wins,
-                      SUM(CASE WHEN UPPER(is_correct)='LOSS' THEN 1 ELSE 0 END) AS losses,
-                      AVG(forward_pnl) AS avg_pnl
-               FROM ai_decisions
-               WHERE settled=1
-                 AND UPPER(is_correct) IN ('WIN','LOSS')
-                 AND UPPER(suggested_action) IN ('BUY','SELL')
-                 AND UPPER(target_asset) NOT IN ('', 'NONE')
-               GROUP BY 1, 2, 3"""
+                      SUM(CASE WHEN UPPER(ad.is_correct)='WIN' THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN UPPER(ad.is_correct)='LOSS' THEN 1 ELSE 0 END) AS losses,
+                      AVG(ad.forward_pnl) AS avg_pnl
+               FROM ai_decisions ad
+               INNER JOIN raw_news rn ON rn.id = ad.news_id
+               WHERE ad.settled=1
+                 AND UPPER(ad.is_correct) IN ('WIN','LOSS')
+                 AND ad.forward_pnl IS NOT NULL
+                 AND UPPER(ad.suggested_action) IN ('BUY','SELL')
+                 AND UPPER(ad.target_asset) NOT IN ('', 'NONE')
+                 AND LOWER(COALESCE(rn.quality_status, '')) = 'verified'
+                 AND UPPER(COALESCE(ad.evidence_action, 'HOLD')) = UPPER(ad.suggested_action)
+                 AND COALESCE(ad.trade_gate_reason, '') = ?
+                 AND ad.paper_trading_run_id IS NOT NULL
+               GROUP BY 1, 2, 3""",
+            (_PASSED_TRADE_GATE_REASON,),
         ).fetchall()
         written: List[Dict[str, Any]] = []
         for row in rows:
@@ -336,6 +349,18 @@ def refresh_skills(connection: Optional[sqlite3.Connection] = None) -> List[Dict
                 "avg_pnl": avg_pnl,
                 "note": note,
             })
+        # hermes_skills has no per-sample provenance.  Remove groups that no
+        # longer meet the strict production gate so legacy research-derived
+        # skills cannot survive a refresh and leak back into prompts.
+        skill_keys = [item["skill_key"] for item in written]
+        if skill_keys:
+            placeholders = ",".join("?" for _ in skill_keys)
+            conn.execute(
+                f"DELETE FROM hermes_skills WHERE skill_key NOT IN ({placeholders})",
+                skill_keys,
+            )
+        else:
+            conn.execute("DELETE FROM hermes_skills")
         if owned:
             conn.commit()
         return written

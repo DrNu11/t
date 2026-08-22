@@ -2,6 +2,8 @@
 
 import timeseries
 
+PASSED_REASON = "证据充分，允许输出方向性结论"
+
 
 def _seed_ticks(temp_db, rows):
     temp_db.executemany(
@@ -9,6 +11,38 @@ def _seed_ticks(temp_db, rows):
         rows,
     )
     temp_db.commit()
+
+
+def _seed_decision(
+    temp_db,
+    *,
+    asset,
+    action,
+    verdict,
+    pnl,
+    quality_status="verified",
+    evidence_action=None,
+    gate_reason=PASSED_REASON,
+    paper_run_id=1,
+):
+    news_id = temp_db.execute(
+        """INSERT INTO raw_news(source, content, timestamp, status, quality_status)
+           VALUES ('test', 'news', '2026-08-22 10:00:00', 'DONE', ?)""",
+        (quality_status,),
+    ).lastrowid
+    decision_id = temp_db.execute(
+        """INSERT INTO ai_decisions(
+               news_id, sentiment_score, suggested_action, reasoning, target_asset,
+               settled, is_correct, forward_pnl, mfe_pct, mae_pct, evidence_action,
+               trade_gate_reason, paper_trading_run_id
+           ) VALUES (?, 0.7, ?, 'test', ?, 1, ?, ?, 3.0, 1.0, ?, ?, ?)""",
+        (
+            news_id, action, asset, verdict, pnl, evidence_action or action,
+            gate_reason, paper_run_id,
+        ),
+    ).lastrowid
+    temp_db.commit()
+    return decision_id
 
 
 def test_record_market_snapshot_persists_and_is_idempotent(temp_db, monkeypatch):
@@ -89,12 +123,45 @@ def test_query_factor_history_filters_by_asset(temp_db):
 
 
 def test_record_signal_performance_and_rolling_winrate(temp_db):
-    rows = [
-        {"decision_id": 1, "asset": "BTC", "action": "BUY", "is_correct": "WIN", "forward_pnl": 2.0, "mfe_pct": 3.0, "mae_pct": 1.0},
-        {"decision_id": 2, "asset": "BTC", "action": "SELL", "is_correct": "LOSS", "forward_pnl": -1.0, "mfe_pct": 0.5, "mae_pct": 2.0},
-        {"decision_id": 3, "asset": "ETH", "action": "BUY", "is_correct": "WIN", "forward_pnl": 5.0, "mfe_pct": 6.0, "mae_pct": 0.2},
+    formal_ids = [
+        _seed_decision(temp_db, asset="BTC", action="BUY", verdict="WIN", pnl=2.0),
+        _seed_decision(temp_db, asset="BTC", action="SELL", verdict="LOSS", pnl=-1.0),
+        _seed_decision(temp_db, asset="ETH", action="BUY", verdict="WIN", pnl=5.0),
     ]
-    assert timeseries.record_signal_performance(rows, connection=temp_db) == 3
+    research_ids = [
+        _seed_decision(
+            temp_db, asset="BTC", action="BUY", verdict="WIN", pnl=100.0,
+            quality_status="unverified",
+        ),
+        _seed_decision(
+            temp_db, asset="BTC", action="BUY", verdict="WIN", pnl=100.0,
+            evidence_action="HOLD",
+        ),
+        _seed_decision(
+            temp_db, asset="BTC", action="BUY", verdict="WIN", pnl=100.0,
+            gate_reason="research_only",
+        ),
+        _seed_decision(
+            temp_db, asset="BTC", action="BUY", verdict="WIN", pnl=100.0,
+            paper_run_id=None,
+        ),
+    ]
+    # Caller-provided performance fields are deliberately absent: the writer
+    # must re-read canonical values and production eligibility by decision_id.
+    assert timeseries.record_signal_performance(
+        [{"decision_id": item} for item in formal_ids + research_ids],
+        connection=temp_db,
+    ) == 3
+    assert temp_db.execute("SELECT COUNT(*) FROM signal_performance").fetchone()[0] == 3
+
+    # Simulate a legacy polluted point written before the production gate.
+    temp_db.execute(
+        """INSERT INTO signal_performance
+               (decision_id, asset, ts, action, is_correct, forward_pnl)
+           VALUES (?, 'BTC', 2000000000, 'BUY', 'WIN', 100.0)""",
+        (research_ids[0],),
+    )
+    temp_db.commit()
     btc = timeseries.rolling_winrate("BTC", connection=temp_db)
     assert btc == {"asset": "BTC", "window": 2, "wins": 1, "winrate": 0.5, "cumulative_pnl": 1.0}
     every = timeseries.rolling_winrate(connection=temp_db)
