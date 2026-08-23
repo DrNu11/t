@@ -16,9 +16,17 @@ def test_paper_trading_tracks_and_asset_filter(temp_db):
     assert settings["active_run"]["agent_version"] == paper_trading.AGENT_VERSION
     assert settings["active_run"]["strategy_version_id"] is not None
     assert settings["active_run"]["spec_version"]
+    assert settings["decision_ready_assets"] == ["BTC", "XAU"]
+    assert settings["decision_ready_assets_by_track"] == {
+        "crypto": ["BTC"], "gold": ["XAU"], "oil": [],
+    }
+    assert settings["asset_gate_policy"] == "verified_same_asset_snapshot"
     assert paper_trading.asset_allowed("BTC", settings)
-    assert paper_trading.asset_allowed("SOL", settings)
+    assert paper_trading.asset_allowed("BTCUSDT", settings)
     assert paper_trading.asset_allowed("XAU", settings)
+    assert paper_trading.asset_allowed("GOLD", settings)
+    assert not paper_trading.asset_allowed("ETH", settings)
+    assert not paper_trading.asset_allowed("SOL", settings)
     assert not paper_trading.asset_allowed("WTI", settings)
 
     stopped = paper_trading.set_settings(False, settings["tracks"], temp_db)
@@ -30,6 +38,11 @@ def test_paper_trading_tracks_and_asset_filter(temp_db):
     ).fetchone()
     assert run[0] == "STOPPED"
     assert run[1]
+
+
+def test_paper_trading_rejects_track_without_authoritative_snapshot(temp_db):
+    with pytest.raises(ValueError, match="BTC/XAU"):
+        paper_trading.set_settings(True, ["oil"], temp_db)
 
 
 def test_paper_trading_gate_is_locked_by_default(temp_db, monkeypatch):

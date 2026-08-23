@@ -22,9 +22,14 @@ xlsxwriter>=3.1.0
 # ── Environment Config ─────────────────────────────────────
 python-dotenv>=1.0.0
 
-# ── Crypto Exchange (Binance) ──────────────────────────────
+# ── Crypto/market exchange adapter ────────────────────────
 ccxt>=4.3.0
 requests>=2.32.0
+
+# ── Market structure indicators ───────────────────────────
+# TA-Lib is the production decision engine. Native calculations remain
+# observation/replay-only and fail closed when TA-Lib is unavailable.
+TA-Lib>=0.7.1,<0.8
 
 # ── TreeNews Bridge (treenews_bridge.py) ───────────────────
 websocket-client>=1.7.0

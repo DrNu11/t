@@ -45,6 +45,7 @@ def test_chi_square_balanced_sample_has_high_p_value():
     assert result["p_value"] == 1.0
     assert result["significant"] is False
     assert result["sufficient_sample"] is True
+    assert result["edge_direction"] == "neutral"
 
 
 def test_chi_square_skewed_sample_is_significant():
@@ -52,19 +53,48 @@ def test_chi_square_skewed_sample_is_significant():
     assert result["chi_square"] == 64.0
     assert result["p_value"] < 0.05
     assert result["significant"] is True
+    assert result["edge_direction"] == "positive"
     assert result["losses"] == 10
 
 
 def test_significance_weight_tiers():
     assert evidence.significance_weight(evidence.chi_square_test(90, 100)) == 1.0
-    assert evidence.significance_weight(evidence.chi_square_test(10, 20)) == 0.70
+    assert evidence.significance_weight(evidence.chi_square_test(10, 20)) == 0.50
+    assert evidence.significance_weight(evidence.chi_square_test(0, 100)) == 0.0
     assert evidence.significance_weight(evidence.chi_square_test(2, 3)) == 0.80
+
+
+def test_statistically_significant_failure_vetoes_trade_confidence():
+    result = evidence.evaluate(
+        _factors(sentiment=-0.9, confirmation=-0.9, trend=-0.9),
+        final_score=-0.9,
+        action="SELL",
+        wins=0,
+        total=100,
+    )
+
+    assert result["significance"]["p_value"] == 0.0
+    assert result["significance"]["significant"] is False
+    assert result["significance"]["edge_direction"] == "negative"
+    assert result["confidence_detail"]["significance_weight"] == 0.0
+    assert result["confidence"] == 0.0
+    assert result["gated_action"] == "HOLD"
 
 
 def test_detect_contradictions_flags_bullish_news_against_tape():
     found = evidence.detect_contradictions(_factors(sentiment=0.8, confirmation=-0.9, trend=-0.7, funding=-0.6))
     types = {item["type"] for item in found}
     assert types == {"sentiment_vs_trend", "sentiment_vs_confirmation", "sentiment_vs_funding"}
+
+
+def test_detect_contradictions_prefers_verified_multi_timeframe_structure():
+    factors = _factors(sentiment=0.8, trend=0.9)
+    factors["price_structure"] = {"score": -0.8, "explanation": "verified structure"}
+
+    found = evidence.detect_contradictions(factors)
+
+    assert {item["type"] for item in found} == {"sentiment_vs_price_structure"}
+    assert "多周期盘面结构向下" in found[0]["detail"]
 
 
 def test_detect_contradictions_empty_when_aligned():

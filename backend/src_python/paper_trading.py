@@ -11,10 +11,22 @@ import config
 import db
 import strategy_store
 
+# Automatic paper positions require a decision-ready same-asset snapshot.
+# The current authoritative snapshot pipeline covers only canonical BTC/XAU;
+# every other asset remains selectable as a future track but fails closed.
+DECISION_READY_ASSETS = ("BTC", "XAU")
 TRACK_ASSETS = {
-    "crypto": {"BTC", "ETH", "SOL", "CRYPTO"},
-    "gold": {"XAU", "GOLD"},
-    "oil": {"WTI", "OIL"},
+    "crypto": {"BTC"},
+    "gold": {"XAU"},
+    "oil": set(),
+}
+_ASSET_ALIASES = {
+    "BTCUSD": "BTC",
+    "BTCUSDT": "BTC",
+    "BTC-USDT": "BTC",
+    "GOLD": "XAU",
+    "XAUUSD": "XAU",
+    "XAU-USDT": "XAU",
 }
 AGENT_VERSION = "trident-evidence-agent-v1"
 _RULE_FILES = (
@@ -24,6 +36,16 @@ _RULE_FILES = (
     os.path.join("docs", "防守与陷阱.md"),
     os.path.join("docs", "新闻.md"),
 )
+
+
+def _decision_capabilities() -> Dict[str, Any]:
+    return {
+        "decision_ready_assets": list(DECISION_READY_ASSETS),
+        "decision_ready_assets_by_track": {
+            track: sorted(assets) for track, assets in TRACK_ASSETS.items()
+        },
+        "asset_gate_policy": "verified_same_asset_snapshot",
+    }
 
 
 def _spec_version() -> str:
@@ -78,6 +100,7 @@ def get_settings(connection=None) -> Dict[str, Any]:
                 "active_run_id": None, "active_run": None, "gate_enabled": True,
                 "gate_locked": not config.PAPER_ALLOW_GATE_BYPASS,
                 "updated_at": None,
+                **_decision_capabilities(),
             }
         stored_gate_enabled = bool(row[5] if row[5] is not None else 1)
         gate_locked = not config.PAPER_ALLOW_GATE_BYPASS
@@ -92,6 +115,7 @@ def get_settings(connection=None) -> Dict[str, Any]:
             # deployment that has returned to the default fail-closed policy.
             "gate_enabled": True if gate_locked else stored_gate_enabled,
             "gate_locked": gate_locked,
+            **_decision_capabilities(),
         }
     finally:
         if own:
@@ -108,6 +132,8 @@ def set_settings(
     normalized = sorted({track for track in tracks if track in TRACK_ASSETS})
     if is_running and not normalized:
         raise ValueError("开始模拟操盘前必须至少选择一个投资赛道")
+    if is_running and not any(TRACK_ASSETS[track] for track in normalized):
+        raise ValueError("所选赛道暂无同资产权威快照，当前仅支持 BTC/XAU 自动模拟交易")
     own = connection is None
     conn = connection or db.get_connection()
     if own:
@@ -135,7 +161,8 @@ def set_settings(
                     json.dumps(normalized), activated["id"], version["id"],
                     AGENT_VERSION, config.get_selected_ai_model_id(), _spec_version(),
                     "开始模拟操盘：自动激活当前策略版本；"
-                    + ("宽松模式关闭证据/策略闸门" if not next_gate else "启用多证据、卡方、反幻觉和赛道闸门"),
+                    + ("宽松模式关闭证据/策略闸门" if not next_gate else "启用多证据、卡方、反幻觉和赛道闸门")
+                    + "；同资产权威快照自动交易范围仅 BTC/XAU",
                     now,
                 ),
             )
@@ -160,5 +187,11 @@ def set_settings(
 
 
 def asset_allowed(asset: str, settings: Dict[str, Any]) -> bool:
-    value = asset.upper()
-    return any(value in TRACK_ASSETS.get(track, set()) for track in settings.get("tracks", []))
+    raw_value = str(asset or "").upper().strip()
+    value = _ASSET_ALIASES.get(raw_value, raw_value)
+    if value not in DECISION_READY_ASSETS:
+        return False
+    return any(
+        value in TRACK_ASSETS.get(track, set())
+        for track in settings.get("tracks", [])
+    )

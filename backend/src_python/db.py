@@ -88,6 +88,7 @@ _CREATE_RAW_NEWS = """
         ts              INTEGER,
         status          TEXT    NOT NULL DEFAULT 'PENDING'
             CHECK (status IN ('PENDING', 'PROCESSING', 'DONE', 'FAILED')),
+        processing_started_at INTEGER,
         is_noise        INTEGER NOT NULL DEFAULT 0,
         relevance_score REAL    NOT NULL DEFAULT 0.0,
         quality_status  TEXT    NOT NULL DEFAULT 'unverified',
@@ -168,6 +169,7 @@ _RAW_NEWS_COLUMNS: List[Tuple[str, str]] = [
     ("is_noise",        "INTEGER NOT NULL DEFAULT 0"),
     ("relevance_score", "REAL    NOT NULL DEFAULT 0.0"),
     ("ts",              "INTEGER"),
+    ("processing_started_at", "INTEGER"),
     ("quality_status",  "TEXT NOT NULL DEFAULT 'unverified'"),
     ("quality_reason",  "TEXT NOT NULL DEFAULT ''"),
 ]
@@ -234,6 +236,7 @@ _AI_DECISIONS_COLUMNS: List[Tuple[str, str]] = [
 _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ai_decisions_status ON ai_decisions(status);",
     "CREATE INDEX IF NOT EXISTS idx_raw_news_status ON raw_news(status);",
+    "CREATE INDEX IF NOT EXISTS idx_raw_news_processing_lease ON raw_news(status, processing_started_at);",
     "CREATE INDEX IF NOT EXISTS idx_ai_parent ON ai_decisions(parent_id);",
     "CREATE INDEX IF NOT EXISTS idx_ai_agg_key ON ai_decisions(aggregation_key);",
     "CREATE INDEX IF NOT EXISTS idx_market_ticks_symbol_ts ON market_ticks(symbol, ts);",

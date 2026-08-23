@@ -9,6 +9,11 @@ import {
   fmtTime,
   verdictColor,
 } from '@/lib/replay-data'
+import {
+  latestConfirmedStructureEvent,
+  type MarketStructure,
+  type MarketStructureTimeframe,
+} from '@/components/quant/market-structure-panel'
 
 type Props = {
   signal: SimSignal | null
@@ -20,7 +25,34 @@ type ConsensusModel = {
   reasoning?: string
 }
 
+type HistoricalStructureContext = {
+  asset: string
+  source: string
+  venue: string
+  instrumentId: string
+  instrumentType: string
+  quoteSource: string
+  quoteVenue: string
+  quoteInstrumentId: string
+  contextReason: string
+  decisionEligible: boolean
+  structure: MarketStructure
+}
+
 export function SignalDetail({ signal }: Props) {
+  const consensus = useMemo<Record<string, ConsensusModel>>(() => {
+    const c = signal?.extra_models_consensus
+    if (!c) return {}
+    if (typeof c === 'string') {
+      try { return JSON.parse(c) } catch { return {} }
+    }
+    return c as Record<string, ConsensusModel>
+  }, [signal?.extra_models_consensus])
+  const historicalStructure = useMemo(
+    () => extractHistoricalStructure(signal),
+    [signal],
+  )
+
   if (!signal) {
     return (
       <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-border bg-card">
@@ -29,14 +61,6 @@ export function SignalDetail({ signal }: Props) {
     )
   }
 
-  const consensus = useMemo<Record<string, ConsensusModel>>(() => {
-    const c = signal.extra_models_consensus
-    if (!c) return {}
-    if (typeof c === 'string') {
-      try { return JSON.parse(c) } catch { return {} }
-    }
-    return c as Record<string, ConsensusModel>
-  }, [signal.extra_models_consensus])
   const paperLabel = signal.decision_eligible
     ? `模拟盘 · ${signal.settled ? '已结算' : signal.tracking_quality === 'TRACKABLE' ? '实时跟踪' : '历史不可跟踪'}`
     : `研究隔离 · ${signal.settled ? '已归档' : '不计入持仓'}`
@@ -138,6 +162,16 @@ export function SignalDetail({ signal }: Props) {
         </div>
       </Section>
 
+      <Section title="决策时盘面结构">
+        {historicalStructure ? (
+          <HistoricalStructureView context={historicalStructure} />
+        ) : (
+          <div className="rounded border border-dashed border-border bg-secondary/30 px-3 py-2 text-[11px] leading-5 text-muted-foreground">
+            该决策快照未保存与 {signal.asset} 匹配的盘面结构。旧记录不补算、不使用其他品种替代。
+          </div>
+        )}
+      </Section>
+
       {/* Reasoning path */}
       <Section title="大模型归因">
         <pre className="thin-scroll max-h-48 overflow-y-auto whitespace-pre-wrap rounded border border-border bg-secondary p-2 font-mono text-[11px] leading-relaxed text-foreground">
@@ -234,6 +268,177 @@ export function SignalDetail({ signal }: Props) {
       </Section>
     </div>
   )
+}
+
+function HistoricalStructureView({ context }: { context: HistoricalStructureContext }) {
+  const { structure } = context
+  const usable = context.decisionEligible && structure.decision_eligible === true
+  const hasDistinctQuote = Boolean(
+    context.quoteSource
+    && (
+      context.quoteSource !== context.source
+      || context.quoteVenue !== context.venue
+      || context.quoteInstrumentId !== context.instrumentId
+    )
+  )
+  return (
+    <div className="rounded border border-border bg-secondary/20 p-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-xs font-semibold text-foreground">{context.asset}</span>
+        <span className={`rounded border px-1.5 py-0.5 font-mono text-[9px] ${usable ? 'border-long/40 bg-long/10 text-long' : 'border-hold/40 bg-hold/10 text-hold'}`}>
+          {usable ? '决策时可参与综合评分' : '决策时不可用'}
+        </span>
+        <span className="ml-auto font-mono text-[9px] text-muted-foreground">
+          结构 {context.venue || context.source} · {context.instrumentId || context.asset} · {context.instrumentType || '产品类型未知'}
+        </span>
+      </div>
+      {hasDistinctQuote && (
+        <div className="mt-1 font-mono text-[9px] text-muted-foreground">
+          报价 {context.quoteVenue || context.quoteSource} · {context.quoteInstrumentId || context.asset}
+        </div>
+      )}
+
+      {usable ? (
+        <>
+          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <KV label="综合趋势" value={structureTrendLabel(structure.trend)} tone={structure.trend === 'bullish' ? 'good' : structure.trend === 'bearish' ? 'bad' : 'neutral'} />
+            <KV label="趋势分" value={structureSigned(structure.trend_score)} tone={(structure.trend_score ?? 0) > 0.05 ? 'good' : (structure.trend_score ?? 0) < -0.05 ? 'bad' : 'neutral'} />
+            <KV label="置信度" value={structurePct(structure.confidence)} />
+            <KV label="周期一致" value={`${structureAlignmentLabel(structure.alignment)} ${structurePct(structure.alignment_score)}`} />
+          </div>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            {(['15m', '1h', '4h', '1d'] as const).map((timeframe) => (
+              <HistoricalTimeframe key={timeframe} timeframe={timeframe} data={structure.timeframes?.[timeframe]} />
+            ))}
+          </div>
+          <div className="mt-2 font-mono text-[9px] text-muted-foreground/70">
+            快照时间 {structureTime(structure.as_of_ms)} · 仅展示当时已闭合 K 线，未按现在行情回填。
+          </div>
+        </>
+      ) : (
+        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+          该结构没有通过事件时点、来源或质量闸门（{context.contextReason}），仅保留审计记录，不参与正式买卖判断。
+        </p>
+      )}
+    </div>
+  )
+}
+
+function HistoricalTimeframe({ timeframe, data }: { timeframe: string; data?: MarketStructureTimeframe }) {
+  if (!data || data.status === 'unavailable') {
+    return <div className="rounded border border-border px-2 py-1.5 font-mono text-[10px] text-muted-foreground">{timeframe} · 不可用</div>
+  }
+  if (data.decision_eligible !== true) {
+    return (
+      <div className="rounded border border-hold/30 bg-hold/5 px-2 py-1.5 font-mono text-[10px] text-hold">
+        {timeframe} · 质量闸门未通过，仅保留审计记录
+      </div>
+    )
+  }
+  const indicators = data.indicators || {}
+  const structure = data.structure || {}
+  const event = latestConfirmedStructureEvent(structure)
+  return (
+    <div className="rounded border border-border bg-card/40 px-2 py-1.5">
+      <div className="flex items-center gap-2 font-mono text-[10px]">
+        <span className="font-semibold text-foreground">{timeframe}</span>
+        <span className={data.trend === 'bullish' ? 'text-long' : data.trend === 'bearish' ? 'text-short' : 'text-hold'}>{structureTrendLabel(data.trend)}</span>
+        <span className="ml-auto text-muted-foreground">{structureSigned(data.trend_score)} · {structurePct(data.confidence)}</span>
+      </div>
+      <div className="mt-1 font-mono text-[9px] leading-4 text-muted-foreground">
+        <div>EMA20/50/200 {structurePrice(indicators.ema20)} / {structurePrice(indicators.ema50)} / {structurePrice(indicators.ema200)}</div>
+        <div>RSI {structureNumber(indicators.rsi14, 1)} · ATR {structureNumber(indicators.atr_pct, 2)}% · S/R {structurePrice(structure.support?.price)} / {structurePrice(structure.resistance?.price)}</div>
+        <div>{event ? `${event.kind || '结构'} ${event.direction === 'bullish' ? '向上' : event.direction === 'bearish' ? '向下' : '未知'} @ ${structurePrice(event.level)} · 确认 ${structureTime(event.confirmed_at)}` : 'BOS / CHoCH 尚未确认'}</div>
+        <div>BOS / CHoCH 仅作研究参考，不得单独触发交易。</div>
+      </div>
+    </div>
+  )
+}
+
+function extractHistoricalStructure(signal: SimSignal | null): HistoricalStructureContext | null {
+  if (!signal?.decision_context) return null
+  let parsed: unknown
+  try {
+    parsed = typeof signal.decision_context === 'string'
+      ? JSON.parse(signal.decision_context)
+      : signal.decision_context
+  } catch {
+    return null
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.assets)) return null
+  const asset = normalizeStructureAsset(signal.asset)
+  const assetContext = parsed.assets[asset]
+  if (!isRecord(assetContext) || !isRecord(assetContext.market_structure)) return null
+  const structure = assetContext.market_structure as MarketStructure
+  const eventTimeEligible = parsed.market_context_eligible === true && parsed.timestamp_mismatch === false
+  const structureSource = firstNonEmptyString(
+    assetContext.structure_source,
+    structure.source,
+    assetContext.source,
+  ) || 'unknown'
+  return {
+    asset,
+    source: structureSource,
+    venue: firstNonEmptyString(assetContext.structure_venue, assetContext.venue, structureSource),
+    instrumentId: firstNonEmptyString(assetContext.structure_instrument_id, assetContext.instrument_id),
+    instrumentType: firstNonEmptyString(assetContext.structure_instrument_type, assetContext.instrument_type),
+    quoteSource: firstNonEmptyString(assetContext.quote_source, assetContext.source),
+    quoteVenue: firstNonEmptyString(assetContext.quote_venue, assetContext.venue),
+    quoteInstrumentId: firstNonEmptyString(assetContext.quote_instrument_id, assetContext.instrument_id),
+    contextReason: typeof parsed.market_context_reason === 'string'
+      ? parsed.market_context_reason
+      : 'missing_event_time_audit',
+    decisionEligible: eventTimeEligible && assetContext.decision_eligible === true && structure.decision_eligible === true,
+    structure,
+  }
+}
+
+function normalizeStructureAsset(value: string): string {
+  const asset = value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
+  if (asset === 'GOLD' || asset === 'XAUUSD' || asset === 'XAUUSDT' || asset === 'XAU') return 'XAU'
+  if (asset === 'BTCUSD' || asset === 'BTCUSDT' || asset === 'BTC') return 'BTC'
+  return asset
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value
+  }
+  return ''
+}
+
+function structureTrendLabel(value?: string) {
+  return value === 'bullish' ? '多头' : value === 'bearish' ? '空头' : value === 'range' ? '震荡' : '未知'
+}
+
+function structureAlignmentLabel(value?: string) {
+  return value === 'bullish' ? '多头一致' : value === 'bearish' ? '空头一致' : value === 'mixed' ? '周期冲突' : value === 'range' ? '震荡一致' : '未知'
+}
+
+function structureSigned(value?: number) {
+  return typeof value === 'number' && Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${value.toFixed(3)}` : '—'
+}
+
+function structurePct(value?: number) {
+  return typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(0)}%` : '—'
+}
+
+function structureNumber(value?: number | null, digits = 2) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—'
+}
+
+function structurePrice(value?: number | null) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+  return value.toLocaleString('en-US', { maximumFractionDigits: Math.abs(value) >= 100 ? 2 : 5 })
+}
+
+function structureTime(value?: number | null) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '未知'
+  return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {

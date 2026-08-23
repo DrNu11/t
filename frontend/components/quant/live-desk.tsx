@@ -11,6 +11,7 @@ import { SignalLedger } from '@/components/quant/signal-ledger'
 import { StatCards } from '@/components/quant/stat-cards'
 import { MarketTabs } from '@/components/quant/market-tabs'
 import { PriceTicker } from '@/components/quant/price-ticker'
+import { MarketStructurePanel } from '@/components/quant/market-structure-panel'
 
 export function LiveDesk() {
   const [events, setEvents] = useState<ApiEvent[]>([])
@@ -86,15 +87,22 @@ export function LiveDesk() {
         </div>
         <StatCards events={events} activeMarket={activeMarket} />
         {activeMarket === 'CRYPTO' || activeMarket === 'GOLD' || activeMarket === 'OIL' ? (
-          <div key={activeMarket} className="h-[350px] shrink-0 md:h-[420px]">
-            <TradingViewChart
-              symbol={
-                activeMarket === 'CRYPTO' ? 'BINANCE:BTCUSDT'
-                  : activeMarket === 'GOLD' ? 'OANDA:XAUUSD'
-                    : 'OANDA:WTICOUSD'
-              }
-              interval="60"
-            />
+          <div key={activeMarket} className="grid shrink-0 gap-3 md:grid-cols-[minmax(0,1fr)_300px]">
+            <div className="h-[350px] md:h-[420px]">
+              <TradingViewChart
+                symbol={
+                  activeMarket === 'CRYPTO' ? 'BINANCE:BTCUSDT'
+                    : activeMarket === 'GOLD' ? 'OANDA:XAUUSD'
+                      : 'OANDA:WTICOUSD'
+                }
+                interval="60"
+              />
+            </div>
+            <div className="h-[350px] md:h-[420px]">
+              <MarketStructurePanel
+                asset={activeMarket === 'CRYPTO' ? 'BTC' : activeMarket === 'GOLD' ? 'XAU' : 'WTI'}
+              />
+            </div>
           </div>
         ) : (
           <div key={activeMarket} className="min-h-0 flex-1">

@@ -45,6 +45,7 @@ import macro_context
 import data_quality
 import decision_guard
 import market_feeds
+import market_snapshot
 import timeseries
 import strategy_store
 import paper_trading
@@ -847,6 +848,10 @@ async def get_today_events() -> Dict[str, Any]:
 
 
 _MARKET_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
+_MARKET_STRUCTURE_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
+_MARKET_STRUCTURE_INFLIGHT: Optional[asyncio.Task] = None
+_MARKET_STRUCTURE_CACHE_TTL = 5.0
+_MARKET_STRUCTURE_ASSETS = frozenset({"BTC", "XAU"})
 _TECHFLOW_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
 _EASTMONEY_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
 _BLOCKBEATS_CACHE: Dict[str, Any] = {"expires": 0.0, "value": None}
@@ -867,6 +872,191 @@ def _cached_market_prices() -> Dict[str, Any]:
 @app.get("/api/market/prices")
 async def get_market_prices():
     return await asyncio.to_thread(_cached_market_prices)
+
+
+async def _produce_market_structure_snapshot() -> Dict[str, Any]:
+    """Refresh the structure cache independently of any HTTP waiter.
+
+    Request handlers await this producer through ``asyncio.shield``.  Cache
+    publication and in-flight cleanup deliberately live here so cancellation
+    of the last waiting client cannot discard a successful upstream result.
+    """
+    global _MARKET_STRUCTURE_INFLIGHT
+    producer = asyncio.current_task()
+    try:
+        snapshot = await market_snapshot.get_snapshot()
+        if not isinstance(snapshot, dict):
+            raise TypeError("market snapshot must be an object")
+        _MARKET_STRUCTURE_CACHE["value"] = snapshot
+        _MARKET_STRUCTURE_CACHE["expires"] = time.monotonic() + _MARKET_STRUCTURE_CACHE_TTL
+        return snapshot
+    finally:
+        if _MARKET_STRUCTURE_INFLIGHT is producer:
+            _MARKET_STRUCTURE_INFLIGHT = None
+
+
+async def _cached_market_structure_snapshot() -> Dict[str, Any]:
+    """Share one short-lived snapshot across structure API callers.
+
+    A snapshot fans out to several upstream OKX endpoints.  Keeping a tiny
+    cache and a single producer prevents concurrent UI polls from multiplying
+    those requests while preserving near-real-time behaviour.
+    """
+    global _MARKET_STRUCTURE_INFLIGHT
+    now = time.monotonic()
+    cached = _MARKET_STRUCTURE_CACHE.get("value")
+    if isinstance(cached, dict) and now < float(_MARKET_STRUCTURE_CACHE.get("expires") or 0.0):
+        return cached
+
+    task = _MARKET_STRUCTURE_INFLIGHT
+    if task is None or task.done():
+        task = asyncio.create_task(_produce_market_structure_snapshot())
+        _MARKET_STRUCTURE_INFLIGHT = task
+    return await asyncio.shield(task)
+
+
+@app.get("/api/market/structure/{asset}")
+async def get_market_structure(asset: str):
+    """Return the latest verified, closed-candle structure for one asset.
+
+    Structure analysis is deliberately fail-closed: an unsupported asset or
+    unavailable upstream returns an observable ``unavailable`` payload rather
+    than borrowing another asset's data or fabricating indicator values.
+    """
+    asset_key = str(asset or "").strip().upper()
+    if not asset_key or not re.fullmatch(r"[A-Z0-9._-]{2,16}", asset_key):
+        raise HTTPException(status_code=400, detail="invalid asset")
+
+    # Reject unsupported instruments before any network call.  In particular,
+    # WTI is displayed as unavailable until a verified oil provider is wired;
+    # it must never trigger a BTC/XAU snapshot or borrow another asset.
+    if asset_key not in _MARKET_STRUCTURE_ASSETS:
+        return {
+            "asset": asset_key,
+            "status": "unavailable",
+            "decision_eligible": False,
+            "source": "",
+            "structure_source": "",
+            "structure_venue": "",
+            "structure_instrument_id": "",
+            "structure_instrument_type": "",
+            "quote_source": "",
+            "quote_venue": "",
+            "quote_instrument_id": "",
+            "quote_instrument_type": "",
+            "venue": "",
+            "instrument_id": "",
+            "instrument_type": "",
+            "updated_at": None,
+            "reason": "unsupported_asset",
+            "supported_assets": sorted(_MARKET_STRUCTURE_ASSETS),
+            "structure": None,
+        }
+
+    try:
+        snapshot = await _cached_market_structure_snapshot()
+    except Exception as exc:
+        return {
+            "asset": asset_key,
+            "status": "unavailable",
+            "decision_eligible": False,
+            "source": "",
+            "structure_source": "",
+            "structure_venue": "",
+            "structure_instrument_id": "",
+            "structure_instrument_type": "",
+            "quote_source": "",
+            "quote_venue": "",
+            "quote_instrument_id": "",
+            "quote_instrument_type": "",
+            "venue": "",
+            "instrument_id": "",
+            "instrument_type": "",
+            "updated_at": None,
+            "reason": f"snapshot_unavailable:{type(exc).__name__}",
+            "structure": None,
+        }
+
+    assets = snapshot.get("assets") if isinstance(snapshot, dict) else None
+    asset_row = assets.get(asset_key) if isinstance(assets, dict) else None
+    if not isinstance(asset_row, dict):
+        asset_row = {}
+    structure = asset_row.get("market_structure")
+    if not isinstance(structure, dict):
+        structure = None
+    structure_status = str((structure or {}).get("status") or "unavailable")
+    structure_quality = (
+        structure.get("quality")
+        if isinstance(structure, dict) and isinstance(structure.get("quality"), dict)
+        else {}
+    )
+    structure_warnings = (
+        structure.get("warnings")
+        if isinstance(structure, dict) and isinstance(structure.get("warnings"), list)
+        else []
+    )
+    eligible = bool(
+        asset_row.get("decision_eligible") is True
+        and structure is not None
+        and structure.get("decision_eligible") is True
+        and structure_status in {"ok", "partial"}
+    )
+    structure_source = str(
+        (structure or {}).get("source")
+        or asset_row.get("structure_source")
+        or asset_row.get("source")
+        or ""
+    )
+    structure_venue = str(
+        (structure or {}).get("venue")
+        or asset_row.get("structure_venue")
+        or (structure or {}).get("source")
+        or ""
+    )
+    structure_instrument_id = str(
+        (structure or {}).get("instrument_id")
+        or asset_row.get("structure_instrument_id")
+        or ""
+    )
+    structure_instrument_type = str(
+        (structure or {}).get("instrument_type")
+        or asset_row.get("structure_instrument_type")
+        or ""
+    )
+    return {
+        "asset": asset_key,
+        "status": structure_status,
+        "decision_eligible": eligible,
+        # Top-level source/venue/instrument remain backward-compatible aliases
+        # for structure identity. Explicit structure_* and quote_* keys remove
+        # any ambiguity for consumers comparing Jin10 spot with OKX swaps.
+        "source": structure_source,
+        "structure_source": structure_source,
+        "structure_venue": structure_venue,
+        "structure_instrument_id": structure_instrument_id,
+        "structure_instrument_type": structure_instrument_type,
+        "quote_source": str(asset_row.get("quote_source") or asset_row.get("source") or ""),
+        "quote_venue": str(asset_row.get("quote_venue") or asset_row.get("venue") or ""),
+        "quote_instrument_id": str(asset_row.get("quote_instrument_id") or asset_row.get("instrument_id") or ""),
+        "quote_instrument_type": str(asset_row.get("quote_instrument_type") or asset_row.get("instrument_type") or ""),
+        "venue": structure_venue,
+        "instrument_id": structure_instrument_id,
+        "instrument_type": structure_instrument_type,
+        "updated_at": (
+            (structure or {}).get("as_of_ms")
+            or (snapshot.get("epoch_ms") if isinstance(snapshot, dict) else None)
+            or (snapshot.get("timestamp") if isinstance(snapshot, dict) else None)
+        ),
+        "reason": "" if eligible else str(
+            (structure or {}).get("reason")
+            or structure_quality.get("reason")
+            or (structure_warnings[0] if structure_warnings else "")
+            or asset_row.get("quality_reason")
+            or asset_row.get("status_note")
+            or "verified_structure_unavailable"
+        ),
+        "structure": structure,
+    }
 
 
 @app.get("/api/timeseries/ticks/{symbol}")

@@ -5,6 +5,11 @@ import api_server
 import market_feeds
 
 
+def _reset_structure_cache():
+    api_server._MARKET_STRUCTURE_CACHE.update({"expires": 0.0, "value": None})
+    api_server._MARKET_STRUCTURE_INFLIGHT = None
+
+
 def test_market_feed_mapping_and_median(monkeypatch):
     values = {
         "Binance": (100.0, 1.0), "OKX": (102.0, 2.0),
@@ -43,6 +48,200 @@ def test_market_api_cache(monkeypatch):
     assert asyncio.run(api_server.get_market_prices()) == {"items": []}
     assert asyncio.run(api_server.get_market_prices()) == {"items": []}
     assert len(calls) == 1
+
+
+def test_market_structure_api_returns_only_matching_verified_asset(monkeypatch):
+    _reset_structure_cache()
+
+    async def snapshot():
+        return {
+            "timestamp": "2026-08-22T12:00:00Z",
+            "assets": {
+                "BTC": {
+                    "source": "OKX",
+                    "decision_eligible": True,
+                    "market_structure": {
+                        "status": "ok",
+                        "decision_eligible": True,
+                        "aggregate": {"trend": "bullish", "trend_score": 0.7},
+                    },
+                },
+                "XAU": {
+                    "source": "OKX",
+                    "decision_eligible": False,
+                    "status_note": "真实交易对不可用",
+                },
+            },
+        }
+
+    monkeypatch.setattr(api_server.market_snapshot, "get_snapshot", snapshot)
+    result = asyncio.run(api_server.get_market_structure("btc"))
+    assert result["asset"] == "BTC"
+    assert result["status"] == "ok"
+    assert result["decision_eligible"] is True
+    assert result["structure"]["aggregate"]["trend"] == "bullish"
+
+    unavailable = asyncio.run(api_server.get_market_structure("xau"))
+    assert unavailable["asset"] == "XAU"
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["decision_eligible"] is False
+    assert unavailable["structure"] is None
+
+
+def test_market_structure_api_fails_closed_on_snapshot_error(monkeypatch):
+    _reset_structure_cache()
+
+    async def snapshot():
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(api_server.market_snapshot, "get_snapshot", snapshot)
+    result = asyncio.run(api_server.get_market_structure("BTC"))
+    assert result["status"] == "unavailable"
+    assert result["decision_eligible"] is False
+    assert result["reason"] == "snapshot_unavailable:RuntimeError"
+
+
+def test_market_structure_api_preserves_structure_provenance_and_reason(monkeypatch):
+    _reset_structure_cache()
+
+    async def snapshot():
+        return {
+            "epoch_ms": 1_800_000_000_000,
+            "assets": {
+                "XAU": {
+                    "source": "金十",
+                    "venue": "Jin10",
+                    "instrument_id": "XAUUSD",
+                    "instrument_type": "spot_quote",
+                    "quote_source": "金十",
+                    "quote_venue": "Jin10",
+                    "quote_instrument_id": "XAUUSD",
+                    "quote_instrument_type": "spot_quote",
+                    "structure_source": "OKX",
+                    "structure_venue": "OKX",
+                    "structure_instrument_id": "XAU-USDT-SWAP",
+                    "structure_instrument_type": "perpetual_swap",
+                    "decision_eligible": True,
+                    "quality_reason": "verified_source",
+                    "market_structure": {
+                        "source": "OKX",
+                        "status": "unavailable",
+                        "decision_eligible": False,
+                        "quality": {"reason": "OKX 未返回真实 OHLCV"},
+                        "warnings": ["OKX 未返回真实 OHLCV"],
+                    },
+                }
+            },
+        }
+
+    monkeypatch.setattr(api_server.market_snapshot, "get_snapshot", snapshot)
+    result = asyncio.run(api_server.get_market_structure("XAU"))
+
+    assert result["source"] == "OKX"
+    assert result["structure_source"] == "OKX"
+    assert result["structure_venue"] == "OKX"
+    assert result["structure_instrument_id"] == "XAU-USDT-SWAP"
+    assert result["structure_instrument_type"] == "perpetual_swap"
+    assert result["quote_source"] == "金十"
+    assert result["venue"] == "OKX"
+    assert result["instrument_id"] == "XAU-USDT-SWAP"
+    assert result["instrument_type"] == "perpetual_swap"
+    assert result["quote_venue"] == "Jin10"
+    assert result["quote_instrument_id"] == "XAUUSD"
+    assert result["reason"] == "OKX 未返回真实 OHLCV"
+    assert result["decision_eligible"] is False
+    assert result["updated_at"] == 1_800_000_000_000
+
+
+def test_market_structure_api_rejects_unsupported_asset_without_upstream_call(monkeypatch):
+    _reset_structure_cache()
+    calls = []
+
+    async def snapshot():
+        calls.append(1)
+        return {"assets": {}}
+
+    monkeypatch.setattr(api_server.market_snapshot, "get_snapshot", snapshot)
+    result = asyncio.run(api_server.get_market_structure("WTI"))
+
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "unsupported_asset"
+    assert result["supported_assets"] == ["BTC", "XAU"]
+    assert calls == []
+
+
+def test_market_structure_api_singleflights_concurrent_requests(monkeypatch):
+    _reset_structure_cache()
+    calls = []
+
+    async def snapshot():
+        calls.append(1)
+        await asyncio.sleep(0.01)
+        return {
+            "epoch_ms": 1_800_000_000_000,
+            "assets": {
+                asset: {
+                    "source": "OKX",
+                    "decision_eligible": True,
+                    "market_structure": {
+                        "source": "OKX",
+                        "status": "ok",
+                        "decision_eligible": True,
+                    },
+                }
+                for asset in ("BTC", "XAU")
+            },
+        }
+
+    async def run_concurrently():
+        return await asyncio.gather(
+            *(api_server.get_market_structure("BTC" if index % 2 == 0 else "XAU") for index in range(8))
+        )
+
+    monkeypatch.setattr(api_server.market_snapshot, "get_snapshot", snapshot)
+    results = asyncio.run(run_concurrently())
+
+    assert len(calls) == 1
+    assert all(item["decision_eligible"] is True for item in results)
+
+
+def test_market_structure_cache_survives_last_waiter_cancellation(monkeypatch):
+    _reset_structure_cache()
+    calls = []
+
+    async def run_scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def snapshot():
+            calls.append(1)
+            started.set()
+            await release.wait()
+            return {"epoch_ms": 1_800_000_000_000, "assets": {}}
+
+        monkeypatch.setattr(api_server.market_snapshot, "get_snapshot", snapshot)
+        waiter = asyncio.create_task(api_server._cached_market_structure_snapshot())
+        await started.wait()
+        producer = api_server._MARKET_STRUCTURE_INFLIGHT
+        assert producer is not None
+
+        waiter.cancel()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            pass
+
+        release.set()
+        await producer
+        cached = await api_server._cached_market_structure_snapshot()
+        return cached
+
+    result = asyncio.run(run_scenario())
+
+    assert result["epoch_ms"] == 1_800_000_000_000
+    assert calls == [1]
+    assert api_server._MARKET_STRUCTURE_CACHE["value"] is result
+    assert api_server._MARKET_STRUCTURE_INFLIGHT is None
 
 
 def test_techflow_api_maps_json_and_handles_challenge(monkeypatch):

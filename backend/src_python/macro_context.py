@@ -102,7 +102,15 @@ def _error_payload(error: Any) -> Dict[str, Any]:
         return {"note": str(error or "upstream_unavailable")[:240]}
     error_type = type(error).__name__
     status = getattr(error, "code", None)
-    response = getattr(error, "response", None)
+    # ``urllib.error.HTTPError`` delegates unknown attributes to its optional
+    # file object.  Test fixtures and body-less upstream errors may not have
+    # that object, in which case even ``getattr(..., default)`` raises
+    # ``KeyError`` instead of returning the default.  Error reporting must
+    # never mask the original upstream status.
+    try:
+        response = getattr(error, "response", None)
+    except (AttributeError, KeyError):
+        response = None
     if status is None and response is not None:
         status = getattr(response, "status_code", None)
     reason = getattr(error, "reason", None)

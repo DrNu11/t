@@ -14,8 +14,9 @@ import ssl
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from config import (
     AI_MODEL_ROSTER,
@@ -54,6 +55,284 @@ _NEUTRAL_SCORE_EPS = 0.001
 _ALLOWED_QUALITY_STATUSES = (
     ("verified", "legacy") if ALLOW_LEGACY_DECISIONS else ("verified",)
 )
+
+# Current market/macro state is valid only for genuinely live news.  Five
+# minutes is deliberately strict: when timestamps are ambiguous, stale or in
+# the future, the worker would rather omit context than leak future data into
+# research, replay or backtest decisions.
+_MARKET_CONTEXT_REALTIME_WINDOW_S = 5 * 60
+_PROCESSING_LEASE_SECONDS = 15 * 60
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?$"
+)
+_NUMERIC_TIMESTAMP_RE = re.compile(r"^[+]?(?:\d+(?:\.\d+)?|\.\d+)$")
+
+
+def _epoch_seconds(value: Any) -> Optional[float]:
+    """Normalize Unix seconds/milliseconds; reject other numeric magnitudes."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if 1_000_000_000 <= number < 100_000_000_000:
+        return number
+    if 1_000_000_000_000 <= number < 100_000_000_000_000:
+        return number / 1000.0
+    return None
+
+
+def _news_timestamp_epoch(
+    value: Any,
+    *,
+    snapshot_epoch: float,
+) -> Optional[float]:
+    """Parse a dated news timestamp relative to a trusted snapshot epoch.
+
+    Accepted contracts are full ISO datetimes and Unix seconds/milliseconds.
+    Naive ISO values are interpreted in Asia/Shanghai.  Clock-only values are
+    deliberately rejected because binding them to today's date could make a
+    historical/replayed item appear live.
+    """
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _epoch_seconds(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if _NUMERIC_TIMESTAMP_RE.fullmatch(text):
+        return _epoch_seconds(text)
+
+    try:
+        # Date-only and minute-only values are intentionally not accepted.
+        if not _ISO_DATETIME_RE.fullmatch(text):
+            return None
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_SHANGHAI_TZ)
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def evaluate_news_context_eligibility(
+    news_timestamp: Any,
+    snapshot_epoch: Any,
+    *,
+    realtime_window_seconds: int = _MARKET_CONTEXT_REALTIME_WINDOW_S,
+) -> Dict[str, Any]:
+    """Pure, fail-closed timestamp gate for current market/macro context."""
+
+    snapshot_s = _epoch_seconds(snapshot_epoch)
+    raw_timestamp = "" if news_timestamp is None else str(news_timestamp).strip()
+    base: Dict[str, Any] = {
+        "market_context_eligible": False,
+        "timestamp_mismatch": True,
+        "market_context_reason": "snapshot_epoch_invalid",
+        "news_timestamp_raw": raw_timestamp,
+        "news_epoch_ms": None,
+        "snapshot_epoch_ms": (
+            int(round(snapshot_s * 1000)) if snapshot_s is not None else None
+        ),
+        "context_age_seconds": None,
+        "realtime_window_seconds": int(realtime_window_seconds),
+    }
+    if snapshot_s is None:
+        return base
+    if not raw_timestamp:
+        base["market_context_reason"] = "news_timestamp_missing"
+        return base
+
+    news_s = _news_timestamp_epoch(news_timestamp, snapshot_epoch=snapshot_s)
+    if news_s is None:
+        base["market_context_reason"] = "news_timestamp_unparseable"
+        return base
+
+    age_s = snapshot_s - news_s
+    base["news_epoch_ms"] = int(round(news_s * 1000))
+    base["context_age_seconds"] = round(age_s, 3)
+    if age_s < 0:
+        base["market_context_reason"] = "news_timestamp_after_snapshot"
+        return base
+    if age_s > max(0, int(realtime_window_seconds)):
+        base["market_context_reason"] = "news_timestamp_outside_realtime_window"
+        return base
+
+    base.update({
+        "market_context_eligible": True,
+        "timestamp_mismatch": False,
+        "market_context_reason": "within_realtime_window",
+    })
+    return base
+
+
+def build_news_context_package(
+    news_timestamp: Any,
+    snapshot: Any,
+    macro_payload: Any = None,
+) -> Dict[str, Any]:
+    """Build one news item's prompt/context without leaking current state.
+
+    The returned package is deterministic for its arguments.  Ineligible
+    events receive an audit-only decision context containing timestamp gate
+    metadata; current assets, summaries and macro layers are omitted entirely.
+    """
+
+    safe_snapshot = snapshot if isinstance(snapshot, dict) else {}
+    eligibility = evaluate_news_context_eligibility(
+        news_timestamp,
+        safe_snapshot.get("epoch_ms"),
+    )
+    snapshot_status = str(safe_snapshot.get("status") or "unavailable").lower()
+    snapshot_assets = safe_snapshot.get("assets")
+    snapshot_ready = (
+        snapshot_status in {"ok", "partial"}
+        and isinstance(snapshot_assets, dict)
+        and any(
+            isinstance(item, dict)
+            and item.get("status") == "ok"
+            and item.get("decision_eligible") is True
+            for item in snapshot_assets.values()
+        )
+    )
+    eligibility["snapshot_status"] = snapshot_status
+    if eligibility["market_context_eligible"] and not snapshot_ready:
+        eligibility.update({
+            "market_context_eligible": False,
+            "timestamp_mismatch": False,
+            "market_context_reason": "snapshot_not_decision_ready",
+        })
+    if not eligibility["market_context_eligible"]:
+        withheld = {
+            "status": "context_withheld",
+            **eligibility,
+        }
+        return {
+            "market_context": "",
+            "decision_context": json.dumps(
+                withheld, ensure_ascii=False, separators=(",", ":"),
+            ),
+            "eligibility": eligibility,
+        }
+
+    market_context = str(safe_snapshot.get("summary") or "").strip()
+    macro = macro_payload if isinstance(macro_payload, dict) else {}
+    macro_summary = str(macro.get("summary") or "").strip()
+    if macro_summary:
+        market_context = (
+            f"{market_context}\n\n{macro_summary}".strip()
+            if market_context else macro_summary
+        )
+
+    decision_payload = dict(safe_snapshot)
+    decision_payload.update(eligibility)
+    decision_context = json.dumps(
+        decision_payload, ensure_ascii=False, separators=(",", ":"),
+    )
+    if macro:
+        decision_context = merge_into_context(decision_context, {}, macro)
+    return {
+        "market_context": market_context,
+        "decision_context": decision_context,
+        "eligibility": eligibility,
+    }
+
+
+def evaluate_target_market_context_eligibility(
+    target_asset: Any,
+    snapshot: Any,
+    context_eligibility: Any,
+) -> Dict[str, Any]:
+    """Require a verified same-asset quote before aggregation or paper trade."""
+    canonical = evidence.normalize_asset(target_asset)
+    if not isinstance(context_eligibility, dict) or not context_eligibility.get(
+        "market_context_eligible"
+    ):
+        return {
+            "target_market_context_eligible": False,
+            "target_market_context_reason": str(
+                ((context_eligibility or {}).get("market_context_reason") or "context_unavailable")
+                if isinstance(context_eligibility, dict) else "context_unavailable"
+            ),
+            "target_asset_context_key": canonical,
+        }
+    assets = snapshot.get("assets") if isinstance(snapshot, dict) else None
+    asset_context = assets.get(canonical) if isinstance(assets, dict) else None
+    eligible = bool(
+        canonical
+        and isinstance(asset_context, dict)
+        and asset_context.get("status") == "ok"
+        and asset_context.get("decision_eligible") is True
+    )
+    return {
+        "target_market_context_eligible": eligible,
+        "target_market_context_reason": (
+            "verified_same_asset_context" if eligible else "target_asset_context_unavailable"
+        ),
+        "target_asset_context_key": canonical,
+    }
+
+
+def select_current_learning_context(
+    context_eligibility: Any,
+    *,
+    performance_context: str = "",
+    hermes_skills: Any = None,
+) -> Dict[str, Any]:
+    """Fail closed when selecting present-day learned context for one event."""
+
+    eligible = bool(
+        isinstance(context_eligibility, dict)
+        and context_eligibility.get("market_context_eligible") is True
+        and context_eligibility.get("timestamp_mismatch") is False
+    )
+    skills = hermes_skills if isinstance(hermes_skills, list) else []
+    return {
+        "eligible": eligible,
+        "performance_context": str(performance_context or "") if eligible else "",
+        "hermes_skills": list(skills) if eligible else [],
+    }
+
+
+def _authoritative_news_timestamp(news_row: Any) -> Any:
+    """Prefer the canonical event epoch; use dated legacy text only if absent."""
+
+    keys = news_row.keys() if hasattr(news_row, "keys") else ()
+    if "ts" in keys and news_row["ts"] is not None:
+        return news_row["ts"]
+    if "timestamp" in keys:
+        return news_row["timestamp"] or ""
+    return ""
+
+
+def _canonical_news_timestamp(value: Any) -> str:
+    """Serialize the authoritative event clock for prompts and decision rows."""
+
+    epoch = _epoch_seconds(value)
+    if epoch is not None:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+    return "" if value is None else str(value)
+
+
+def _settled_sample_for_context(
+    asset: str,
+    *,
+    target_market_context_eligible: bool,
+    connection: sqlite3.Connection,
+) -> Dict[str, Any]:
+    """Never read present-day settled evidence for a non-live event."""
+
+    if not target_market_context_eligible:
+        return {}
+    return evidence.collect_settled_sample(asset, connection=connection)
 
 
 def reconcile_score_action(score: float, action: str) -> tuple[float, str]:
@@ -880,7 +1159,11 @@ async def _process_single(
     """
     news_id = news_row["id"]
     content = re.sub(r'\[hash:[a-fA-F0-9]+\]\s*', '', news_row["content"])
-    pre_ts = news_row["timestamp"]
+    # `ts` is the canonical event clock.  The legacy human-readable
+    # `timestamp` column is only a fallback; using it here while the context
+    # gate uses `ts` would give the model a different event time than the
+    # audited market snapshot.
+    pre_ts = _canonical_news_timestamp(_authoritative_news_timestamp(news_row))
 
     try:
         async with _LLM_SEMAPHORE:
@@ -990,6 +1273,93 @@ def _bump_parent_score(
     return False
 
 
+def _recover_processing_on_worker_start() -> bool:
+    """Recover only expired claims left by a previous worker.
+
+    A false return means the database was temporarily unavailable; startup
+    keeps retrying before it performs any ordinary claim or external request.
+    """
+
+    conn = _open_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        lease_cutoff = int(time.time()) - _PROCESSING_LEASE_SECONDS
+        conn.execute(
+            "UPDATE raw_news"
+            " SET status = 'PENDING', processing_started_at = NULL"
+            " WHERE status = 'PROCESSING'"
+            " AND (processing_started_at IS NULL OR processing_started_at <= ?)",
+            (lease_cutoff,),
+        )
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+def _claim_pending_batch() -> List[sqlite3.Row]:
+    """Atomically recover expired claims and lease the next eligible batch."""
+
+    conn = _open_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        now_epoch = int(time.time())
+        lease_cutoff = now_epoch - _PROCESSING_LEASE_SECONDS
+        conn.execute(
+            "UPDATE raw_news"
+            " SET status = 'PENDING', processing_started_at = NULL"
+            " WHERE status = 'PROCESSING'"
+            " AND (processing_started_at IS NULL OR processing_started_at <= ?)",
+            (lease_cutoff,),
+        )
+        quality_placeholders = ",".join("?" for _ in _ALLOWED_QUALITY_STATUSES)
+        rows = conn.execute(
+            "SELECT * FROM raw_news"
+            " WHERE status = 'PENDING' AND is_noise = 0"
+            f" AND LOWER(COALESCE(quality_status, 'unverified')) IN ({quality_placeholders})"
+            " ORDER BY id ASC LIMIT ?",
+            (*_ALLOWED_QUALITY_STATUSES, BATCH_SIZE),
+        ).fetchall()
+        if rows:
+            ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE raw_news SET status = 'PROCESSING', processing_started_at = ?"
+                f" WHERE id IN ({placeholders}) AND status = 'PENDING'",
+                (now_epoch, *ids),
+            )
+        # Commit even when no row is claimable so orphaned, ineligible rows
+        # recovered above do not remain permanently stuck in PROCESSING.
+        conn.commit()
+        return rows
+    except sqlite3.OperationalError:
+        conn.rollback()
+        return []
+    finally:
+        conn.close()
+
+
+def _mark_news_terminal_status(
+    conn: sqlite3.Connection,
+    news_id: int,
+    status: str,
+) -> None:
+    """Complete a leased row and clear its processing lease atomically."""
+
+    terminal = str(status or "").upper()
+    if terminal not in {"DONE", "FAILED"}:
+        raise ValueError("raw_news terminal status must be DONE or FAILED")
+    conn.execute(
+        "UPDATE raw_news"
+        " SET status = ?, processing_started_at = NULL"
+        " WHERE id = ? AND status = 'PROCESSING'",
+        (terminal, int(news_id)),
+    )
+
+
 
 async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
     """
@@ -1005,6 +1375,7 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
     """
 
     idle_ticks = 0  # heartbeat counter when no PENDING data
+    recover_processing_on_start = True
 
     # 失败冷却: snapshot 连续 DOWN 后 5 分钟内不重试, 减少无意义等待
     _SNAPSHOT_COOLDOWN_S = 300
@@ -1013,92 +1384,67 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
     while True:
         await asyncio.sleep(1)
 
+        if recover_processing_on_start:
+            recovered = await loop.run_in_executor(
+                None, _recover_processing_on_worker_start,
+            )
+            if not recovered:
+                # Do not start market/macro/LLM work until the lease table can
+                # be recovered atomically. A transient SQLite lock is retried.
+                continue
+            recover_processing_on_start = False
+
         # ==================================================================
         # Phase 1 - Batch atomic claim
         # ==================================================================
-        def _batch_claim() -> List[sqlite3.Row]:
-            conn = _open_db()
-            try:
-                conn.execute("BEGIN IMMEDIATE;")
-                quality_placeholders = ",".join("?" for _ in _ALLOWED_QUALITY_STATUSES)
-                rows = conn.execute(
-                    "SELECT * FROM raw_news"
-                    " WHERE status = 'PENDING' AND is_noise = 0"
-                    f" AND LOWER(COALESCE(quality_status, 'unverified')) IN ({quality_placeholders})"
-                    " ORDER BY id ASC LIMIT ?",
-                    (*_ALLOWED_QUALITY_STATUSES, BATCH_SIZE),
-                ).fetchall()
-                if not rows:
-                    conn.rollback()
-                    return []
-
-                ids = [r["id"] for r in rows]
-                placeholders = ",".join("?" * len(ids))
-                conn.execute(
-                    f"UPDATE raw_news SET status = 'PROCESSING'"
-                    f" WHERE id IN ({placeholders})",
-                    ids,
-                )
-                conn.commit()
-                return rows
-            except sqlite3.OperationalError:
-                conn.rollback()
-                return []
-            finally:
-                conn.close()
-
-        def _has_pending_eligible() -> bool:
-            """Cheap read guard before any network/macro work is started."""
-            conn = _open_db()
-            try:
-                quality_placeholders = ",".join("?" for _ in _ALLOWED_QUALITY_STATUSES)
-                return conn.execute(
-                    "SELECT 1 FROM raw_news"
-                    " WHERE status = 'PENDING' AND is_noise = 0"
-                    f" AND LOWER(COALESCE(quality_status, 'unverified')) IN ({quality_placeholders})"
-                    " LIMIT 1",
-                    _ALLOWED_QUALITY_STATUSES,
-                ).fetchone() is not None
-            except sqlite3.OperationalError:
-                return False
-            finally:
-                conn.close()
-
-        if not await loop.run_in_executor(None, _has_pending_eligible):
+        # Claim first.  No external market or macro request may begin until we
+        # own the exact rows whose timestamps will be checked against it.
+        batch = await loop.run_in_executor(None, _claim_pending_batch)
+        if not batch:
             idle_ticks += 1
             if idle_ticks % 30 == 1:
                 print(f"[{_now()}] [AI] idle ({idle_ticks}s)")
             continue
+        idle_ticks = 0  # reset heartbeat on activity
 
         # ==================================================================
-        # Phase 0 — Pull market snapshot (once per batch, before LLM calls)
+        # Phase 1.5 — Pull current context after the batch has been claimed
         # ==================================================================
 
-        market_context = ""
-        decision_context = "{}"  # 完整快照 JSON, 供 Hermes 复盘
+        snapshot_payload: Dict[str, Any] = {}
         macro_context_payload: Dict[str, Any] = {}
         now_ts = time.time()
         if now_ts - _last_snapshot_down_ts > _SNAPSHOT_COOLDOWN_S:
             try:
                 snap = await get_snapshot()
-                market_context = snap.get("summary", "")
-                decision_context = json.dumps(snap, ensure_ascii=False)
-                if market_context:
-                    print(f"\n  [SNAPSHOT] {snap['status'].upper()} | "
-                          f"BTC={snap['assets']['BTC'].get('price_str','?')} | "
-                          f"XAU={snap['assets']['XAU'].get('price_str','?')}")
-                if snap['status'] == 'down':
+                snapshot_payload = snap if isinstance(snap, dict) else {}
+                if snapshot_payload.get("summary"):
+                    raw_assets = snapshot_payload.get("assets")
+                    assets = raw_assets if isinstance(raw_assets, dict) else {}
+                    snapshot_status = str(
+                        snapshot_payload.get("status") or "unknown"
+                    ).upper()
+                    print(f"\n  [SNAPSHOT] {snapshot_status} | "
+                          f"BTC={(assets.get('BTC') or {}).get('price_str','?')} | "
+                          f"XAU={(assets.get('XAU') or {}).get('price_str','?')}")
+                if snapshot_payload.get("status") == "down":
                     _last_snapshot_down_ts = now_ts
             except Exception as e:
                 print(f"  [SNAPSHOT] 获取失败: {type(e).__name__}: {str(e)[:80]}")
-                market_context = ""
-                decision_context = json.dumps({"error": str(e), "status": "down"}, ensure_ascii=False)
+                snapshot_payload = {
+                    "error": str(e),
+                    "status": "down",
+                    "epoch_ms": int(now_ts * 1000),
+                }
                 _last_snapshot_down_ts = now_ts
         else:
             # 冷却中, 跳过本轮 snapshot 请求
             remaining = _SNAPSHOT_COOLDOWN_S - int(now_ts - _last_snapshot_down_ts)
-            market_context = ""
-            decision_context = json.dumps({"status": "down", "cooldown": True}, ensure_ascii=False)
+            snapshot_payload = {
+                "status": "down",
+                "cooldown": True,
+                "epoch_ms": int(now_ts * 1000),
+            }
             if int(now_ts) % 60 == 0:  # 每分钟只打一次
                 print(f"  [SNAPSHOT] 跳过 (冷却中, {remaining}s 后重试)")
 
@@ -1106,41 +1452,15 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
             try:
                 macro_pack = await loop.run_in_executor(None, macro_context.build_context)
                 macro_context_payload = macro_pack if isinstance(macro_pack, dict) else {}
-                # Keep the raw structured layers alongside the human-readable
-                # prompt block so every AI decision can be audited later.
-                decision_context = merge_into_context(decision_context, {}, macro_context_payload)
-                if macro_pack.get("summary"):
-                    market_context = (
-                        (market_context + "\n\n" + macro_pack["summary"]).strip()
-                        if market_context else macro_pack["summary"]
+                if macro_context_payload.get("summary"):
+                    print(
+                        f"  [MACRO] {macro_context_payload.get('status', 'unknown')} "
+                        f"{macro_context_payload.get('ok', 0)}/"
+                        f"{macro_context_payload.get('total', 0)}"
                     )
-                    print(f"  [MACRO] {macro_pack['status']} {macro_pack['ok']}/{macro_pack['total']}")
             except Exception as e:
                 print(f"  [MACRO] 拉取失败: {type(e).__name__}: {str(e)[:80]}")
                 macro_context_payload = {}
-
-        # ==================================================================
-        # Phase 0.5 — Build historical performance reference (once per batch)
-        # ==================================================================
-        performance_context = ""
-        try:
-            performance_context = await loop.run_in_executor(
-                None, _build_performance_context,
-            )
-            if performance_context:
-                print(f"  [PERF] 历史绩效已注入 prompt ({len(performance_context)} chars)")
-        except Exception as e:
-            print(f"  [PERF] 构建失败: {type(e).__name__}: {str(e)[:80]}")
-            performance_context = ""
-
-        batch = await loop.run_in_executor(None, _batch_claim)
-        if not batch:
-            idle_ticks += 1
-            if idle_ticks % 30 == 1:
-                print(f"[{_now()}] [AI] idle ({idle_ticks}s)")
-            continue
-
-        idle_ticks = 0  # reset heartbeat on activity
 
         def _load_strategy_context() -> str:
             """Snapshot the active strategy instructions for this AI batch."""
@@ -1178,13 +1498,51 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
         batch_ids = [r["id"] for r in batch]
         # Map news_id → content for downstream use (Feishu alerts etc.)
         content_map: Dict[int, str] = {}
-        timestamp_map: Dict[int, str] = {}
+        timestamp_map: Dict[int, Any] = {}
         for row in batch:
             c = row["content"]
             # Strip [hash:xxx] prefix for cleaner display
             c = re.sub(r'\[hash:[a-zA-Z0-9]+\]\s*', '', c)
             content_map[row["id"]] = c
-            timestamp_map[row["id"]] = row["timestamp"] or ""
+            # The canonical event epoch is authoritative.  A legacy textual
+            # timestamp is accepted only as a fallback and must include a date
+            # to pass evaluate_news_context_eligibility().
+            timestamp_map[row["id"]] = _authoritative_news_timestamp(row)
+
+        # Context is selected per news item, not per batch.  A mixed batch may
+        # legitimately contain one live row and one replayed historical row.
+        news_context_map: Dict[int, Dict[str, Any]] = {}
+        for row in batch:
+            nid = row["id"]
+            package = build_news_context_package(
+                timestamp_map[nid], snapshot_payload, macro_context_payload,
+            )
+            news_context_map[nid] = package
+            eligibility = package["eligibility"]
+            if not eligibility["market_context_eligible"]:
+                print(
+                    f"  [CONTEXT] news={nid} withheld: "
+                    f"{eligibility['market_context_reason']}"
+                )
+
+        batch_has_live_context = any(
+            select_current_learning_context(package["eligibility"])["eligible"]
+            for package in news_context_map.values()
+        )
+        performance_context = ""
+        if batch_has_live_context:
+            try:
+                performance_context = await loop.run_in_executor(
+                    None, _build_performance_context,
+                )
+                if performance_context:
+                    print(
+                        "  [PERF] 历史绩效已注入实时事件 prompt "
+                        f"({len(performance_context)} chars)"
+                    )
+            except Exception as e:
+                print(f"  [PERF] 构建失败: {type(e).__name__}: {str(e)[:80]}")
+                performance_context = ""
         print(
             f"\n[{_now()}] [AI] Claimed {len(batch)} items: {batch_ids}"
         )
@@ -1198,38 +1556,54 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
         hermes_skills: List[Dict[str, Any]] = []
         writing_map: Dict[int, str] = {}
         if HERMES_AGENT_ENABLED:
-            try:
-                hermes_agent.refresh_skills()
-                hermes_skills = hermes_agent.load_skills()
-                if hermes_skills:
-                    print(f"  [HERMES] 已结算技能 {len(hermes_skills)} 条回灌")
-            except Exception as e:
-                print(f"  [HERMES] 技能刷新失败: {type(e).__name__}: {str(e)[:80]}")
-                hermes_skills = []
+            if batch_has_live_context:
+                try:
+                    hermes_agent.refresh_skills()
+                    hermes_skills = hermes_agent.load_skills()
+                    if hermes_skills:
+                        print(f"  [HERMES] 已结算技能 {len(hermes_skills)} 条回灌")
+                except Exception as e:
+                    print(f"  [HERMES] 技能刷新失败: {type(e).__name__}: {str(e)[:80]}")
+                    hermes_skills = []
             for row in batch:
                 nid = row["id"]
+                row_market_context = news_context_map[nid]["market_context"]
+                row_learning = select_current_learning_context(
+                    news_context_map[nid]["eligibility"],
+                    performance_context=performance_context,
+                    hermes_skills=hermes_skills,
+                )
+                row_skills = row_learning["hermes_skills"]
                 try:
                     packet = hermes_agent.persist_news_writing(
                         nid,
                         content_map.get(nid, ""),
                         source=row["source"] if "source" in row.keys() else "",
-                        market_context=market_context,
+                        market_context=row_market_context,
                     )
                     writing_map[nid] = hermes_agent.render_writing_context(
-                        packet["desks"], hermes_skills
+                        packet["desks"], row_skills
                     )
                 except Exception as e:
                     print(f"  [HERMES] 写作沉淀失败 news={nid}: {type(e).__name__}: {str(e)[:80]}")
-                    writing_map[nid] = hermes_agent.build_prompt_context(
-                        content_map.get(nid, ""), market_context
+                    # Do not call build_prompt_context(): it reloads current
+                    # settled skills and would bypass the per-event time gate.
+                    writing_map[nid] = hermes_agent.render_writing_context(
+                        hermes_agent.write_desks(
+                            content_map.get(nid, ""), row_market_context,
+                        ),
+                        row_skills,
                     )
         tasks = [
             _process_single(
                 row,
                 batch_model,
                 loop,
-                market_context,
-                performance_context,
+                news_context_map[row["id"]]["market_context"],
+                select_current_learning_context(
+                    news_context_map[row["id"]]["eligibility"],
+                    performance_context=performance_context,
+                )["performance_context"],
                 writing_map.get(row["id"], ""),
                 strategy_context,
             )
@@ -1319,11 +1693,28 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                         )
                     category = res.get("market_category", "OTHER")
                     asset = res.get("target_asset", "NONE")
+                    news_context = news_context_map[nid]
+                    context_eligibility = news_context["eligibility"]
+                    market_context_eligible = bool(
+                        context_eligibility["market_context_eligible"]
+                    )
+                    target_context_gate = evaluate_target_market_context_eligibility(
+                        asset,
+                        snapshot_payload,
+                        context_eligibility,
+                    )
+                    target_market_context_eligible = bool(
+                        target_context_gate["target_market_context_eligible"]
+                    )
 
                     # ── Aggregation: bundle into parent if same asset+direction ──
                     parent_id: int | None = None
                     agg_key = ""
-                    if action in ("BUY", "SELL") and abs(score) >= _AGG_MIN_SCORE:
+                    if (
+                        target_market_context_eligible
+                        and action in ("BUY", "SELL")
+                        and abs(score) >= _AGG_MIN_SCORE
+                    ):
                         agg_key = f"{category}|{asset}|{action}"
                         if agg_key in parent_cache:
                             parent_id = parent_cache[agg_key]
@@ -1344,7 +1735,9 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                     evt_strength = features["event_strength"]
                     direct_cat = 1 if features["direct_catalyst"] else 0
                     tf_match = features["timeframe_match"]
-                    per_decision_context = merge_into_context(decision_context, features)
+                    audited_context = json.loads(news_context["decision_context"])
+                    audited_context.update(target_context_gate)
+                    per_decision_context = merge_into_context(audited_context, features)
 
                     cur = conn.execute(
                         """
@@ -1407,7 +1800,11 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                     decision_id = cur.lastrowid
                     primary_decision_ids[nid] = decision_id
 
-                    history_sample = evidence.collect_settled_sample(asset, connection=conn)
+                    history_sample = _settled_sample_for_context(
+                        asset,
+                        target_market_context_eligible=target_market_context_eligible,
+                        connection=conn,
+                    )
                     guard = decision_guard.evaluate_decision({
                         "sentiment_score": score,
                         "target_asset": asset,
@@ -1464,12 +1861,18 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                         news_quality_status,
                     )
                     gate_passed = (
-                        guard["confidence_detail"]["passed_gate"]
+                        target_market_context_eligible
+                        and guard["confidence_detail"]["passed_gate"]
                         and guard["action"] == action
                         and direction_consistent
                     )
                     if not quality_verified:
                         gate_reason = f"新闻质量未验证:{news_quality_status or 'unverified'}"
+                    elif not target_market_context_eligible:
+                        gate_reason = (
+                            "同品种盘面上下文不可用:"
+                            f"{target_context_gate['target_market_context_reason']}"
+                        )
                     else:
                         gate_reason = guard["verdict"] if gate_passed else (
                             "LLM 方向与分数符号矛盾" if not direction_consistent else guard["verdict"]
@@ -1503,6 +1906,7 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                         trading_settings["is_running"]
                         and active_run is not None
                         and quality_verified
+                        and target_market_context_eligible
                         and paper_trading.asset_allowed(asset, trading_settings)
                         and action in ("BUY", "SELL")
                         and asset not in ("", "NONE")
@@ -1606,19 +2010,11 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                 # Mark DONE for all news_ids that produced a primary model row
                 # ============================================================
                 for nid in done_news_ids:
-                    conn.execute(
-                        "UPDATE raw_news SET status = 'DONE'"
-                        " WHERE id = ? AND status = 'PROCESSING';",
-                        (nid,),
-                    )
+                    _mark_news_terminal_status(conn, nid, "DONE")
                 for f in failures:
                     nid = f["news_id"]
                     if nid > 0 and nid not in done_news_ids:
-                        conn.execute(
-                            "UPDATE raw_news SET status = 'FAILED'"
-                            " WHERE id = ? AND status = 'PROCESSING';",
-                            (nid,),
-                        )
+                        _mark_news_terminal_status(conn, nid, "FAILED")
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -1692,7 +2088,7 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
             print(f"  └─ Consensus: {consensus_str}")
             # Fire-and-forget Feishu comparison card (Chinese title)
             feishu_body = "\n\n".join(feishu_lines)
-            news_ts = timestamp_map.get(nid, "")
+            news_ts = str(timestamp_map.get(nid, "") or "")
             asyncio.create_task(
                 send_feishu_alert(
                     f"{display_title}\n\n**Consensus**: {consensus_str}",

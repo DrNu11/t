@@ -8,7 +8,8 @@ import {
 
 const FACTOR_LABELS: Record<string, string> = {
   news_sentiment: '新闻情绪', market_confirmation: '市场确认', trend: '趋势',
-  volatility: '波动适配', funding: '资金费率', cluster_heat: '聚合热度',
+  price_structure: '盘面结构', positioning: '持仓结构',
+  volatility: '波动强度（不定方向）', funding: '资金费率', cluster_heat: '聚合热度',
   historical_confidence: '历史置信',
 }
 

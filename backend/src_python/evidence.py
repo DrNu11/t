@@ -312,7 +312,7 @@ def chi_square_test(wins: int, total: int, scope: str = "asset") -> Dict[str, An
         return {
             "chi_square": 0.0, "p_value": 1.0, "sample_size": total, "wins": wins,
             "losses": losses, "significant": False, "sufficient_sample": False,
-            "scope": scope,
+            "scope": scope, "edge_direction": "insufficient",
             "note": (
                 f"{scope_label}已结算样本 {total} 条，不足 {MIN_SIGNIFICANCE_SAMPLE} 条，"
                 "历史胜率不参与显著性判定"
@@ -321,23 +321,43 @@ def chi_square_test(wins: int, total: int, scope: str = "asset") -> Dict[str, An
     expected = total / 2.0
     statistic = ((wins - expected) ** 2 + (losses - expected) ** 2) / expected
     p_value = math.erfc(math.sqrt(statistic / 2.0))
+    positive_edge = wins > losses
+    edge_direction = "positive" if positive_edge else "negative" if wins < losses else "neutral"
     return {
         "chi_square": round(statistic, 4),
         "p_value": round(p_value, 4),
         "sample_size": total,
         "wins": wins,
         "losses": losses,
-        "significant": p_value <= 0.05,
+        # The chi-square p-value is two-sided.  Only a statistically reliable
+        # win rate above 50% is positive evidence for reusing the strategy;
+        # a significant failure rate must never be interpreted as confidence.
+        "significant": positive_edge and p_value <= 0.05,
+        "edge_direction": edge_direction,
         "sufficient_sample": True,
         "scope": scope,
-        "note": f"{scope_label}样本 {total} 条胜 {wins} 条，χ²={statistic:.3f}，p={p_value:.4f}",
+        "note": (
+            f"{scope_label}样本 {total} 条胜 {wins} 条，"
+            f"双侧χ²={statistic:.3f}，p={p_value:.4f}，"
+            f"历史边际={edge_direction}"
+        ),
     }
 
 
 def significance_weight(test: Dict[str, Any]) -> float:
-    """Decision weight multiplier derived from the chi-square p-value."""
+    """Return a confidence multiplier for a *positive* historical edge."""
     if not test.get("sufficient_sample"):
         return 0.80
+    total = max(int(test.get("sample_size") or 0), 0)
+    wins = max(min(int(test.get("wins") or 0), total), 0)
+    if total and wins < total / 2.0:
+        # A strategy that loses more often than it wins is vetoed.  The
+        # two-sided p-value may be tiny, but that proves failure, not edge.
+        return 0.0
+    if total and wins == total / 2.0:
+        # No demonstrated edge: even a maximal raw factor score stays below
+        # the 55-point execution gate.
+        return 0.50
     p_value = float(test.get("p_value", 1.0))
     for threshold, weight in _SIGNIFICANCE_TIERS:
         if p_value <= threshold:
@@ -357,12 +377,17 @@ def detect_contradictions(factors: Dict[str, Dict[str, Any]]) -> List[Dict[str, 
     sentiment = _score(factors, "news_sentiment")
     confirmation = _score(factors, "market_confirmation")
     trend = _score(factors, "trend")
+    price_structure = _score(factors, "price_structure")
+    structure_is_primary = "price_structure" in factors
+    market_trend = price_structure if structure_is_primary else trend
+    trend_type = "sentiment_vs_price_structure" if structure_is_primary else "sentiment_vs_trend"
+    trend_label = "多周期盘面结构" if structure_is_primary else "趋势结构"
     funding = _score(factors, "funding")
     found: List[Dict[str, str]] = []
-    if sentiment > _DIRECTIONAL and trend < -_DIRECTIONAL:
-        found.append({"type": "sentiment_vs_trend", "detail": "新闻偏多但趋势结构向下，方向证据互相冲突"})
-    if sentiment < -_DIRECTIONAL and trend > _DIRECTIONAL:
-        found.append({"type": "sentiment_vs_trend", "detail": "新闻偏空但趋势结构向上，方向证据互相冲突"})
+    if sentiment > _DIRECTIONAL and market_trend < -_DIRECTIONAL:
+        found.append({"type": trend_type, "detail": f"新闻偏多但{trend_label}向下，方向证据互相冲突"})
+    if sentiment < -_DIRECTIONAL and market_trend > _DIRECTIONAL:
+        found.append({"type": trend_type, "detail": f"新闻偏空但{trend_label}向上，方向证据互相冲突"})
     if sentiment > _DIRECTIONAL and confirmation < -_DIRECTIONAL:
         found.append({"type": "sentiment_vs_confirmation", "detail": "新闻偏多但盘面未确认（价格反向），存在证伪风险"})
     if sentiment < -_DIRECTIONAL and confirmation > _DIRECTIONAL:

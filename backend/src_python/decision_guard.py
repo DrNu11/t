@@ -303,10 +303,10 @@ def normalize_ai_analysis(
 
 
 def _clamp(value: Any, low: float = -1.0, high: float = 1.0) -> float:
-    try:
-        return max(low, min(high, float(value)))
-    except (TypeError, ValueError):
+    number = _finite_number(value)
+    if number is None:
         return 0.0
+    return max(low, min(high, number))
 
 
 def _macro_rows(context: Dict[str, Any]) -> list[Dict[str, Any]]:
@@ -333,6 +333,56 @@ def _macro_value(rows: list[Dict[str, Any]], key: str, asset: str = "") -> Any:
     return None, {}
 
 
+def _price_structure_factor(asset_context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a directional factor only for an eligible, bounded aggregate.
+
+    ``market_structure.trend_score`` is the multi-timeframe engine's aggregate
+    output.  Older experimental snapshots may have placed the same aggregate
+    under ``aggregate``; accepting that shape keeps replay read-compatible
+    without relaxing the quality gate.
+    """
+
+    if (
+        asset_context.get("status") != "ok"
+        or asset_context.get("decision_eligible") is not True
+    ):
+        return None
+    structure = asset_context.get("market_structure")
+    if not isinstance(structure, dict):
+        return None
+    if structure.get("decision_eligible") is not True:
+        return None
+    status = str(structure.get("status") or "").strip().lower()
+    if status not in {"ok", "partial"}:
+        return None
+
+    aggregate = structure.get("aggregate")
+    aggregate = aggregate if isinstance(aggregate, dict) else structure
+    trend_score = _finite_number(aggregate.get("trend_score"))
+    if trend_score is None or not -1.0 <= trend_score <= 1.0:
+        return None
+
+    trend_label = str(
+        aggregate.get("trend") or structure.get("trend") or "unknown"
+    ).strip().lower()
+    alignment = str(
+        aggregate.get("alignment") or structure.get("alignment") or "unknown"
+    ).strip().lower()
+    alignment_score = _finite_number(
+        aggregate.get("alignment_score", structure.get("alignment_score"))
+    )
+    alignment_note = alignment
+    if alignment_score is not None and 0.0 <= alignment_score <= 1.0:
+        alignment_note = f"{alignment} ({alignment_score:.2f})"
+    return {
+        "score": trend_score,
+        "explanation": (
+            f"价格结构趋势={trend_label}; "
+            f"多周期一致性={alignment_note}; 状态={status}"
+        ),
+    }
+
+
 def evaluate_decision(row: Dict[str, Any]) -> Dict[str, Any]:
     try:
         context = json.loads(row.get("decision_context") or "{}")
@@ -341,27 +391,47 @@ def evaluate_decision(row: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(context, dict):
         context = {}
     assets = context.get("assets") if isinstance(context.get("assets"), dict) else {}
-    asset = str(row.get("target_asset") or "BTC").upper()
-    asset_context = assets.get(asset) or assets.get("BTC") or {}
+    asset = str(row.get("target_asset") or "").upper()
+    # Never borrow BTC's tape for another or an unspecified asset.  Missing
+    # same-asset data must remain unavailable rather than become false proof.
+    asset_context = assets.get(asset, {}) if asset else {}
     if not isinstance(asset_context, dict):
         asset_context = {}
     market_eligible = (
         asset_context.get("decision_eligible") is True
         and asset_context.get("status") == "ok"
     )
+    has_structure_contract = isinstance(asset_context.get("market_structure"), dict)
+    if "stats_7d_decision_eligible" in asset_context:
+        stats_eligible = market_eligible and asset_context.get("stats_7d_decision_eligible") is True
+    else:
+        # Pre-structure snapshots remain replay-compatible. New structured
+        # snapshots must carry an explicit field-level approval.
+        stats_eligible = market_eligible and not has_structure_contract
     stats = (
         asset_context.get("stats_7d")
-        if market_eligible and isinstance(asset_context.get("stats_7d"), dict)
+        if stats_eligible and isinstance(asset_context.get("stats_7d"), dict)
         else {}
     )
+    if "change_24h_decision_eligible" in asset_context:
+        confirmation_eligible = (
+            market_eligible and asset_context.get("change_24h_decision_eligible") is True
+        )
+    else:
+        confirmation_eligible = market_eligible and not has_structure_contract
     confirmation_text = str(row.get("market_confirmation") or "unknown").lower()
     confirmation = 0.0
-    if market_eligible:
+    if confirmation_eligible:
         confirmation = 1.0 if confirmation_text in {"confirmed", "strong", "yes", "positive"} else (-1.0 if confirmation_text in {"rejected", "opposite", "negative"} else _clamp(asset_context.get("change_24h_pct", 0) / 5))
     trend_text = str(stats.get("trend", "unknown")).lower()
     trend = 1.0 if "strong bull" in trend_text else 0.6 if "bull" in trend_text else -1.0 if "strong bear" in trend_text else -0.6 if "bear" in trend_text else 0.0
-    atr_pct = _clamp(stats.get("atr_pct", 0), 0, 100)
-    funding_pct = _clamp(asset_context.get("funding_rate_pct", 0), -1, 1) if market_eligible else 0.0
+    atr_value = _finite_number(stats.get("atr_pct"))
+    atr_pct = max(0.0, min(100.0, atr_value)) if atr_value is not None else 0.0
+    if "funding_decision_eligible" in asset_context:
+        funding_eligible = market_eligible and asset_context.get("funding_decision_eligible") is True
+    else:
+        funding_eligible = market_eligible and not has_structure_contract
+    funding_pct = _clamp(asset_context.get("funding_rate_pct", 0), -1, 1) if funding_eligible else 0.0
     cluster = max(1, int(row.get("cluster_size") or 1))
     sample = row.get("history_sample") if isinstance(row.get("history_sample"), dict) else {}
     if sample:
@@ -377,16 +447,68 @@ def evaluate_decision(row: Dict[str, Any]) -> Dict[str, Any]:
         "lane": "同赛道自动补齐",
         "market": "全市场自动补齐",
     }.get(scope, "同品种")
+    price_structure = _price_structure_factor(asset_context)
+    legacy_trend_score = trend if price_structure is None else 0.0
+    legacy_trend_explanation = (
+        f"快照趋势={stats.get('trend', 'Unknown')}"
+        if stats_eligible and price_structure is None
+        else "由合格多周期盘面结构替代，避免重复计权"
+        if price_structure is not None
+        else "旧趋势字段质量门禁未通过"
+    )
     factors = {
         "news_sentiment": {"score": _clamp(row.get("sentiment_score")), "explanation": "AI 新闻情绪分"},
-        "market_confirmation": {"score": confirmation, "explanation": f"市场确认={confirmation_text}" if market_eligible else "行情质量门禁未通过"},
-        "trend": {"score": trend, "explanation": f"快照趋势={stats.get('trend', 'Unknown')}" if market_eligible else "行情质量门禁未通过"},
-        "volatility": {"score": _clamp(1 - atr_pct / 10) if market_eligible else 0.0, "explanation": f"ATR={atr_pct:.3f}%" if market_eligible else "行情质量门禁未通过"},
-        "funding": {"score": _clamp(-funding_pct / 0.1), "explanation": f"资金费率={funding_pct:.4f}%" if market_eligible else "行情质量门禁未通过"},
-        "cluster_heat": {"score": _clamp((cluster - 1) / 4), "explanation": f"新闻聚合数量={cluster}"},
-        "historical_confidence": {"score": _clamp(((wins / settled) - 0.5) * 2) if settled else 0.0, "explanation": f"{scope_note}已结算 {settled} 条，胜 {wins} 条"},
+        "market_confirmation": {"score": confirmation, "explanation": f"市场确认={confirmation_text}" if confirmation_eligible else "24h行情字段质量门禁未通过"},
+        "trend": {"score": legacy_trend_score, "explanation": legacy_trend_explanation},
+        # ATR describes risk/position sizing, not direction.  Keep it visible
+        # for audit compatibility, but never let high/low volatility vote BUY
+        # or SELL.
+        "volatility": {
+            "score": 0.0,
+            "explanation": (
+                f"ATR={atr_pct:.3f}% (仅风险观测，不参与方向评分)"
+                if market_eligible else "行情质量门禁未通过"
+            ),
+        },
+        "funding": {"score": _clamp(-funding_pct / 0.1), "explanation": f"资金费率={funding_pct:.4f}%" if funding_eligible else "资金费率字段质量门禁未通过"},
+        # Cluster size is corroboration density, not a bullish vote.  Keep the
+        # observation for confidence/audit consumers while removing it from
+        # the signed direction score.
+        "cluster_heat": {
+            "score": 0.0,
+            "observed_count": cluster,
+            "role": "confidence_only",
+            "explanation": f"新闻聚合数量={cluster} (仅置信观测，不参与方向评分)",
+        },
+        # Historical win rate already enters evidence significance/confidence
+        # through ``wins``/``settled`` below.  Treating it as a positive signed
+        # factor would systematically cancel valid bearish conclusions.
+        "historical_confidence": {
+            "score": 0.0,
+            "observed_win_rate": round(wins / settled, 6) if settled else None,
+            "sample_size": settled,
+            "role": "confidence_only",
+            "explanation": (
+                f"{scope_note}已结算 {settled} 条，胜 {wins} 条 "
+                "(仅置信/显著性观测，不参与方向评分)"
+            ),
+        },
     }
-    weights = {"news_sentiment": 0.30, "market_confirmation": 0.20, "trend": 0.15, "volatility": 0.10, "funding": 0.10, "cluster_heat": 0.10, "historical_confidence": 0.05}
+    weights = {
+        "news_sentiment": 0.30,
+        "market_confirmation": 0.20,
+        "trend": 0.0 if price_structure is not None else 0.15,
+        "volatility": 0.0,
+        "funding": 0.10,
+        "cluster_heat": 0.0,
+        "historical_confidence": 0.0,
+    }
+
+    if price_structure is not None:
+        factors["price_structure"] = price_structure
+        # After normalisation this remains roughly 10–15% in common factor
+        # sets: meaningful corroboration, never a standalone trigger.
+        weights["price_structure"] = 0.10
 
     # New structured fields are optional.  They are only added when the
     # worker has persisted them, preserving the old factor shape for legacy
@@ -411,21 +533,22 @@ def evaluate_decision(row: Dict[str, Any]) -> Dict[str, Any]:
 
     macro_rows = _macro_rows(context)
     if macro_rows:
-        funding_value, _ = _macro_value(macro_rows, "funding", asset)
         ratio_value, _ = _macro_value(macro_rows, "ls_ratio", asset)
         fng_value, fng_payload = _macro_value(macro_rows, "crypto_fng")
         fed_value, fed_payload = _macro_value(macro_rows, "next_move_bp")
         flow_value, _ = _macro_value(macro_rows, "taker_buy_sell", asset)
 
-        structure_parts = []
-        if funding_value is not None:
-            structure_parts.append(-_clamp(float(funding_value) / 0.1))
-        if ratio_value is not None:
-            structure_parts.append(-_clamp((float(ratio_value) - 1.0) / 1.5))
-        if structure_parts:
-            structure_score = sum(structure_parts) / len(structure_parts)
-            factors["structure"] = {"score": _clamp(structure_score), "explanation": "资金费率/多空比盘面结构"}
-            weights["structure"] = 0.08
+        # Funding already has a dedicated same-asset factor above.  Reusing
+        # macro funding here would silently double its directional weight.
+        # Long/short ratio is a distinct positioning signal and stays
+        # optional when the provider has no eligible observation.
+        ratio_number = _finite_number(ratio_value)
+        if ratio_number is not None and ratio_number >= 0.0:
+            factors["positioning"] = {
+                "score": -_clamp((ratio_number - 1.0) / 1.5),
+                "explanation": f"多空持仓比={ratio_number:.3f}",
+            }
+            weights["positioning"] = 0.08
 
         if fng_value is not None:
             factors["sentiment_regime"] = {
@@ -456,6 +579,15 @@ def evaluate_decision(row: Dict[str, Any]) -> Dict[str, Any]:
     # Keep the final score on the same scale after optional factors are added.
     weight_total = sum(weights.values()) or 1.0
     weights = {name: value / weight_total for name, value in weights.items()}
+    # JSON consumers legitimately assert this probability-like contract
+    # exactly.  Close binary floating-point residue into the final positive
+    # weight while leaving observation-only zero weights untouched.
+    positive_names = [name for name, value in weights.items() if value > 0.0]
+    if positive_names:
+        closing_name = positive_names[-1]
+        weights[closing_name] = 1.0 - sum(
+            value for name, value in weights.items() if name != closing_name
+        )
     final_score = sum(factors[name]["score"] * weight for name, weight in weights.items())
     raw_action = "BUY" if final_score >= 0.3 else "SELL" if final_score <= -0.3 else "HOLD"
     validation = evidence.evaluate(factors, final_score, raw_action, wins, settled, scope=scope)
