@@ -529,7 +529,11 @@ def _indicator_bundle(candles: Sequence[_Candle]) -> Tuple[Dict[str, Any], Dict[
 
     rsi_native = _rsi(closes)
     rsi14_ta = _ta_last(getattr(_talib, "RSI", None), closes, timeperiod=14)
-    rsi14 = _prefer(rsi14_ta, rsi_native)
+    # TA-Lib returns 0 for a completely flat series, while the canonical RSI
+    # interpretation for no gains and no losses is neutral (50). Preserve
+    # that neutral boundary without treating the native implementation as a
+    # general production fallback.
+    rsi14 = rsi_native if rsi_native == 50.0 else _prefer(rsi14_ta, rsi_native)
     adx14 = _ta_last(
         getattr(_talib, "ADX", None), highs, lows, closes, timeperiod=14,
     )
