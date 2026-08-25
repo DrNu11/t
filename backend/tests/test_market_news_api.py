@@ -148,6 +148,31 @@ def test_external_news_limit_counts_inserts_not_duplicate_attempts(temp_db, monk
     assert rows[-1]["source"] == "东方财富"
 
 
+def test_external_news_filter_verdict_does_not_leave_noise_pending(temp_db, monkeypatch):
+    monkeypatch.setattr(api_server.config, "NEWS_CANDIDATE_DISPLAY_ENABLED", True)
+    monkeypatch.setattr(
+        api_server,
+        "evaluate_news",
+        lambda *_args: {"is_noise": 1, "relevance_score": 0.0},
+    )
+
+    inserted = api_server._ingest_external_news_sync([{
+        "id": "noise-1",
+        "title": "抽奖空投活动公告",
+        "source": "东方财富",
+        "published_at": "2026-08-25T12:02:00+08:00",
+    }])
+
+    assert inserted == 1
+    row = temp_db.execute(
+        "SELECT status, is_noise FROM raw_news WHERE content LIKE '%抽奖空投活动公告%'"
+    ).fetchone()
+    assert row["is_noise"] == 1
+    # raw_news keeps the existing terminal status enum; is_noise is the
+    # audit flag that excludes this row from the AI/trading queue.
+    assert row["status"] == "DONE"
+
+
 def test_external_news_releases_writer_lock_before_ai_filter(temp_db, monkeypatch):
     monkeypatch.setattr(api_server.config, "NEWS_CANDIDATE_DISPLAY_ENABLED", True)
     lock_checks = []

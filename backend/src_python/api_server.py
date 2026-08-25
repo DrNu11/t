@@ -1556,7 +1556,7 @@ def _ingest_external_news_sync(
                 source=source,
                 content=content[:1000],
                 timestamp=timestamp,
-                status="PENDING",
+                status=("DONE" if int(filtered["is_noise"]) else "PENDING"),
                 is_noise=int(filtered["is_noise"]),
                 relevance_score=float(filtered["relevance_score"]),
                 ts=ts_epoch,
@@ -1568,7 +1568,7 @@ def _ingest_external_news_sync(
                     news_id,
                     source=source,
                     is_noise=int(filtered["is_noise"]),
-                    status="PENDING",
+                    status=("DONE" if int(filtered["is_noise"]) else "PENDING"),
                     ts=ts_epoch,
                     connection=conn,
                 )

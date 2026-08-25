@@ -404,7 +404,7 @@ async def _tree_news_handler(reader, writer) -> None:
                     source=source_label,
                     content=cleaned,
                     timestamp=ts,
-                    status="PENDING",
+                    status=("DONE" if int(f_result["is_noise"]) else "PENDING"),
                     is_noise=int(f_result["is_noise"]),
                     relevance_score=float(f_result["relevance_score"]),
                     ts=ts_epoch,
@@ -415,7 +415,7 @@ async def _tree_news_handler(reader, writer) -> None:
                     news_id,
                     source=source_label,
                     is_noise=int(f_result["is_noise"]),
-                    status="PENDING",
+                    status=("DONE" if int(f_result["is_noise"]) else "PENDING"),
                     ts=ts_epoch,
                     connection=conn,
                 )
