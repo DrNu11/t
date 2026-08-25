@@ -140,8 +140,34 @@ export function ReplayStats({ refreshKey }: { refreshKey: number }) {
               </div>
             ))}
           </div>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            {(reflection.failure_diagnostics ?? []).map((diagnostic) => {
+              const active = diagnostic.assessment === 'observed' || diagnostic.assessment === 'candidate'
+              const notAssessable = diagnostic.assessment === 'not_assessable'
+              return (
+                <div
+                  key={diagnostic.key}
+                  title={diagnostic.evidence.join('\n')}
+                  className={`rounded border px-2 py-1.5 font-mono text-[10px] ${active ? 'border-short/30 bg-short/5' : 'border-border bg-secondary/20'}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-foreground">{diagnostic.label}</span>
+                    <span className={active ? 'text-short' : 'text-muted-foreground'}>
+                      {notAssessable ? '不可直接验证' : `${diagnostic.count} 笔`}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 truncate text-muted-foreground">
+                    {diagnostic.evidence[0] ?? (diagnostic.assessment === 'not_observed' ? '当前样本未观察到' : '样本不足')}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+          <div className="mt-2 font-mono text-[10px] text-muted-foreground">
+            可观测证据覆盖亏损样本 {(reflection.observable_loss_coverage * 100).toFixed(0)}%；未知原因保留为未知，不由 AI 倒推。
+          </div>
           <ul className="mt-2 list-disc space-y-1 pl-4 text-[10px] text-muted-foreground">
-            {reflection.recommendations.slice(0, 3).map((item) => <li key={item}>{item}</li>)}
+            {reflection.recommendations.slice(0, 5).map((item) => <li key={item}>{item}</li>)}
           </ul>
         </div>
       )}

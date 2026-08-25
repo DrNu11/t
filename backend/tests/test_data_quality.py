@@ -26,6 +26,21 @@ def test_direct_exchange_is_verified_and_unknown_source_is_blocked():
     assert blocked.reason == "source_not_allowlisted"
 
 
+def test_tokenized_gold_proxies_are_retained_but_not_decision_eligible():
+    for source in ("binance_paxg", "coingecko_paxg"):
+        decision = data_quality.assess(
+            source=source,
+            kind="market",
+            event_id=f"{source}:1",
+            published_at=1_700_000_000,
+            observed_at=1_700_000_001,
+            payload={"price": 2400.0, "symbol": "PAXGUSDT"},
+        )
+        assert decision.accepted is True
+        assert decision.decision_eligible is False
+        assert decision.quality_status == "candidate"
+
+
 def test_candidate_requires_explicit_source_promotion(monkeypatch):
     payload = {"title": "美联储公布声明"}
     candidate = data_quality.assess(

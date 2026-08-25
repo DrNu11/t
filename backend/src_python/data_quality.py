@@ -62,8 +62,17 @@ POLICIES: tuple[SourcePolicy, ...] = (
     SourcePolicy("binance", "Binance direct", "A", ("market", "structure"), mode="verified",
                  reference_url="https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams",
                  notes="exchange-native stream; validate symbol/clock and sequence gaps"),
-    SourcePolicy("okx", "OKX direct", "A", ("market", "structure"), mode="verified",
+    SourcePolicy("okx", "OKX direct", "A", ("market", "structure", "flow"), mode="verified",
                  reference_url="https://www.okx.com/docs-v5/en/", notes="exchange-native market feed"),
+    SourcePolicy("oanda", "OANDA broker quote", "B", ("market",), mode="candidate",
+                 reference_url="https://developer.oanda.com/rest-live-v20/pricing-ep/",
+                 notes="licensed broker quote; keep distinct from exchange/futures settlement"),
+    SourcePolicy("binance_paxg", "Binance PAXG/USDT", "B", ("market",), mode="candidate",
+                 reference_url="https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints",
+                 notes="free exchange-native tokenized-gold proxy; never relabel as XAU/USD"),
+    SourcePolicy("coingecko_paxg", "CoinGecko PAXG", "C", ("market",), mode="candidate",
+                 reference_url="https://docs.coingecko.com/reference/simple-price",
+                 notes="aggregated tokenized-gold cross-check; rate-limited and non-canonical"),
     SourcePolicy("bitget", "Bitget direct", "A", ("market", "structure"), mode="verified",
                  reference_url="https://www.bitget.com/api-doc", notes="exchange-native market feed"),
     SourcePolicy("gateio", "Gate.io direct", "A", ("market", "structure"), mode="verified",
@@ -85,6 +94,9 @@ POLICIES: tuple[SourcePolicy, ...] = (
                  reference_url="https://www.census.gov/data/developers/data-sets.html", notes="official trade/retail/housing data"),
     SourcePolicy("ism", "Institute for Supply Management", "A", ("macro", "calendar"), mode="verified",
                  reference_url="https://www.ismworld.org/supply-management-news-and-reports/reports/", notes="official PMI publisher; terms apply"),
+    SourcePolicy("trading_economics", "Trading Economics", "B", ("macro", "calendar"), mode="candidate",
+                 reference_url="https://docs.tradingeconomics.com/",
+                 notes="licensed calendar aggregator; corroborate with the original publisher"),
     SourcePolicy("jin10", "金十（授权 Open Data）", "B", ("news", "market", "macro", "calendar"), mode="candidate",
                  reference_url="https://open-data-api.jin10.com/", notes="requires an authorised secret-key and contract review"),
     # Existing feeds are retained as candidate observations for continuity,
@@ -205,6 +217,14 @@ def canonical_source(source: str) -> str:
         return "binance_fapi"
     if "sosovalue" in value:
         return "sosovalue"
+    if "oanda" in value:
+        return "oanda"
+    if "coingecko" in value and ("paxg" in value or "pax-gold" in value):
+        return "coingecko_paxg"
+    if "binance" in value and "paxg" in value:
+        return "binance_paxg"
+    if "tradingeconomics" in value or "trading_economics" in value:
+        return "trading_economics"
     if value.startswith("derived"):
         return "derived"
     if value in {"binance", "binance direct", "binance_futures"}:

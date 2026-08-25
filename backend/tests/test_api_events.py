@@ -94,6 +94,29 @@ def test_event_rows_include_unanalyzed_and_latest_decision(temp_db, monkeypatch)
     assert pending["reason"] == "待 AI 分析"
 
 
+def test_event_rows_compact_omits_large_decision_context(temp_db, monkeypatch):
+    temp_db.execute(
+        "INSERT INTO raw_news (source, content, timestamp, status, is_noise) "
+        "VALUES ('source', 'news', '2026-08-05 10:00:00', 'DONE', 0)"
+    )
+    temp_db.execute(
+        """
+        INSERT INTO ai_decisions
+            (news_id, sentiment_score, suggested_action, reasoning, decision_context)
+        VALUES (1, 0.0, 'HOLD', 'reason', ?)
+        """,
+        (json.dumps({"snapshot": "x" * 10000}),),
+    )
+    temp_db.commit()
+    monkeypatch.setattr(api_server, "DB_PATH", temp_db.execute("PRAGMA database_list").fetchone()[2])
+
+    full = asyncio.run(api_server._fetch_event_rows(limit=1))
+    compact = asyncio.run(api_server._fetch_event_rows(limit=1, compact=True))
+
+    assert len(full[0]["decision_context"]) > 10000
+    assert compact[0]["decision_context"] == "{}"
+
+
 def test_today_events_counts_shanghai_day(temp_db, monkeypatch):
     today = api_server.datetime.now(api_server.TZ_SHANGHAI).strftime("%Y-%m-%d")
     temp_db.executemany(
@@ -149,6 +172,40 @@ def test_ingest_external_news_survives_missing_ts(tmp_path, monkeypatch):
     check = sqlite3.connect(str(db_file))
     assert check.execute("SELECT COUNT(*) FROM raw_news").fetchone()[0] == 1
     check.close()
+
+
+def test_candidate_news_can_be_displayed_without_entering_ai_gate(temp_db, monkeypatch):
+    monkeypatch.setattr(api_server.config, "NEWS_CANDIDATE_DISPLAY_ENABLED", True)
+    item = {
+        "id": "candidate-live-1",
+        "title": "TechFlow 实时候选快讯",
+        "summary": "候选源仅用于实时展示",
+        "source": "TechFlow 深潮",
+        "published_at": "2026-08-24T10:00:00+08:00",
+    }
+    assert api_server._ingest_external_news_sync([item]) == 1
+    row = temp_db.execute(
+        "SELECT quality_status, status FROM raw_news ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert tuple(row) == ("candidate", "PENDING")
+
+
+def test_candidate_news_is_backfilled_after_display_gate_opens(temp_db, monkeypatch):
+    item = {
+        "id": "candidate-backfill-1",
+        "title": "候选快讯回填测试",
+        "summary": "先审计，后展示",
+        "source": "TechFlow 深潮",
+        "published_at": "2026-08-24T10:01:00+08:00",
+    }
+    monkeypatch.setattr(api_server.config, "NEWS_CANDIDATE_DISPLAY_ENABLED", False)
+    assert api_server._ingest_external_news_sync([item]) == 0
+    monkeypatch.setattr(api_server.config, "NEWS_CANDIDATE_DISPLAY_ENABLED", True)
+    assert api_server._ingest_external_news_sync([item]) == 1
+    row = temp_db.execute(
+        "SELECT quality_status, status FROM raw_news ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert tuple(row) == ("candidate", "PENDING")
 
 
 def test_ingest_external_news_preserves_provider_timestamp(temp_db, monkeypatch):

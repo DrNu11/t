@@ -77,7 +77,8 @@ def test_paper_trading_defaults(temp_db):
 def test_raw_news_columns(temp_db):
     cols = {r[1] for r in temp_db.execute("PRAGMA table_info(raw_news)")}
     assert {"is_noise", "relevance_score", "status", "content", "ts",
-            "quality_status", "quality_reason"} <= cols
+            "quality_status", "quality_reason", "ai_retry_count",
+            "ai_next_retry_at", "ai_last_error"} <= cols
 
 
 def test_insert_raw_news_works_without_ts_column():
@@ -128,7 +129,7 @@ def test_migrate_backfills_old_schema():
     cols = {r[1] for r in conn.execute("PRAGMA table_info(ai_decisions)")}
     assert "mfe_pct" in cols and "vip_tag" in cols and "parent_id" in cols
     rcols = {r[1] for r in conn.execute("PRAGMA table_info(raw_news)")}
-    assert "is_noise" in rcols
+    assert {"is_noise", "ai_retry_count", "ai_next_retry_at", "ai_last_error"} <= rcols
     conn.close()
 
 

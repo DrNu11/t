@@ -16,6 +16,8 @@ import ssl
 import time
 import urllib.request
 
+import config
+
 from config import (
     DOUBAO_API_KEY,
     DOUBAO_BASE_URL,
@@ -387,7 +389,10 @@ async def _tree_news_handler(reader, writer) -> None:
                     metadata={"transport": "tree_news_webhook"},
                     quarantine=not quality.decision_eligible,
                 )
-                if not quality.accepted or not quality.decision_eligible:
+                if not quality.accepted or (
+                    not quality.decision_eligible
+                    and not config.NEWS_CANDIDATE_DISPLAY_ENABLED
+                ):
                     conn.commit()
                     return None
                 ts = _ts()

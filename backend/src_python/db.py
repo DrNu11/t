@@ -89,6 +89,9 @@ _CREATE_RAW_NEWS = """
         status          TEXT    NOT NULL DEFAULT 'PENDING'
             CHECK (status IN ('PENDING', 'PROCESSING', 'DONE', 'FAILED')),
         processing_started_at INTEGER,
+        ai_retry_count  INTEGER NOT NULL DEFAULT 0,
+        ai_next_retry_at INTEGER,
+        ai_last_error   TEXT    NOT NULL DEFAULT '',
         is_noise        INTEGER NOT NULL DEFAULT 0,
         relevance_score REAL    NOT NULL DEFAULT 0.0,
         quality_status  TEXT    NOT NULL DEFAULT 'unverified',
@@ -170,6 +173,9 @@ _RAW_NEWS_COLUMNS: List[Tuple[str, str]] = [
     ("relevance_score", "REAL    NOT NULL DEFAULT 0.0"),
     ("ts",              "INTEGER"),
     ("processing_started_at", "INTEGER"),
+    ("ai_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("ai_next_retry_at", "INTEGER"),
+    ("ai_last_error", "TEXT NOT NULL DEFAULT ''"),
     ("quality_status",  "TEXT NOT NULL DEFAULT 'unverified'"),
     ("quality_reason",  "TEXT NOT NULL DEFAULT ''"),
 ]
@@ -237,6 +243,7 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ai_decisions_status ON ai_decisions(status);",
     "CREATE INDEX IF NOT EXISTS idx_raw_news_status ON raw_news(status);",
     "CREATE INDEX IF NOT EXISTS idx_raw_news_processing_lease ON raw_news(status, processing_started_at);",
+    "CREATE INDEX IF NOT EXISTS idx_raw_news_ai_retry ON raw_news(status, ai_next_retry_at);",
     "CREATE INDEX IF NOT EXISTS idx_ai_parent ON ai_decisions(parent_id);",
     "CREATE INDEX IF NOT EXISTS idx_ai_agg_key ON ai_decisions(aggregation_key);",
     "CREATE INDEX IF NOT EXISTS idx_market_ticks_symbol_ts ON market_ticks(symbol, ts);",

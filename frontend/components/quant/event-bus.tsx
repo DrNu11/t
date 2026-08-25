@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, Download, Radio, Wifi, WifiOff } from 'lucide-react'
-import type { ApiEvent, MarketCategory } from '@/lib/quant-data'
+import type { ApiEvent, MarketCategory, Signal } from '@/lib/quant-data'
 import { computeMFE, computeMAE, computeMFETime, computeMAETime, getImpactThreshold, calculateHeatScore } from '@/lib/signal-utils'
 import { SignalBadge } from './signal-badge'
 import { API_BASE } from '@/lib/api'
 
 const SSE_URL = `${API_BASE}/events/stream`
 const MAX_EVENTS = 10000
+const INITIAL_HISTORY_LIMIT = 200
 
 const EVENT_CATEGORIES: { key: MarketCategory; label: string }[] = [
   { key: 'ALL', label: '全部' },
@@ -81,6 +82,17 @@ function AnalysisStatusBadge({ status }: { status: ApiEvent['analysis_status'] }
   return (
     <span className={'inline-flex items-center rounded border px-1.5 py-0 text-[9px] font-bold tracking-wider ' + color}>
       {labels[status] ?? '待 AI 分析'}
+    </span>
+  )
+}
+
+function ObservationBadge({ signal }: { signal: Signal }) {
+  return (
+    <span
+      className="inline-flex items-center rounded border border-hold/50 bg-hold/10 px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-wider text-hold"
+      title="来源尚未通过质量验证，仅供 AI 观察，不构成交易信号"
+    >
+      AI 观察 {signal}
     </span>
   )
 }
@@ -159,11 +171,16 @@ export function EventBus({ activeMarket = 'ALL', onMarketChange, onEventsUpdated
 
   useEffect(() => {
     mountedRef.current = true
+    let historyRetryTimer: ReturnType<typeof setTimeout> | null = null
     async function loadHistory() {
+      let loaded = false
       try {
-        const res = await fetch(`${API_BASE}/events?limit=${MAX_EVENTS}`)
+        const res = await fetch(`${API_BASE}/events?limit=${INITIAL_HISTORY_LIMIT}&compact=true`, {
+          cache: 'no-store',
+        })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data: ApiEvent[] = await res.json()
+        if (data.length === 0) throw new Error('empty history')
         if (mountedRef.current) {
           setEvents((current) => {
             const liveIds = new Set(current.map((event) => event.news_id))
@@ -172,10 +189,18 @@ export function EventBus({ activeMarket = 'ALL', onMarketChange, onEventsUpdated
               .slice(0, MAX_EVENTS)
           })
           setError(null)
+          loaded = true
         }
       } catch (err) {
         if (mountedRef.current) {
           setError(err instanceof Error ? err.message : 'fetch failed')
+        }
+      } finally {
+        if (mountedRef.current && !loaded && historyRetryTimer === null) {
+          historyRetryTimer = setTimeout(() => {
+            historyRetryTimer = null
+            void loadHistory()
+          }, 5_000)
         }
       }
     }
@@ -196,12 +221,13 @@ export function EventBus({ activeMarket = 'ALL', onMarketChange, onEventsUpdated
     const countTimer = setInterval(() => void loadCounts(), 15_000)
     const es = new EventSource(SSE_URL)
     esRef.current = es
-    es.onopen = () => { if (mountedRef.current) { setConnected(true); setError(null) } }
+    es.onopen = () => { if (mountedRef.current) setConnected(true) }
     es.onmessage = handleSseMessage
     es.onerror = () => { if (mountedRef.current) setConnected(false) }
     return () => {
       mountedRef.current = false
       clearInterval(countTimer)
+      if (historyRetryTimer !== null) clearTimeout(historyRetryTimer)
       es.close()
       esRef.current = null
     }
@@ -282,6 +308,7 @@ export function EventBus({ activeMarket = 'ALL', onMarketChange, onEventsUpdated
         {filteredEvents.map((item) => {
           const open = expandedIds.has(item.id)
           const isAnalyzed = item.analysis_status === 'DONE' && item.decision_id !== null
+          const qualityVerified = (item.quality_status || '').toLowerCase() === 'verified'
           const hasPath = isAnalyzed && !!(item.reasoning_path && item.reasoning_path.trim())
           const hasTracking = !!(item.entry_price && item.entry_price > 0)
           const hasDoubao = !!(item.doubao_action && item.doubao_action !== 'HOLD')
@@ -301,7 +328,11 @@ export function EventBus({ activeMarket = 'ALL', onMarketChange, onEventsUpdated
                     </span>
                   )}
                   <div className="ml-auto flex shrink-0 items-center gap-1">
-                    {isAnalyzed ? <SignalBadge signal={item.action} /> : <AnalysisStatusBadge status={item.analysis_status} />}
+                    {isAnalyzed
+                      ? (qualityVerified
+                        ? <SignalBadge signal={item.action} />
+                        : <ObservationBadge signal={item.action} />)
+                      : <AnalysisStatusBadge status={item.analysis_status} />}
                     {isAnalyzed && item.vip_tag && <VipBadge tag={item.vip_tag} />}
                     {hasDoubao && <DoubaoBadge action={item.doubao_action} reason={item.doubao_reasoning} />}
                     {item.settled === 1 && item.is_correct && <VerdictBadge verdict={item.is_correct} />}

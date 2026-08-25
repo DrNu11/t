@@ -53,6 +53,11 @@ import news_sources
 import quick_sim
 import backtest
 from providers.jin10 import get_jin10_provider
+from providers.binance_paxg import get_binance_paxg_provider
+from providers.coingecko_paxg import get_coingecko_paxg_provider
+from providers.oanda import get_oanda_provider
+from providers.official_macro import get_official_macro_calendar_provider
+from providers.trading_economics import get_trading_economics_provider
 from realtime_filter import evaluate_news
 from engine.forward import classify_directional_outcome
 from engine.prices import _fetch_eastmoney_xau, _fetch_sina_xau, _get_current_price
@@ -188,8 +193,14 @@ def _row_to_event(row) -> Dict[str, Any]:
     analysis_status = _normalize_analysis_status(_safe(row, "analysis_status"), decision_id is not None)
     reason = _safe(row, "reason") or ""
     reason = re.sub(r"^\[.*?\]\s*", "", reason)
+    quality_status = str(_safe(row, "quality_status") or "unverified").strip().lower()
     if decision_id is None:
-        reason = "AI 分析失败" if analysis_status == "FAILED" else "待 AI 分析"
+        if analysis_status == "FAILED":
+            reason = "AI 分析失败"
+        elif quality_status == "candidate":
+            reason = "待 AI 观察分析（来源未验证）"
+        else:
+            reason = "待 AI 分析"
     market = (_safe(row, "market_category") or "OTHER").upper()
     if market not in ("CRYPTO", "GOLD", "OIL", "MACRO", "OTHER"):
         market = "OTHER"
@@ -220,7 +231,7 @@ def _row_to_event(row) -> Dict[str, Any]:
         "timestamp": _format_time(_safe(row, "timestamp")),
         "ai_time": _format_time(_safe(row, "created_at")) if decision_id is not None else "——",
         "source": _safe(row, "source") or "FinancialJuice",
-        "quality_status": _safe(row, "quality_status") or "unverified",
+        "quality_status": quality_status,
         "quality_reason": _safe(row, "quality_reason") or "",
         "news_text": re.sub(r'\[hash:[a-fA-F0-9]+\]\s*', '', (_safe(row, "news_text") or "")[:200]),
         "action": (_safe(row, "action") or "HOLD").upper(),
@@ -367,8 +378,18 @@ _EVENT_SELECT = """
     )
 """
 
+_EVENT_SELECT_COMPACT = _EVENT_SELECT.replace(
+    "ad.decision_context,",
+    "NULL AS decision_context,",
+)
 
-async def _fetch_event_rows(news_ids: List[int] | None = None, limit: int | None = None) -> List[Dict[str, Any]]:
+
+async def _fetch_event_rows(
+    news_ids: List[int] | None = None,
+    limit: int | None = None,
+    *,
+    compact: bool = False,
+) -> List[Dict[str, Any]]:
     params: List[Any] = []
     where = "WHERE rn.is_noise = 0"
     if news_ids is not None:
@@ -376,7 +397,11 @@ async def _fetch_event_rows(news_ids: List[int] | None = None, limit: int | None
             return []
         where += f" AND rn.id IN ({','.join('?' for _ in news_ids)})"
         params.extend(news_ids)
-    sql = f"{_EVENT_SELECT} {where} ORDER BY rn.id DESC"
+    # The ingest watcher may backfill a provider's older pages after the
+    # newest item.  Sort by the provider timestamp first so replay/backfill
+    # order cannot make stale headlines appear as the live feed.
+    select_clause = _EVENT_SELECT_COMPACT if compact else _EVENT_SELECT
+    sql = f"{select_clause} {where} ORDER BY datetime(rn.timestamp) DESC, rn.id DESC"
     if limit is not None:
         sql += " LIMIT ?"
         params.append(limit)
@@ -385,7 +410,14 @@ async def _fetch_event_rows(news_ids: List[int] | None = None, limit: int | None
         cursor = await connection.execute(sql, params)
         rows = await cursor.fetchall()
         await cursor.close()
-    return [_row_to_event(row) for row in rows]
+    events = [_row_to_event(row) for row in rows]
+    if compact:
+        # decision_context may contain a full market snapshot and can be tens
+        # of kilobytes per row.  The live ledger does not render it; replay
+        # endpoints remain the authoritative source for the complete context.
+        for event in events:
+            event["decision_context"] = "{}"
+    return events
 
 
 async def _fetch_change_cursors() -> tuple[int, int]:
@@ -642,7 +674,7 @@ async def db_watcher() -> None:
             current_raw, current_decision = await _fetch_change_cursors()
             changed_ids = await _fetch_incremental_news_ids(raw_cursor, decision_cursor)
             if changed_ids:
-                events = await _fetch_event_rows(changed_ids)
+                events = await _fetch_event_rows(changed_ids, compact=True)
                 for event in reversed(events):
                     await _broadcast_sse(event)
                     snapshot[event["news_id"]] = (
@@ -660,7 +692,7 @@ async def db_watcher() -> None:
                     if snapshot.get(news_id) != state
                 ]
                 if reconciled_ids:
-                    events = await _fetch_event_rows(reconciled_ids)
+                    events = await _fetch_event_rows(reconciled_ids, compact=True)
                     for event in reversed(events):
                         await _broadcast_sse(event)
                 snapshot = current
@@ -806,10 +838,13 @@ async def select_ai_model(selection: AIModelSelection):
 
 
 @app.get("/api/events")
-async def get_events(limit: int = 2000) -> List[Dict[str, Any]]:
+async def get_events(limit: int = 2000, compact: bool = False) -> List[Dict[str, Any]]:
     """Return the latest non-noise news rows with their latest decision."""
     try:
-        return await _fetch_event_rows(limit=max(1, min(int(limit), config.EVENTS_LIST_MAX)))
+        return await _fetch_event_rows(
+            limit=max(1, min(int(limit), config.EVENTS_LIST_MAX)),
+            compact=compact,
+        )
     except aiosqlite.OperationalError:
         return []
 
@@ -865,7 +900,13 @@ def _cached_market_prices() -> Dict[str, Any]:
         payload = market_feeds.fetch_market_prices()
         _MARKET_CACHE["value"] = payload
         _MARKET_CACHE["expires"] = now + 2.0
-        timeseries.record_market_snapshot(payload)
+        try:
+            timeseries.record_market_snapshot(payload)
+        except sqlite3.OperationalError as exc:
+            # Snapshot persistence is audit telemetry.  A temporary SQLite
+            # writer lock must not turn a valid live quote into an HTTP 500.
+            if "locked" not in str(exc).lower():
+                raise
     return _MARKET_CACHE["value"]
 
 
@@ -1173,7 +1214,9 @@ def _fetch_techflow_sync() -> Dict[str, Any]:
                 if item_id in seen:
                     continue
                 seen.add(item_id)
-                summary = str(_techflow_value(row, "summary", "description", "digest", "content") or "").strip()
+                summary = str(_techflow_value(
+                    row, "summary", "abstract", "description", "digest", "content"
+                ) or "").strip()
                 url = str(_techflow_value(row, "url", "link", "share_url") or "").strip()
                 if url.startswith("/"):
                     url = "https://www.techflowpost.com" + url
@@ -1185,7 +1228,12 @@ def _fetch_techflow_sync() -> Dict[str, Any]:
                     "published_at": str(_techflow_value(row, "published_at", "publish_time", "created_at", "createdAt") or ""),
                     "source": "TechFlow 深潮",
                 })
-        value = {"status": "ok", "items": items, "error": ""}
+        value = {
+            "status": "ok" if items else "empty",
+            "items": items,
+            "error": "" if items else "TechFlow returned no usable rows",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
     except Exception as exc:
         value = {"status": "unavailable", "items": [], "error": f"TechFlow unavailable: {type(exc).__name__}"}
     _TECHFLOW_CACHE.update({"value": value, "expires": now + _NEWS_CACHE_TTL})
@@ -1204,12 +1252,19 @@ def _fetch_eastmoney_news_sync() -> Dict[str, Any]:
     try:
         items = []
         seen: set[str] = set()
+        eastmoney_url = config.EASTMONEY_NEWS_URL
+        if "req_trace=" not in eastmoney_url:
+            separator = "&" if "?" in eastmoney_url else "?"
+            eastmoney_url = f"{eastmoney_url}{separator}req_trace={time.time_ns()}"
         for payload in _fetch_paged_json(
-            config.EASTMONEY_NEWS_URL,
+            eastmoney_url,
             referer="https://www.eastmoney.com/",
             timeout=5,
             pages=config.NEWS_SOURCE_PAGES,
         ):
+            if isinstance(payload, dict) and payload.get("data") is None:
+                message = str(payload.get("message") or "empty response")
+                raise ValueError(f"EastMoney response error: {message[:120]}")
             for row in _extract_news_rows(payload, ("list", "items", "data", "result")):
                 if not isinstance(row, dict):
                     continue
@@ -1232,7 +1287,12 @@ def _fetch_eastmoney_news_sync() -> Dict[str, Any]:
                     "published_at": str(_techflow_value(row, "published_at", "showTime", "publishTime", "Art_ShowTime", "date") or ""),
                     "source": "东方财富",
                 })
-        value = {"status": "ok", "items": items, "error": ""}
+        value = {
+            "status": "ok" if items else "empty",
+            "items": items,
+            "error": "" if items else "EastMoney returned no usable rows",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
     except Exception as exc:
         value = {"status": "unavailable", "items": [], "error": f"EastMoney unavailable: {type(exc).__name__}"}
     _EASTMONEY_CACHE.update({"value": value, "expires": now + _NEWS_CACHE_TTL})
@@ -1279,7 +1339,12 @@ def _fetch_blockbeats_sync() -> Dict[str, Any]:
                     "published_at": str(_techflow_value(row, "create_time", "published_at", "created_at", "add_time") or ""),
                     "source": "律动 BlockBeats",
                 })
-        value = {"status": "ok", "items": items, "error": ""}
+        value = {
+            "status": "ok" if items else "empty",
+            "items": items,
+            "error": "" if items else "BlockBeats returned no usable rows",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
     except Exception as exc:
         value = {"status": "unavailable", "items": [], "error": f"BlockBeats unavailable: {type(exc).__name__}"}
     _BLOCKBEATS_CACHE.update({"value": value, "expires": now + _NEWS_CACHE_TTL})
@@ -1408,12 +1473,31 @@ async def get_news_report():
     return await _news_report()
 
 
-def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
+def _news_item_sort_key(item: Dict[str, Any]) -> int:
+    """Sort provider rows by their own event clock, newest first."""
+    value = item.get("published_at") or item.get("time")
+    normalized = _external_timestamp(value)
+    return int(normalized[1]) if normalized else 0
+
+
+def _ingest_external_news_sync(
+    items: List[Dict[str, Any]], *, max_inserted: int | None = None
+) -> int:
+    """Persist fresh provider rows until the *actual* insert quota is reached.
+
+    The watcher previously sliced the merged provider list before deduplication.
+    Once the first page was already stored, it retried the same duplicates and
+    never reached newer rows from later providers.  The limit now counts only
+    successful inserts.
+    """
     inserted = 0
+    insert_limit = None if max_inserted is None else max(0, int(max_inserted))
     conn = db.get_connection()
     try:
         data_quality.ensure_schema(conn)
         for item in items:
+            if insert_limit is not None and inserted >= insert_limit:
+                break
             title = str(item.get("title") or "").strip()
             summary = str(item.get("summary") or item.get("body") or "").strip()
             if not title:
@@ -1433,9 +1517,24 @@ def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
             )
             if (
                 not quality.decision_eligible
+                and not getattr(config, "NEWS_CANDIDATE_DISPLAY_ENABLED", False)
                 and data_quality.observation_already_recorded(conn, quality, item)
             ):
                 continue
+            display_candidate = bool(
+                quality.decision_eligible
+                or getattr(config, "NEWS_CANDIDATE_DISPLAY_ENABLED", False)
+            )
+            can_ingest = bool(
+                quality.accepted
+                and display_candidate
+                and news_sources.allow_ingest(source, conn)
+            )
+            # L2 classification may call a remote model and take seconds.  It
+            # must run before the first write in this transaction; otherwise a
+            # whole provider batch holds SQLite's single writer lock while the
+            # model responds, blocking settings, quotes and the AI worker.
+            filtered = evaluate_news(title, summary) if can_ingest else None
             data_quality.record(
                 conn,
                 quality,
@@ -1444,14 +1543,12 @@ def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
                 metadata={"provider_id": str(item.get("id") or "")[:200]},
                 quarantine=not quality.decision_eligible,
             )
-            if not quality.accepted or not quality.decision_eligible:
+            if not can_ingest:
+                conn.commit()
                 continue
             content = f"[hash:{marker}] {title}"
             if summary and summary not in title:
                 content += f"\n{summary}"
-            if not news_sources.allow_ingest(source, conn):
-                continue
-            filtered = evaluate_news(title, summary)
             normalized_ts = _external_timestamp(published_value)
             timestamp, ts_epoch = normalized_ts or (_now(), int(time.time()))
             news_id = db.insert_raw_news(
@@ -1478,7 +1575,8 @@ def _ingest_external_news_sync(items: List[Dict[str, Any]]) -> int:
             except sqlite3.OperationalError as exc:
                 print(f"[NEWS-SOURCES] timeseries skip: {exc}")
             inserted += 1
-        conn.commit()
+            # Release the writer lock before classifying the next provider row.
+            conn.commit()
     finally:
         conn.close()
     return inserted
@@ -1507,7 +1605,12 @@ async def news_source_watcher() -> None:
                 if isinstance(payload, dict) and payload.get("status") == "ok":
                     items.extend(payload.get("items") or [])
             if remaining > 0 and items:
-                await asyncio.to_thread(_ingest_external_news_sync, items[:remaining])
+                items.sort(key=_news_item_sort_key, reverse=True)
+                await asyncio.to_thread(
+                    _ingest_external_news_sync,
+                    items,
+                    max_inserted=remaining,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1518,16 +1621,43 @@ async def news_source_watcher() -> None:
         await asyncio.sleep(poll_seconds)
 
 
+def _macro_calendar_effective_window(
+    start: str,
+    end: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, str]:
+    """Use a bounded live window when the client omits both dates.
+
+    The database intentionally retains historical releases, but a live
+    calendar must not start at the oldest retained FOMC record.  Explicit
+    client boundaries are never rewritten.
+    """
+    if start or end:
+        return start, end
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    reference = reference.astimezone(timezone.utc)
+    lower = reference - timedelta(hours=6)
+    upper = reference + timedelta(days=120)
+    return (
+        lower.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        upper.isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+
+
 async def macro_calendar_watcher() -> None:
-    """Low-frequency calendar sync; dormant until explicitly configured."""
+    """Low-frequency sync for explicitly configured calendar providers."""
     while True:
         try:
-            if (
-                getattr(config, "MACRO_CALENDAR_ENABLED", False)
-                and config.JIN10_ENABLED
-                and config.JIN10_CALENDAR_URL
-            ):
-                result = await asyncio.to_thread(macro_context.sync_jin10_calendar)
+            if getattr(config, "MACRO_CALENDAR_ENABLED", False):
+                start, end = _macro_calendar_effective_window("", "")
+                result = await asyncio.to_thread(
+                    macro_context.sync_macro_calendars,
+                    start=start,
+                    end=end,
+                )
                 if result.get("status") not in {"ok", "disabled"}:
                     print(f"[MACRO-CALENDAR] {result.get('reason') or result.get('status')}")
         except asyncio.CancelledError:
@@ -2385,13 +2515,18 @@ async def get_macro_calendar(
     verified_only: int = 0,
 ):
     """Government/macro schedule and releases, with source quality attached."""
+    effective_start, effective_end = _macro_calendar_effective_window(start, end)
     sync_result: Dict[str, Any] | None = None
     if refresh:
-        sync_result = await asyncio.to_thread(macro_context.sync_jin10_calendar)
+        sync_result = await asyncio.to_thread(
+            macro_context.sync_macro_calendars,
+            start=effective_start,
+            end=effective_end,
+        )
     items = await asyncio.to_thread(
         macro_context.list_macro_events,
-        start=start,
-        end=end,
+        start=effective_start,
+        end=effective_end,
         limit=limit,
         decision_eligible=True if verified_only else None,
     )
@@ -2399,6 +2534,7 @@ async def get_macro_calendar(
         "status": "ok" if items else "empty",
         "items": items,
         "sync": sync_result,
+        "window": {"start": effective_start, "end": effective_end},
         "note": "候选日历仅展示/验证；decision_eligible=true 才可进入 AI 或交易闸门。",
     }
 
@@ -2438,6 +2574,115 @@ async def get_data_quality_policies():
 @app.get("/api/data-quality/summary")
 async def get_data_quality_summary():
     return await asyncio.to_thread(_data_quality_summary_sync)
+
+
+def _news_source_status_sync() -> Dict[str, Any]:
+    settings = news_sources.get_settings()
+    enabled_sources = settings.get("sources") or {}
+    cached = {
+        "techflow": _TECHFLOW_CACHE.get("value"),
+        "eastmoney": _EASTMONEY_CACHE.get("value"),
+        "blockbeats": _BLOCKBEATS_CACHE.get("value"),
+        "jin10": _JIN10_CACHE.get("value"),
+    }
+    source_patterns = {
+        "financialjuice": ("WS:fj:%", "WS:financialjuice%"),
+        "tree_news": ("%tree%", "%telegram%"),
+        "techflow": ("%TechFlow%", "%深潮%"),
+        "eastmoney": ("%EastMoney%", "%东方财富%"),
+        "blockbeats": ("%BlockBeats%", "%律动%"),
+        "jin10": ("%Jin10%", "%金十%"),
+    }
+    database: Dict[str, Dict[str, Any]] = {}
+    conn = db.get_connection()
+    try:
+        for key, patterns in source_patterns.items():
+            row = conn.execute(
+                """SELECT COUNT(*) AS total, MAX(ts) AS last_ts,
+                          MAX(timestamp) AS last_event_at
+                   FROM raw_news WHERE source LIKE ? OR source LIKE ?""",
+                patterns,
+            ).fetchone()
+            database[key] = {
+                "stored": int(row[0] or 0),
+                "last_event_ts": int(row[1]) if row[1] else None,
+                "last_event_at": row[2],
+            }
+    finally:
+        conn.close()
+
+    now_epoch = int(time.time())
+    result: Dict[str, Any] = {}
+    for key in source_patterns:
+        cache_value = cached.get(key) if isinstance(cached.get(key), dict) else {}
+        db_value = database[key]
+        last_ts = db_value["last_event_ts"]
+        age = max(0, now_epoch - last_ts) if last_ts else None
+        status = str(cache_value.get("status") or "unknown")
+        if key in {"financialjuice", "tree_news"}:
+            status = "empty" if age is None else ("ok" if age <= 300 else "stale")
+        result[key] = {
+            "enabled": bool(settings.get("enabled", True) and enabled_sources.get(key, True)),
+            "status": status,
+            "cached_items": len(cache_value.get("items") or []),
+            "stored": db_value["stored"],
+            "last_event_at": db_value["last_event_at"],
+            "age_seconds": age,
+            "error": str(cache_value.get("error") or "")[:200],
+            "quality_status": "candidate",
+            "decision_eligible": False,
+        }
+    return {
+        "enabled": bool(settings.get("enabled", True)),
+        "daily_target": int(settings.get("daily_target") or 0),
+        "today_count": int(settings.get("today_count") or 0),
+        "remaining": int(settings.get("remaining") or 0),
+        "sources": result,
+    }
+
+
+@app.get("/api/data-sources/status")
+async def get_data_sources_status():
+    """Return safe provider configuration status without exposing credentials."""
+    news_status = await asyncio.to_thread(_news_source_status_sync)
+    return {
+        "sources": {
+            "okx": {
+                "provider": "okx",
+                "enabled": True,
+                "configured": True,
+                "source_type": "exchange_public_api",
+                "decision_eligible": True,
+            },
+            "jin10": {
+                **get_jin10_provider().health(),
+                "decision_eligible": False,
+                "note": "requires authorized key and explicit operator promotion",
+            },
+            "oanda": {
+                **get_oanda_provider().health(),
+                "decision_eligible": False,
+            },
+            "binance_paxg": {
+                **get_binance_paxg_provider().health(),
+                "decision_eligible": False,
+            },
+            "coingecko_paxg": {
+                **get_coingecko_paxg_provider().health(),
+                "decision_eligible": False,
+            },
+            "trading_economics": {
+                **get_trading_economics_provider().health(),
+                "decision_eligible": False,
+            },
+            "official_macro": {
+                **get_official_macro_calendar_provider().health(),
+                "policy_eligible": True,
+            },
+        },
+        "news_ingest": news_status,
+        "fail_closed": True,
+    }
 
 
 @app.get("/api/health")
@@ -3424,6 +3669,241 @@ async def get_replay_stats(strategy_id: Optional[int] = None, version_id: Option
     }
 
 
+_REFLECTION_CRYPTO_ASSETS = frozenset({
+    "BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "ADA", "AVAX", "PAXG",
+})
+
+
+def _reflection_context(value: Any) -> tuple[Dict[str, Any], str]:
+    """Parse a stored decision snapshot without treating malformed data as evidence."""
+    if isinstance(value, dict):
+        return value, "ok"
+    if not isinstance(value, str) or not value.strip():
+        return {}, "missing"
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}, "invalid"
+    return (parsed, "ok") if isinstance(parsed, dict) else ({}, "invalid")
+
+
+def _reflection_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _reflection_entry_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=TZ_SHANGHAI)
+    return parsed.astimezone(TZ_SHANGHAI)
+
+
+def _reflection_asset_context(context: Dict[str, Any], asset: str) -> Dict[str, Any]:
+    assets = context.get("assets")
+    if not isinstance(assets, dict):
+        return {}
+    value = assets.get(asset.upper())
+    return value if isinstance(value, dict) else {}
+
+
+def _reflection_structure_observations(
+    context: Dict[str, Any], asset: str,
+) -> tuple[Optional[str], Optional[float]]:
+    asset_context = _reflection_asset_context(context, asset)
+    structure = asset_context.get("market_structure")
+    if not isinstance(structure, dict):
+        return None, None
+    aggregate = structure.get("aggregate")
+    aggregate = aggregate if isinstance(aggregate, dict) else structure
+    trend = str(aggregate.get("trend") or "").lower() or None
+    timeframes = structure.get("timeframes")
+    if not isinstance(timeframes, dict):
+        return trend, None
+    for timeframe in ("15m", "1h"):
+        frame = timeframes.get(timeframe)
+        if not isinstance(frame, dict):
+            continue
+        indicators = frame.get("indicators")
+        if not isinstance(indicators, dict):
+            continue
+        volume_ratio = _reflection_float(indicators.get("volume_ratio"))
+        if volume_ratio is not None:
+            return trend, volume_ratio
+    return trend, None
+
+
+def _build_replay_failure_diagnostics(
+    losses: list[Dict[str, Any]], decided: list[Dict[str, Any]],
+) -> tuple[list[Dict[str, Any]], float]:
+    """Classify only observable failure associations; never manufacture causality."""
+    definitions = {
+        "data_gap": "数据缺失/快照不可用",
+        "low_liquidity_session": "非核心时段/低流动性",
+        "ignored_contradictory_factor": "方向与已知盘面因素冲突",
+        "profit_not_locked": "已有浮盈但未及时锁定",
+        "entry_or_stop_timing": "入场或止损时机不佳",
+    }
+    observations: Dict[str, Dict[int, list[str]]] = {
+        key: {} for key in definitions
+    }
+
+    def record(key: str, item: Dict[str, Any], reason: str) -> None:
+        signal_id = int(item.get("id") or 0)
+        observations[key].setdefault(signal_id, []).append(reason)
+
+    for item in losses:
+        asset = str(item.get("asset") or "").upper()
+        action = str(item.get("action") or "").upper()
+        context, context_state = _reflection_context(item.get("decision_context"))
+
+        data_reasons: list[str] = []
+        if context_state != "ok":
+            data_reasons.append(f"decision_context_{context_state}")
+        else:
+            snapshot_status = str(
+                context.get("snapshot_status") or context.get("status") or ""
+            ).lower()
+            if snapshot_status and snapshot_status not in {"ok", "partial"}:
+                data_reasons.append(f"snapshot_status={snapshot_status}")
+            if context.get("market_context_eligible") is False:
+                data_reasons.append("market_context_ineligible")
+            if context.get("target_market_context_eligible") is False:
+                data_reasons.append("target_asset_context_ineligible")
+            macro = context.get("macro_context")
+            if isinstance(macro, dict):
+                ok_count = _reflection_float(macro.get("ok"))
+                total_count = _reflection_float(macro.get("total"))
+                if (
+                    ok_count is not None and total_count is not None
+                    and total_count > 0 and ok_count / total_count < 0.5
+                ):
+                    data_reasons.append(
+                        f"macro_coverage={int(ok_count)}/{int(total_count)}"
+                    )
+        if data_reasons:
+            record("data_gap", item, ", ".join(data_reasons))
+
+        trend, volume_ratio = _reflection_structure_observations(context, asset)
+        entry_time = _reflection_entry_time(item.get("entry_time"))
+        liquidity_reasons: list[str] = []
+        if volume_ratio is not None and volume_ratio < 0.5:
+            liquidity_reasons.append(f"15m/1h volume_ratio={volume_ratio:.2f}")
+        if (
+            asset and asset not in _REFLECTION_CRYPTO_ASSETS
+            and entry_time is not None and entry_time.weekday() >= 5
+        ):
+            liquidity_reasons.append("non_crypto_weekend")
+        if liquidity_reasons:
+            record("low_liquidity_session", item, ", ".join(liquidity_reasons))
+
+        contradiction_reasons: list[str] = []
+        confirmation = str(item.get("market_confirmation") or "").lower()
+        if confirmation in {"negative", "rejected", "opposite"}:
+            contradiction_reasons.append(f"market_confirmation={confirmation}")
+        if context.get("timestamp_mismatch") is True:
+            contradiction_reasons.append("snapshot_timestamp_mismatch")
+        if (action == "BUY" and trend == "bearish") or (
+            action == "SELL" and trend == "bullish"
+        ):
+            contradiction_reasons.append(f"{action.lower()}_against_{trend}_structure")
+        if contradiction_reasons:
+            record(
+                "ignored_contradictory_factor", item,
+                ", ".join(contradiction_reasons),
+            )
+
+        pnl = _reflection_float(item.get("forward_pnl"))
+        mfe = _reflection_float(item.get("mfe_pct"))
+        mae = _reflection_float(item.get("mae_pct"))
+        if pnl is not None and pnl < 0 and mfe is not None and mfe > 0:
+            record(
+                "profit_not_locked", item,
+                f"MFE={mfe:.3f}% then final PnL={pnl:.3f}%",
+            )
+        if mae is not None and mfe is not None and mae > mfe:
+            record(
+                "entry_or_stop_timing", item,
+                f"MAE={mae:.3f}% > MFE={mfe:.3f}%",
+            )
+
+    observed_ids: set[int] = set()
+    diagnostics: list[Dict[str, Any]] = []
+    loss_count = len(losses)
+    for key, label in definitions.items():
+        rows = observations[key]
+        observed_ids.update(rows)
+        evidence = [
+            f"#{signal_id}: {'; '.join(reasons)}"
+            for signal_id, reasons in list(rows.items())[:3]
+        ]
+        diagnostics.append({
+            "key": key,
+            "label": label,
+            "count": len(rows),
+            "share": round(len(rows) / loss_count, 4) if loss_count else 0.0,
+            "assessment": "observed" if rows else "not_observed",
+            "evidence": evidence,
+            "sample_signal_ids": list(rows)[:5],
+        })
+
+    ordered = sorted(decided, key=lambda item: int(item.get("id") or 0))
+    minimum_window = 6
+    regime: Dict[str, Any] = {
+        "key": "regime_change_candidate",
+        "label": "市场规则/状态变化（候选）",
+        "count": 0,
+        "share": 0.0,
+        "assessment": "insufficient_sample",
+        "evidence": ["至少需要前后各 6 笔正式结算交易才能检测胜率结构变化。"],
+        "sample_signal_ids": [],
+    }
+    if len(ordered) >= minimum_window * 2:
+        window = min(20, len(ordered) // 2)
+        previous = ordered[-2 * window:-window]
+        recent = ordered[-window:]
+        previous_wr = sum(
+            str(item.get("is_correct") or "").upper() == "WIN" for item in previous
+        ) / window
+        recent_wr = sum(
+            str(item.get("is_correct") or "").upper() == "WIN" for item in recent
+        ) / window
+        delta = recent_wr - previous_wr
+        recent_loss_ids = [
+            int(item.get("id") or 0) for item in recent
+            if str(item.get("is_correct") or "").upper() == "LOSS"
+        ]
+        regime.update({
+            "count": len(recent_loss_ids) if delta <= -0.25 else 0,
+            "share": round(len(recent_loss_ids) / loss_count, 4) if loss_count and delta <= -0.25 else 0.0,
+            "assessment": "candidate" if delta <= -0.25 else "not_observed",
+            "evidence": [
+                f"前窗胜率 {previous_wr:.1%}，近窗胜率 {recent_wr:.1%}，变化 {delta:+.1%}。"
+            ],
+            "sample_signal_ids": recent_loss_ids[:5] if delta <= -0.25 else [],
+        })
+    diagnostics.append(regime)
+    diagnostics.append({
+        "key": "unobservable_external_information",
+        "label": "系统外不可观测信息",
+        "count": 0,
+        "share": None,
+        "assessment": "not_assessable",
+        "evidence": ["现有数据不能证明某笔亏损由系统外信息造成；仅可标记未知，不能倒推原因。"],
+        "sample_signal_ids": [],
+    })
+    coverage = round(len(observed_ids) / loss_count, 4) if loss_count else 0.0
+    return diagnostics, coverage
+
+
 @app.get("/api/replay/reflection")
 async def get_replay_reflection(limit: int = 500):
     """Return a deterministic post-trade review for model/self-reflection UI.
@@ -3445,6 +3925,12 @@ async def get_replay_reflection(limit: int = 500):
     ]
     wins = [item for item in decided if str(item.get("is_correct")).upper() == "WIN"]
     losses = [item for item in decided if str(item.get("is_correct")).upper() == "LOSS"]
+    failure_diagnostics, observable_loss_coverage = _build_replay_failure_diagnostics(
+        losses, decided,
+    )
+    diagnostic_counts = {
+        item["key"]: item["count"] for item in failure_diagnostics
+    }
 
     def grouped(field: str) -> list[Dict[str, Any]]:
         buckets: Dict[str, list[Dict[str, Any]]] = {}
@@ -3481,8 +3967,24 @@ async def get_replay_reflection(limit: int = 500):
         "market_not_confirmed": sum(
             str(item.get("market_confirmation") or "").lower() == "negative" for item in losses
         ),
+        "data_gap": diagnostic_counts["data_gap"],
+        "low_liquidity_session": diagnostic_counts["low_liquidity_session"],
+        "ignored_contradictory_factor": diagnostic_counts["ignored_contradictory_factor"],
+        "profit_not_locked": diagnostic_counts["profit_not_locked"],
+        "entry_or_stop_timing": diagnostic_counts["entry_or_stop_timing"],
+        "regime_change_candidate": diagnostic_counts["regime_change_candidate"],
     }
     recommendations: list[str] = []
+    if patterns["data_gap"]:
+        recommendations.append("数据覆盖不足的亏损单不用于自动放大仓位；先补齐目标盘面与宏观快照。")
+    if patterns["low_liquidity_session"]:
+        recommendations.append("低流动性或非核心时段降低仓位，并要求成交量恢复后再确认方向。")
+    if patterns["ignored_contradictory_factor"]:
+        recommendations.append("新闻方向与盘面结构冲突时暂停单边交易，等待结构和资金流同向。")
+    if patterns["profit_not_locked"]:
+        recommendations.append("出现过浮盈后转亏的事件启用分批止盈或移动保护，按影响窗口及时了结。")
+    if patterns["regime_change_candidate"]:
+        recommendations.append("近期胜率相对历史窗口显著下降，冻结自动加仓并重新验证阈值。")
     if patterns["uncertain_direction_loss"]:
         recommendations.append("不确定性较高的信号先进入双向模拟/人工复核，不直接放大实盘仓位。")
     if patterns["adverse_excursion_dominated"]:
@@ -3500,13 +4002,15 @@ async def get_replay_reflection(limit: int = 500):
         "by_horizon": grouped("impact_horizon"),
         "by_asset": grouped("asset"),
         "failure_patterns": patterns,
+        "failure_diagnostics": failure_diagnostics,
+        "observable_loss_coverage": observable_loss_coverage,
         "recommendations": recommendations,
         "research_excluded": {
             "sample": len(research_decided),
             "wins": sum(str(item.get("is_correct")).upper() == "WIN" for item in research_decided),
             "losses": sum(str(item.get("is_correct")).upper() == "LOSS" for item in research_decided),
         },
-        "method": "deterministic_verified_replay_review_v2",
+        "method": "deterministic_evidence_backed_replay_review_v3",
     }
 
 

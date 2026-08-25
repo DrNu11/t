@@ -9,6 +9,9 @@ export type ApiEvent = {
   news_id: number
   decision_id: number | null
   analysis_status: AnalysisStatus
+  quality_status?: string
+  quality_reason?: string
+  trade_gate_reason?: string
   timestamp: string
   ai_time: string
   source: string

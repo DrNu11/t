@@ -314,6 +314,16 @@ export type ReplayReflection = {
   by_horizon: Array<{ key: string; sample: number; wins: number; losses: number; winrate: number; avg_forward_pnl: number | null }>
   by_asset: Array<{ key: string; sample: number; wins: number; losses: number; winrate: number; avg_forward_pnl: number | null }>
   failure_patterns: Record<string, number>
+  failure_diagnostics: Array<{
+    key: string
+    label: string
+    count: number
+    share: number | null
+    assessment: 'observed' | 'candidate' | 'not_observed' | 'insufficient_sample' | 'not_assessable' | string
+    evidence: string[]
+    sample_signal_ids: number[]
+  }>
+  observable_loss_coverage: number
   recommendations: string[]
   research_excluded?: { sample: number; wins: number; losses: number }
   method: string

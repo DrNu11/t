@@ -14,7 +14,8 @@ from engine.ai_worker import (
     _analysis_features_for_persist, _authoritative_news_timestamp,
     _build_performance_context, _claim_pending_batch,
     _bump_parent_score, _call_llm_sync, _find_active_parent,
-    _mark_news_terminal_status, _recover_processing_on_worker_start,
+    _is_transient_ai_error, _mark_news_terminal_status,
+    _recover_processing_on_worker_start, _schedule_news_failure,
     build_model_config,
     build_news_context_package, direction_consistent,
     evaluate_news_context_eligibility, quality_allows_paper_position,
@@ -150,6 +151,38 @@ def test_news_llm_request_uses_aiping_endpoint_model_and_extra_body(monkeypatch)
     assert captured["payload"]["model"] == "DeepSeek-V4-Flash-0731"
     assert captured["payload"]["enable_thinking"] is False
     assert captured["payload"]["provider"] == model["extra_body"]["provider"]
+
+
+def test_ox_alpha_request_leaves_budget_for_visible_json(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def read(self):
+            result = {
+                "sentiment_score": 0.2, "suggested_action": "HOLD",
+                "reasoning": "离线测试", "market_category": "OTHER",
+                "target_asset": "NONE", "reasoning_path": "测试路径",
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(result)}}]}).encode()
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["payload"] = json.loads(request.data.decode())
+            return FakeResponse()
+
+    monkeypatch.setattr(ai_worker_module, "OPENROUTER_AI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        ai_worker_module,
+        "AI_MODEL_ROSTER",
+        ({"id": "stealth/ox-alpha", "label": "Ox Alpha", "provider": "openrouter"},),
+    )
+    monkeypatch.setattr("engine.ai_worker.urllib.request.build_opener", lambda *args: FakeOpener())
+
+    result = _call_llm_sync("offline news content", build_model_config("stealth/ox-alpha"))
+
+    assert result["suggested_action"] == "HOLD"
+    assert captured["payload"]["max_tokens"] == 4096
+    assert captured["payload"]["reasoning"] == {"effort": "low"}
 
 
 def test_news_llm_request_injects_hermes_writing_context(monkeypatch):
@@ -499,6 +532,88 @@ def test_processing_lease_recovers_stale_claim_on_worker_restart(
     assert tuple(state) == ("PROCESSING", now_epoch)
 
 
+def test_candidate_news_can_be_claimed_for_observation_analysis(
+    temp_db, monkeypatch,
+):
+    """Candidate rows may reach the LLM only when the explicit flag is on."""
+    candidate_id = temp_db.execute(
+        """INSERT INTO raw_news
+           (source, content, timestamp, ts, status, is_noise, quality_status)
+           VALUES ('TechFlow 深潮', 'candidate observation',
+                   '2026-08-22T14:03:00+08:00', 1787378580,
+                   'PENDING', 0, 'candidate')""",
+    ).lastrowid
+    unverified_id = temp_db.execute(
+        """INSERT INTO raw_news
+           (source, content, timestamp, ts, status, is_noise, quality_status)
+           VALUES ('unknown', 'unverified observation',
+                   '2026-08-22T14:03:00+08:00', 1787378580,
+                   'PENDING', 0, 'unverified')""",
+    ).lastrowid
+    temp_db.commit()
+    db_path = temp_db.execute("PRAGMA database_list").fetchone()[2]
+
+    def open_test_db():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(ai_worker_module, "_open_db", open_test_db)
+    monkeypatch.setattr(
+        ai_worker_module, "_ALLOWED_QUALITY_STATUSES", ("verified", "candidate")
+    )
+
+    claimed = _claim_pending_batch()
+
+    assert [row["id"] for row in claimed] == [candidate_id]
+    states = {
+        row["id"]: row["status"]
+        for row in temp_db.execute(
+            "SELECT id, status FROM raw_news WHERE id IN (?, ?) ORDER BY id",
+            (candidate_id, unverified_id),
+        ).fetchall()
+    }
+    assert states == {candidate_id: "PROCESSING", unverified_id: "PENDING"}
+
+
+def test_claim_prioritizes_fresh_relevant_news_and_model_batch_limit(
+    temp_db, monkeypatch,
+):
+    now_epoch = 1_787_378_700
+    rows = (
+        ("old-high", now_epoch - 7200, 0.99),
+        ("fresh-low", now_epoch - 30, 0.20),
+        ("fresh-high", now_epoch - 40, 0.80),
+    )
+    ids = {}
+    for content, event_ts, relevance in rows:
+        ids[content] = temp_db.execute(
+            """INSERT INTO raw_news
+               (source, content, timestamp, ts, status, is_noise,
+                relevance_score, quality_status)
+               VALUES ('test', ?, '2026-08-22T14:03:00+08:00', ?,
+                       'PENDING', 0, ?, 'verified')""",
+            (content, event_ts, relevance),
+        ).lastrowid
+    temp_db.commit()
+    db_path = temp_db.execute("PRAGMA database_list").fetchone()[2]
+
+    def open_test_db():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(ai_worker_module, "_open_db", open_test_db)
+    monkeypatch.setattr(ai_worker_module.time, "time", lambda: now_epoch)
+    monkeypatch.setattr(ai_worker_module, "_selected_batch_limit", lambda: 2)
+
+    claimed = _claim_pending_batch()
+
+    assert [row["id"] for row in claimed] == [
+        ids["fresh-high"], ids["fresh-low"],
+    ]
+
+
 def test_terminal_status_clears_processing_lease(temp_db):
     ids = []
     for content in ("done", "failed"):
@@ -521,6 +636,86 @@ def test_terminal_status_clears_processing_lease(temp_db):
         ("DONE", None),
         ("FAILED", None),
     ]
+
+
+def test_transient_ai_failure_waits_then_returns_to_claim_queue(
+    temp_db, monkeypatch,
+):
+    now_epoch = 1_787_378_700
+    news_id = temp_db.execute(
+        """INSERT INTO raw_news
+           (source, content, timestamp, ts, status, quality_status,
+            processing_started_at)
+           VALUES ('test', 'rate limited', '2026-08-22T14:03:00+08:00', ?,
+                   'PROCESSING', 'verified', ?)""",
+        (now_epoch - 10, now_epoch),
+    ).lastrowid
+    temp_db.commit()
+    db_path = temp_db.execute("PRAGMA database_list").fetchone()[2]
+
+    monkeypatch.setattr(ai_worker_module, "AI_TRANSIENT_MAX_RETRIES", 3)
+    monkeypatch.setattr(ai_worker_module, "AI_TRANSIENT_RETRY_BASE_SECONDS", 60)
+    monkeypatch.setattr(ai_worker_module, "AI_TRANSIENT_RETRY_MAX_SECONDS", 300)
+
+    outcome = _schedule_news_failure(
+        temp_db, news_id, "RuntimeError: Ox Alpha HTTP 429", now_epoch=now_epoch,
+    )
+    temp_db.commit()
+    assert outcome == {
+        "status": "PENDING",
+        "retry_count": 1,
+        "retry_at": now_epoch + 60,
+        "delay_seconds": 60,
+        "transient": True,
+    }
+    state = temp_db.execute(
+        """SELECT status, processing_started_at, ai_retry_count,
+                  ai_next_retry_at, ai_last_error
+           FROM raw_news WHERE id=?""",
+        (news_id,),
+    ).fetchone()
+    assert tuple(state[:4]) == ("PENDING", None, 1, now_epoch + 60)
+    assert "HTTP 429" in state[4]
+
+    def open_test_db():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(ai_worker_module, "_open_db", open_test_db)
+    monkeypatch.setattr(ai_worker_module.time, "time", lambda: now_epoch + 59)
+    assert _claim_pending_batch() == []
+    monkeypatch.setattr(ai_worker_module.time, "time", lambda: now_epoch + 60)
+    assert [row["id"] for row in _claim_pending_batch()] == [news_id]
+
+
+def test_permanent_or_exhausted_ai_failure_is_terminal(temp_db, monkeypatch):
+    ids = []
+    for content, retry_count in (("bad-json", 0), ("rate-limit-exhausted", 2)):
+        ids.append(temp_db.execute(
+            """INSERT INTO raw_news
+               (source, content, timestamp, status, quality_status,
+                processing_started_at, ai_retry_count)
+               VALUES ('test', ?, '2026-08-22T14:03:00+08:00',
+                       'PROCESSING', 'verified', 1000, ?)""",
+            (content, retry_count),
+        ).lastrowid)
+    monkeypatch.setattr(ai_worker_module, "AI_TRANSIENT_MAX_RETRIES", 2)
+
+    permanent = _schedule_news_failure(
+        temp_db, ids[0], "ValueError: invalid JSON", now_epoch=2000,
+    )
+    exhausted = _schedule_news_failure(
+        temp_db, ids[1], "HTTP 503 temporarily unavailable", now_epoch=2000,
+    )
+    temp_db.commit()
+
+    assert permanent["status"] == "FAILED"
+    assert permanent["transient"] is False
+    assert exhausted["status"] == "FAILED"
+    assert exhausted["transient"] is True
+    assert _is_transient_ai_error("HTTP 429 rate limited") is True
+    assert _is_transient_ai_error("ValueError: invalid JSON") is False
 
 
 def test_reconcile_hold_weak_score_is_neutral():

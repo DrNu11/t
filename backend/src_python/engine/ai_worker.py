@@ -25,12 +25,21 @@ from config import (
     AIPING_BASE_URL,
     AIPING_EXTRA_BODY,
     AIPING_JSON_MODE,
+    OPENROUTER_AI_API_KEY,
+    OPENROUTER_AI_BASE_URL,
+    OPENROUTER_AI_JSON_MODE,
+    OPENROUTER_AI_BATCH_SIZE,
+    OPENROUTER_AI_MAX_CONCURRENCY,
+    AI_TRANSIENT_MAX_RETRIES,
+    AI_TRANSIENT_RETRY_BASE_SECONDS,
+    AI_TRANSIENT_RETRY_MAX_SECONDS,
     get_selected_ai_model_id,
     VIP_SCORE_BOOST,
     BATCH_SIZE,
     HERMES_AGENT_ENABLED,
     MACRO_CONTEXT_ENABLED,
     ALLOW_LEGACY_DECISIONS,
+    CANDIDATE_AI_ANALYSIS_ENABLED,
     _AGG_WINDOW_HOURS,
     _AGG_MIN_SCORE,
 )
@@ -52,8 +61,19 @@ from .utils import _detect_vip, _now, _open_db, _ts
 
 # HOLD 弱分阈值：|score| 不超过此值时视为中性观望，不伪造符号。
 _NEUTRAL_SCORE_EPS = 0.001
+# Candidate rows may be analysed by the selected model when explicitly
+# enabled, but the later ``quality_allows_paper_position`` gate remains
+# verified-only.  This lets Ox Alpha provide an observation without turning an
+# unverified feed into a trade or a settled training sample.
+_ANALYSIS_QUALITY_STATUSES = (
+    ("verified", "candidate")
+    if CANDIDATE_AI_ANALYSIS_ENABLED
+    else ("verified",)
+)
 _ALLOWED_QUALITY_STATUSES = (
-    ("verified", "legacy") if ALLOW_LEGACY_DECISIONS else ("verified",)
+    _ANALYSIS_QUALITY_STATUSES + ("legacy",)
+    if ALLOW_LEGACY_DECISIONS
+    else _ANALYSIS_QUALITY_STATUSES
 )
 
 # Current market/macro state is valid only for genuinely live news.  Five
@@ -457,6 +477,18 @@ def build_model_config(model_id: str) -> Dict[str, Any]:
     model = next((item for item in AI_MODEL_ROSTER if item["id"] == model_id), None)
     if model is None:
         raise ValueError("unsupported AI model")
+    if model.get("provider") == "openrouter":
+        if not OPENROUTER_AI_API_KEY:
+            raise ValueError("OpenRouter AI provider is not configured")
+        return {
+            "id": model["id"],
+            "label": model["label"],
+            "provider": "openrouter",
+            "api_base": OPENROUTER_AI_BASE_URL,
+            "api_key": OPENROUTER_AI_API_KEY,
+            "extra_body": {},
+            "json_mode": OPENROUTER_AI_JSON_MODE,
+        }
     return {
         "id": model["id"],
         "label": model["label"],
@@ -474,8 +506,16 @@ def get_current_model_config() -> Dict[str, Any]:
 # Compatibility export for callers that still inspect MODELS at import time.
 MODELS: List[Dict[str, Any]] = [build_model_config(DEFAULT_AI_MODEL_ID)]
 
-# 全局并发限流 — 单模型时 5 条新闻最多 5 并发，Semaphore(8) 留有裕量
+# Paid/internal routing can sustain concurrency. Free OpenRouter models have
+# a separate limiter so a ten-row batch does not become ten simultaneous 429s.
 _LLM_SEMAPHORE = asyncio.Semaphore(8)
+_OPENROUTER_LLM_SEMAPHORE = asyncio.Semaphore(OPENROUTER_AI_MAX_CONCURRENCY)
+
+
+def _model_semaphore(model_cfg: Dict[str, Any]) -> asyncio.Semaphore:
+    if model_cfg.get("provider") == "openrouter":
+        return _OPENROUTER_LLM_SEMAPHORE
+    return _LLM_SEMAPHORE
 
 
 # ---------------------------------------------------------------------------
@@ -870,16 +910,23 @@ def _call_llm_sync(news_content: str, model_cfg: Dict[str, str],
         if strategy_context:
             user_text = strategy_context + "\n\n" + user_text
 
+        # Ox Alpha spends part of its completion budget on hidden reasoning.
+        # With the generic 2048-token budget it can finish at ``length`` before
+        # emitting the required JSON.  Ask for low reasoning and leave enough
+        # room for the visible structured answer; this affects only Ox Alpha.
+        is_ox_alpha = model_cfg.get("id") == "stealth/ox-alpha"
         payload: Dict[str, Any] = {
             "model": model_cfg["id"],
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": user_text},
             ],
-            "max_tokens": 2048,
+            "max_tokens": 4096 if is_ox_alpha else 2048,
             "temperature": 0.1,
             **model_cfg["extra_body"],
         }
+        if is_ox_alpha:
+            payload["reasoning"] = {"effort": "low"}
         if use_json:
             payload["response_format"] = {"type": "json_object"}
 
@@ -1166,7 +1213,7 @@ async def _process_single(
     pre_ts = _canonical_news_timestamp(_authoritative_news_timestamp(news_row))
 
     try:
-        async with _LLM_SEMAPHORE:
+        async with _model_semaphore(model_cfg):
             llm_result = await loop.run_in_executor(
                 None, _call_llm_sync, content, model_cfg, market_context,
                 performance_context, pre_ts, writing_context, strategy_context,
@@ -1300,9 +1347,19 @@ def _recover_processing_on_worker_start() -> bool:
         conn.close()
 
 
+def _selected_batch_limit() -> int:
+    try:
+        if get_current_model_config().get("provider") == "openrouter":
+            return min(BATCH_SIZE, OPENROUTER_AI_BATCH_SIZE)
+    except (OSError, TypeError, ValueError):
+        pass
+    return BATCH_SIZE
+
+
 def _claim_pending_batch() -> List[sqlite3.Row]:
     """Atomically recover expired claims and lease the next eligible batch."""
 
+    batch_limit = _selected_batch_limit()
     conn = _open_db()
     try:
         conn.execute("BEGIN IMMEDIATE;")
@@ -1316,18 +1373,23 @@ def _claim_pending_batch() -> List[sqlite3.Row]:
             (lease_cutoff,),
         )
         quality_placeholders = ",".join("?" for _ in _ALLOWED_QUALITY_STATUSES)
+        freshness_cutoff = now_epoch - 60 * 60
         rows = conn.execute(
             "SELECT * FROM raw_news"
             " WHERE status = 'PENDING' AND is_noise = 0"
+            " AND (ai_next_retry_at IS NULL OR ai_next_retry_at <= ?)"
             f" AND LOWER(COALESCE(quality_status, 'unverified')) IN ({quality_placeholders})"
-            " ORDER BY id ASC LIMIT ?",
-            (*_ALLOWED_QUALITY_STATUSES, BATCH_SIZE),
+            " ORDER BY CASE WHEN COALESCE(ts, 0) >= ? THEN 0 ELSE 1 END ASC,"
+            " COALESCE(relevance_score, 0) DESC, COALESCE(ts, 0) DESC, id DESC"
+            " LIMIT ?",
+            (now_epoch, *_ALLOWED_QUALITY_STATUSES, freshness_cutoff, batch_limit),
         ).fetchall()
         if rows:
             ids = [row["id"] for row in rows]
             placeholders = ",".join("?" for _ in ids)
             conn.execute(
-                f"UPDATE raw_news SET status = 'PROCESSING', processing_started_at = ?"
+                f"UPDATE raw_news SET status = 'PROCESSING', processing_started_at = ?,"
+                " ai_next_retry_at = NULL"
                 f" WHERE id IN ({placeholders}) AND status = 'PENDING'",
                 (now_epoch, *ids),
             )
@@ -1354,10 +1416,75 @@ def _mark_news_terminal_status(
         raise ValueError("raw_news terminal status must be DONE or FAILED")
     conn.execute(
         "UPDATE raw_news"
-        " SET status = ?, processing_started_at = NULL"
+        " SET status = ?, processing_started_at = NULL, ai_next_retry_at = NULL,"
+        " ai_last_error = CASE WHEN ? = 'DONE' THEN '' ELSE ai_last_error END"
         " WHERE id = ? AND status = 'PROCESSING'",
-        (terminal, int(news_id)),
+        (terminal, terminal, int(news_id)),
     )
+
+
+def _is_transient_ai_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    transient_markers = (
+        "http 429", "code\":429", "rate limit", "rate-limit", "rate_limited",
+        "temporarily", "timeout", "timed out", "connection reset",
+        "connection aborted", "remote end closed", "network is unreachable",
+        "http 500", "http 502", "http 503", "http 504",
+    )
+    return any(marker in text for marker in transient_markers)
+
+
+def _schedule_news_failure(
+    conn: sqlite3.Connection,
+    news_id: int,
+    error: Any,
+    *,
+    now_epoch: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Retry transient provider failures with bounded exponential backoff."""
+    row = conn.execute(
+        "SELECT ai_retry_count FROM raw_news WHERE id = ?",
+        (int(news_id),),
+    ).fetchone()
+    current_count = int(row[0] or 0) if row else 0
+    attempt = current_count + 1
+    error_text = str(error or "unknown")[:500]
+    transient = _is_transient_ai_error(error_text)
+    now_value = int(time.time()) if now_epoch is None else int(now_epoch)
+
+    if transient and attempt <= AI_TRANSIENT_MAX_RETRIES:
+        delay = min(
+            AI_TRANSIENT_RETRY_MAX_SECONDS,
+            AI_TRANSIENT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+        )
+        retry_at = now_value + delay
+        conn.execute(
+            "UPDATE raw_news SET status = 'PENDING', processing_started_at = NULL,"
+            " ai_retry_count = ?, ai_next_retry_at = ?, ai_last_error = ?"
+            " WHERE id = ? AND status = 'PROCESSING'",
+            (attempt, retry_at, error_text, int(news_id)),
+        )
+        return {
+            "status": "PENDING",
+            "retry_count": attempt,
+            "retry_at": retry_at,
+            "delay_seconds": delay,
+            "transient": True,
+        }
+
+    conn.execute(
+        "UPDATE raw_news SET status = 'FAILED', processing_started_at = NULL,"
+        " ai_retry_count = ?, ai_next_retry_at = NULL, ai_last_error = ?"
+        " WHERE id = ? AND status = 'PROCESSING'",
+        (attempt if transient else current_count, error_text, int(news_id)),
+    )
+    return {
+        "status": "FAILED",
+        "retry_count": attempt if transient else current_count,
+        "retry_at": None,
+        "delay_seconds": None,
+        "transient": transient,
+    }
 
 
 
@@ -1368,7 +1495,8 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
     Every 1 second:
       1) Atomically claim up to BATCH_SIZE PENDING rows (BEGIN IMMEDIATE)
       2) Fire all LLM calls concurrently via asyncio.gather
-      3) Persist successes (-> DONE) and failures (-> FAILED) in one transaction.
+      3) Persist successes (-> DONE); transient provider failures return to
+         PENDING with bounded backoff, permanent/exhausted failures -> FAILED.
 
     Head-of-line blocking is eliminated: 10 items complete in ~2-3 s
     instead of 10 * 2 s = 20 s serial.
@@ -1884,7 +2012,10 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                            WHERE id=?""",
                         (
                             active_run["id"] if active_run else None,
-                            active_run["model_id"] if active_run else batch_model["id"],
+                            # The run already preserves its frozen model in
+                            # paper_trading_runs.  This column must identify
+                            # the model that actually produced this decision.
+                            batch_model["id"],
                             guard["confidence"], guard["action"], gate_reason, decision_id,
                         ),
                     )
@@ -1983,6 +2114,11 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                         "pre_ts": s["pre_ts"],
                         "result": res,
                         "parent_id": parent_id,
+                        # Candidate rows may be analyzed for observation, but
+                        # must remain visibly non-actionable in downstream
+                        # notifications as well as in the UI.
+                        "quality_status": str(news_quality_status or "unverified").strip().lower(),
+                        "trade_gate_reason": gate_reason,
                     })
 
                 # ============================================================
@@ -2014,7 +2150,9 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
                 for f in failures:
                     nid = f["news_id"]
                     if nid > 0 and nid not in done_news_ids:
-                        _mark_news_terminal_status(conn, nid, "FAILED")
+                        f["retry_outcome"] = _schedule_news_failure(
+                            conn, nid, f.get("error"),
+                        )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -2086,12 +2224,27 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
             parts = [f"{v}×{k}" for k, v in sorted(consensus.items(), key=lambda x: -x[1])]
             consensus_str = " | ".join(parts)
             print(f"  └─ Consensus: {consensus_str}")
+            observation_only = any(
+                str(item.get("quality_status") or "unverified").lower() != "verified"
+                for item in group
+            )
+            if observation_only:
+                # Candidate analysis is useful for research, but the alert
+                # must not be mistaken for a paper/live trading instruction.
+                feishu_lines.insert(
+                    0,
+                    "⚠️ 来源未通过质量验证：本条仅供 Ox Alpha 观察分析，不构成交易信号。",
+                )
             # Fire-and-forget Feishu comparison card (Chinese title)
             feishu_body = "\n\n".join(feishu_lines)
             news_ts = str(timestamp_map.get(nid, "") or "")
             asyncio.create_task(
                 send_feishu_alert(
-                    f"{display_title}\n\n**Consensus**: {consensus_str}",
+                    (
+                        f"[观察-only] {display_title}"
+                        if observation_only
+                        else display_title
+                    ) + f"\n\n**Consensus**: {consensus_str}",
                     consensus_str,
                     0.0,
                     feishu_body,
@@ -2102,10 +2255,18 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
         for f in failures:
             label = f.get("model_label", "?")
             error_msg = f.get("error", "Unknown error")
-            print(
-                f"[{_now()}] [AI] news=#{f['news_id']} [{label}] FAILED:"
-                f" {error_msg}"
-            )
+            outcome = f.get("retry_outcome") or {}
+            if outcome.get("status") == "PENDING":
+                print(
+                    f"[{_now()}] [AI] news=#{f['news_id']} [{label}] RETRY "
+                    f"{outcome.get('retry_count')}/{AI_TRANSIENT_MAX_RETRIES} "
+                    f"in {outcome.get('delay_seconds')}s: {error_msg}"
+                )
+            else:
+                print(
+                    f"[{_now()}] [AI] news=#{f['news_id']} [{label}] FAILED:"
+                    f" {error_msg}"
+                )
         # Batch summary
         try:
             s_dt = datetime.fromisoformat(batch_start)
@@ -2114,7 +2275,13 @@ async def ai_worker(loop: asyncio.AbstractEventLoop) -> None:
         except Exception:
             batch_latency = -1
         total_tasks = len(batch)
+        retrying = sum(
+            (item.get("retry_outcome") or {}).get("status") == "PENDING"
+            for item in failures
+        )
+        permanent_failures = len(failures) - retrying
         print(
             f"[{_now()}] [AI] Batch done | {len(successes)}/{total_tasks} ok"
-            f" | {len(failures)} failed | wall={batch_latency:.1f}s"
+            f" | {retrying} retrying | {permanent_failures} failed"
+            f" | wall={batch_latency:.1f}s"
         )

@@ -10,7 +10,11 @@ from typing import Any, Callable, Dict
 import requests
 
 import config
+import data_quality
+from providers.binance_paxg import get_binance_paxg_provider
+from providers.coingecko_paxg import get_coingecko_paxg_provider
 from providers.jin10 import get_jin10_provider
+from providers.oanda import get_oanda_provider
 
 ASSETS = ("BTC", "ETH", "SOL")
 SOURCES = ("Binance", "OKX", "Bitget", "Gate.io")
@@ -151,6 +155,88 @@ def fetch_market_prices() -> Dict[str, Any]:
             "status": "ok" if has_xau else "unavailable",
             "assets": ["XAU"] if has_xau else [],
             "error": jin10_error,
+        }
+    # Optional real XAU/USD broker quote.  It is additive and deliberately
+    # does not participate in the BTC/ETH/SOL median or core status.
+    oanda_error = ""
+    if getattr(config, "OANDA_ENABLED", False):
+        try:
+            provider = get_oanda_provider()
+            if provider.configured:
+                quote = next((item for item in provider.fetch_quotes() if item.asset == "XAU"), None)
+                if quote is not None:
+                    items.append({
+                        "asset": "XAU",
+                        "price": quote.price,
+                        "change24h": quote.change_pct or 0.0,
+                        "source": "oanda",
+                        "sourceCount": 1,
+                        "sourceNames": ["oanda"],
+                        "event_ts": quote.event_ts,
+                        "bid": quote.bid,
+                        "ask": quote.ask,
+                        "instrument_id": quote.symbol,
+                        "instrument_type": "broker_quote",
+                        "updated_at": updated_at,
+                    })
+        except Exception as exc:
+            oanda_error = f"XAU: {type(exc).__name__}"
+        has_xau = any(item.get("source") == "oanda" for item in items)
+        sources["OANDA"] = {
+            "status": "ok" if has_xau else "unavailable",
+            "assets": ["XAU"] if has_xau else [],
+            "error": oanda_error,
+            "decision_eligible": False,
+            "note": "broker quote; does not replace OKX structure instrument",
+        }
+    # Free PAXG proxies are deliberately additive.  Their prices are useful
+    # for divergence/audit, but neither may overwrite OKX XAU or enter the
+    # canonical median/decision path.
+    for provider, label in (
+        (get_binance_paxg_provider(), "BinancePAXG"),
+        (get_coingecko_paxg_provider(), "CoinGeckoPAXG"),
+    ):
+        if not provider.enabled:
+            continue
+        error = ""
+        quote = None
+        try:
+            quote = next(iter(provider.fetch_quotes()), None)
+        except Exception as exc:
+            error = f"XAU: {type(exc).__name__}"
+        if quote is not None:
+            raw_quote = quote.to_dict()
+            quality = data_quality.assess(
+                source=quote.source,
+                kind="market",
+                event_id=f"XAU:{quote.source}:{quote.event_ts or 'missing-time'}",
+                published_at=quote.event_ts,
+                payload=raw_quote,
+            )
+            items.append({
+                "asset": "XAU",
+                "price": quote.price,
+                "change24h": quote.change_pct or 0.0,
+                "source": quote.source,
+                "sourceCount": 1,
+                "sourceNames": [quote.source],
+                "event_ts": quote.event_ts,
+                "bid": quote.bid,
+                "ask": quote.ask,
+                "volume": quote.volume,
+                "instrument_id": quote.symbol,
+                "instrument_type": "tokenized_gold_proxy",
+                "quality_status": quality.quality_status,
+                "quality_reason": quality.reason,
+                "decision_eligible": False,
+                "updated_at": updated_at,
+            })
+        sources[label] = {
+            "status": "ok" if quote is not None else "unavailable",
+            "assets": ["XAU"] if quote is not None else [],
+            "error": error,
+            "decision_eligible": False,
+            "note": provider.health().get("note") or "PAXG tokenized-gold proxy; audit only",
         }
     core_count = sum(str(item.get("asset") or "") in ASSETS for item in items)
     return {

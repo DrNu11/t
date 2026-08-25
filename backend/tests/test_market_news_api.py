@@ -1,8 +1,12 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import api_server
+import config
+import db
 import market_feeds
+from providers.contracts import MarketQuote
 
 
 def _reset_structure_cache():
@@ -39,6 +43,137 @@ def test_market_feed_partial_failure_isolated(monkeypatch):
     result = market_feeds.fetch_market_prices()
     assert [item["price"] for item in result["items"]] == [11, 11, 11]
     assert result["sources"]["Bitget"]["status"] == "unavailable"
+
+
+def test_market_feed_exposes_paxg_proxies_without_changing_core_status(monkeypatch):
+    monkeypatch.setattr(config, "BINANCE_PAXG_ENABLED", True)
+    monkeypatch.setattr(config, "COINGECKO_PAXG_ENABLED", True)
+    monkeypatch.setattr(
+        market_feeds,
+        "get_binance_paxg_provider",
+        lambda: type("P", (), {
+            "enabled": True,
+            "fetch_quotes": lambda self: [MarketQuote(
+                symbol="PAXGUSDT", asset="XAU", price=2400.0,
+                source="binance_paxg", event_ts=1_700_000_000_000,
+            )],
+            "health": lambda self: {"note": "proxy"},
+        })(),
+    )
+    monkeypatch.setattr(
+        market_feeds,
+        "get_coingecko_paxg_provider",
+        lambda: type("P", (), {
+            "enabled": True,
+            "fetch_quotes": lambda self: [MarketQuote(
+                symbol="PAXG/USD", asset="XAU", price=2401.0,
+                source="coingecko_paxg", event_ts=1_700_000_000_000,
+            )],
+            "health": lambda self: {"note": "proxy"},
+        })(),
+    )
+    monkeypatch.setattr(market_feeds, "_FETCHERS", {
+        source: (lambda asset, value=value: {"price": value, "change24h": 1.0})
+        for source, value in {"Binance": 100.0, "OKX": 101.0, "Bitget": 102.0, "Gate.io": 103.0}.items()
+    })
+    result = market_feeds.fetch_market_prices()
+    assert result["status"] == "ok"
+    assert {item["source"] for item in result["items"] if item["asset"] == "XAU"} == {
+        "binance_paxg", "coingecko_paxg",
+    }
+    assert all(item["decision_eligible"] is False for item in result["items"] if item["asset"] == "XAU")
+
+
+def test_macro_calendar_default_window_excludes_old_history():
+    start, end = api_server._macro_calendar_effective_window(
+        "", "", now=datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    )
+    assert start == "2026-08-25T06:00:00Z"
+    assert end == "2026-12-23T12:00:00Z"
+    assert api_server._macro_calendar_effective_window(
+        "2026-01-01", "2026-01-31"
+    ) == ("2026-01-01", "2026-01-31")
+
+
+def test_eastmoney_fetch_adds_required_trace_and_parses_rows(monkeypatch):
+    captured = {}
+
+    def fake_pages(url, **kwargs):
+        captured["url"] = url
+        yield {
+            "code": "1",
+            "message": "success",
+            "data": {
+                "list": [{
+                    "code": "n-1",
+                    "title": "官方宏观数据即将发布",
+                    "summary": "测试摘要",
+                    "uniqueUrl": "https://finance.eastmoney.com/a/1.html",
+                    "showTime": "2026-08-25 12:00:00",
+                }]
+            },
+        }
+
+    api_server._EASTMONEY_CACHE.update({"expires": 0.0, "value": None})
+    monkeypatch.setattr(api_server, "_fetch_paged_json", fake_pages)
+    result = api_server._fetch_eastmoney_news_sync()
+
+    assert "req_trace=" in captured["url"]
+    assert result["status"] == "ok"
+    assert result["items"][0]["source"] == "东方财富"
+
+
+def test_external_news_limit_counts_inserts_not_duplicate_attempts(temp_db, monkeypatch):
+    monkeypatch.setattr(api_server.config, "NEWS_CANDIDATE_DISPLAY_ENABLED", True)
+    monkeypatch.setattr(
+        api_server, "evaluate_news",
+        lambda *args: {"is_noise": 0, "relevance_score": 0.9},
+    )
+    duplicate = {
+        "id": "dup-1", "title": "重复快讯", "source": "TechFlow 深潮",
+        "published_at": "2026-08-25T10:00:00+08:00",
+    }
+    fresh = {
+        "id": "fresh-1", "title": "最新快讯", "source": "东方财富",
+        "published_at": "2026-08-25T10:01:00+08:00",
+    }
+    assert api_server._ingest_external_news_sync([duplicate]) == 1
+    assert api_server._ingest_external_news_sync(
+        [duplicate, fresh], max_inserted=1
+    ) == 1
+    rows = temp_db.execute(
+        "SELECT source, content FROM raw_news ORDER BY id"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[-1]["source"] == "东方财富"
+
+
+def test_external_news_releases_writer_lock_before_ai_filter(temp_db, monkeypatch):
+    monkeypatch.setattr(api_server.config, "NEWS_CANDIDATE_DISPLAY_ENABLED", True)
+    lock_checks = []
+
+    def filter_without_writer_lock(*_args):
+        probe = db.get_connection()
+        try:
+            probe.execute(
+                "UPDATE paper_trading_settings SET news_daily_target=301 WHERE id=1"
+            )
+            probe.rollback()
+            lock_checks.append(True)
+        finally:
+            probe.close()
+        return {"is_noise": 0, "relevance_score": 0.9}
+
+    monkeypatch.setattr(api_server, "evaluate_news", filter_without_writer_lock)
+    inserted = api_server._ingest_external_news_sync([{
+        "id": "lock-1",
+        "title": "宏观政策快讯",
+        "source": "东方财富",
+        "published_at": "2026-08-25T12:00:00+08:00",
+    }])
+
+    assert inserted == 1
+    assert lock_checks == [True]
 
 
 def test_market_api_cache(monkeypatch):
@@ -377,3 +512,19 @@ def test_strategy_advice_llm_bounds_and_rules_fallback(temp_db, monkeypatch):
     assert rules["validation"]["gated_action"] in {"BUY", "SELL", "HOLD"}
     for key, bounds in rules["bounds"].items():
         assert bounds["min"] <= rules["advice"][key] <= bounds["max"]
+
+
+def test_market_prices_survive_snapshot_writer_lock(monkeypatch):
+    payload = {
+        "status": "ok",
+        "items": [{"asset": "BTC", "price": 80000.0, "change24h": 1.0}],
+    }
+    monkeypatch.setattr(api_server, "_MARKET_CACHE", {"expires": 0.0, "value": None})
+    monkeypatch.setattr(api_server.market_feeds, "fetch_market_prices", lambda: payload)
+
+    def locked(_payload):
+        raise api_server.sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(api_server.timeseries, "record_market_snapshot", locked)
+
+    assert api_server._cached_market_prices() == payload

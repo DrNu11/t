@@ -8,6 +8,8 @@ import json
 import time
 from typing import Any, List
 
+import config
+
 # 实时新闻过滤器 — ingest 阶段拦截垃圾新闻
 from realtime_filter import evaluate_news
 import db
@@ -125,15 +127,23 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
     Token is re-fetched on every reconnect to prevent expiry.
     """
 
-    reconnect_delay = 5
+    reconnect_delay = config.FJ_RECONNECT_MIN_SECONDS
+
+    async def _retry(reason: str) -> None:
+        nonlocal reconnect_delay
+        print(f"[INGEST] {reason} — retrying in {reconnect_delay}s ...")
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(
+            config.FJ_RECONNECT_MAX_SECONDS,
+            reconnect_delay * 2,
+        )
 
     while True:
         # ---- Fetch fresh config + token + cookies ------------------------
         cfg = await loop.run_in_executor(None, _extract_centrifugo_config)
         token = cfg.get("token")
         if not token:
-            print(f"[INGEST] No token — retrying in {reconnect_delay}s ...")
-            await asyncio.sleep(reconnect_delay)
+            await _retry("No token; fallback news sources remain active")
             continue
 
         fresh_cookies = cfg.get("cookies", "")
@@ -158,25 +168,22 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
             raw_resp = await ws.recv_text(timeout=10.0)
             if raw_resp is None:
                 code_info = ws.close_info or "no reason"
-                print(f"[INGEST] Centrifugo rejected: {code_info} — retrying in {reconnect_delay}s ...")
                 await _safe_close(ws)
-                await asyncio.sleep(reconnect_delay)
+                await _retry(f"Centrifugo rejected: {code_info}")
                 continue
-
             resp = json.loads(raw_resp.strip())
             if isinstance(resp, dict) and resp.get("error"):
-                print(f"[INGEST] Centrifugo error: {resp['error']} — retrying in {reconnect_delay}s ...")
                 await _safe_close(ws)
-                await asyncio.sleep(reconnect_delay)
+                await _retry(f"Centrifugo error: {resp['error']}")
                 continue
 
             # Success
+            reconnect_delay = config.FJ_RECONNECT_MIN_SECONDS
             print(f"[INGEST] Connected — {_now()}")
             ok_connect_resp = resp
         except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
-            print(f"[INGEST] Connect error: {exc} — retrying in {reconnect_delay}s ...")
             await _safe_close(ws)
-            await asyncio.sleep(reconnect_delay)
+            await _retry(f"Connect error: {exc}")
             continue
 
         # ws is now the winning connection — start message loop
@@ -289,7 +296,10 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
                                         metadata={"transport": "financialjuice_websocket"},
                                         quarantine=not quality.decision_eligible,
                                     )
-                                    if not quality.accepted or not quality.decision_eligible:
+                                    if not quality.accepted or (
+                                        not quality.decision_eligible
+                                        and not config.NEWS_CANDIDATE_DISPLAY_ENABLED
+                                    ):
                                         conn.commit()
                                         return None
                                     ts = _ts()
@@ -413,7 +423,10 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
                                             metadata={"transport": "financialjuice_websocket"},
                                             quarantine=not quality.decision_eligible,
                                         )
-                                        if not quality.accepted or not quality.decision_eligible:
+                                        if not quality.accepted or (
+                                            not quality.decision_eligible
+                                            and not config.NEWS_CANDIDATE_DISPLAY_ENABLED
+                                        ):
                                             conn.commit()
                                             return None
                                         cleaned = f"[hash:{h}] {text[:500]}"
@@ -465,5 +478,4 @@ async def websocket_ingest(loop: asyncio.AbstractEventLoop) -> None:
             except Exception:
                 pass
 
-        print(f"[INGEST] Reconnecting in {reconnect_delay}s ...")
-        await asyncio.sleep(reconnect_delay)
+        await _retry("Connection ended")

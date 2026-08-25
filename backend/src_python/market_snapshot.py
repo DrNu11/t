@@ -39,7 +39,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import config
 import data_quality
 from market_structure import analyze_market_structure
+from providers.binance_paxg import get_binance_paxg_provider
+from providers.coingecko_paxg import get_coingecko_paxg_provider
 from providers.jin10 import get_jin10_provider
+from providers.oanda import get_oanda_provider
 
 # ---------------------------------------------------------------------------
 # ccxt — must be installed (pip install ccxt)
@@ -90,6 +93,118 @@ def _fetch_jin10_xau_sync() -> Optional[Dict[str, Any]]:
     except Exception as exc:
         _debug(f"  [SNAPSHOT:DEBUG] Jin10 XAU unavailable: {type(exc).__name__}")
     return None
+
+
+def _fetch_oanda_xau_sync() -> Optional[Dict[str, Any]]:
+    """Return an optional OANDA XAU/USD quote as a non-canonical candidate."""
+    try:
+        provider = get_oanda_provider()
+        if not provider.configured:
+            return None
+        for quote in provider.fetch_quotes():
+            if quote.asset == "XAU":
+                return quote.to_dict()
+    except Exception as exc:
+        _debug(f"  [SNAPSHOT:DEBUG] OANDA XAU unavailable: {type(exc).__name__}")
+    return None
+
+
+def _fetch_binance_paxg_xau_sync() -> Optional[Dict[str, Any]]:
+    """Return the public Binance PAXG quote as a non-canonical candidate."""
+    try:
+        provider = get_binance_paxg_provider()
+        if not provider.configured:
+            return None
+        quote = next(iter(provider.fetch_quotes()), None)
+        return quote.to_dict() if quote is not None else None
+    except Exception as exc:
+        _debug(f"  [SNAPSHOT:DEBUG] Binance PAXG unavailable: {type(exc).__name__}")
+    return None
+
+
+def _fetch_coingecko_paxg_xau_sync() -> Optional[Dict[str, Any]]:
+    """Return the public CoinGecko PAXG quote as a validation candidate."""
+    try:
+        provider = get_coingecko_paxg_provider()
+        if not provider.configured:
+            return None
+        quote = next(iter(provider.fetch_quotes()), None)
+        return quote.to_dict() if quote is not None else None
+    except Exception as exc:
+        _debug(f"  [SNAPSHOT:DEBUG] CoinGecko PAXG unavailable: {type(exc).__name__}")
+    return None
+
+
+def _attach_oanda_xau_candidate(
+    assets: Dict[str, Dict[str, Any]],
+    quote: Optional[Dict[str, Any]],
+    *,
+    as_of_ms: Optional[int] = None,
+) -> None:
+    """Expose OANDA for comparison without relabelling the OKX structure.
+
+    OANDA is a broker quote and remains candidate-only until an operator
+    validates spread, clock, contract and out-of-sample impact.  It therefore
+    cannot overwrite the primary quote or make a snapshot decision-eligible.
+    """
+    if not quote or "XAU" not in assets:
+        return
+    observed_at = _normalize_source_timestamp_ms(quote.get("event_ts"))
+    now_ms = int(as_of_ms if as_of_ms is not None else time.time() * 1000)
+    quality = data_quality.assess(
+        source="oanda",
+        kind="market",
+        event_id=f"XAU:oanda:{observed_at or 'missing-time'}",
+        published_at=observed_at,
+        payload=quote,
+        observed_at=now_ms / 1000.0,
+    )
+    candidate = {
+        **quote,
+        "source": "oanda",
+        "venue": "OANDA",
+        "instrument_type": "broker_quote",
+        "quality_status": quality.quality_status,
+        "quality_reason": quality.reason,
+        "decision_eligible": False,
+        "observed_at": observed_at,
+        "note": "候选经纪商报价；不覆盖 OKX 盘面结构/结算价",
+    }
+    assets["XAU"].setdefault("quote_candidates", []).append(candidate)
+
+
+def _attach_paxg_xau_candidate(
+    assets: Dict[str, Dict[str, Any]],
+    quote: Optional[Dict[str, Any]],
+    *,
+    source: str,
+    venue: str,
+    as_of_ms: Optional[int] = None,
+) -> None:
+    """Attach a tokenized-gold comparison quote without changing OKX fields."""
+    if not quote or "XAU" not in assets:
+        return
+    observed_at = _normalize_source_timestamp_ms(quote.get("event_ts"))
+    now_ms = int(as_of_ms if as_of_ms is not None else time.time() * 1000)
+    quality = data_quality.assess(
+        source=source,
+        kind="market",
+        event_id=f"XAU:{source}:{observed_at or 'missing-time'}",
+        published_at=observed_at,
+        payload=quote,
+        observed_at=now_ms / 1000.0,
+    )
+    assets["XAU"].setdefault("quote_candidates", []).append({
+        **quote,
+        "source": source,
+        "venue": venue,
+        "instrument_type": "tokenized_gold_proxy",
+        "quality_status": quality.quality_status,
+        "quality_reason": quality.reason,
+        "decision_eligible": False,
+        "observed_at": observed_at,
+        "note": "PAXG 代币化黄金候选报价；不覆盖 OKX XAU 盘面结构/结算价",
+    })
 
 
 def _apply_jin10_xau(
@@ -1131,6 +1246,18 @@ async def get_snapshot() -> Dict[str, Any]:
         asyncio.create_task(asyncio.to_thread(_fetch_jin10_xau_sync))
         if getattr(config, "JIN10_ENABLED", False) else None
     )
+    oanda_task = (
+        asyncio.create_task(asyncio.to_thread(_fetch_oanda_xau_sync))
+        if getattr(config, "OANDA_ENABLED", False) else None
+    )
+    binance_paxg_task = (
+        asyncio.create_task(asyncio.to_thread(_fetch_binance_paxg_xau_sync))
+        if getattr(config, "BINANCE_PAXG_ENABLED", False) else None
+    )
+    coingecko_paxg_task = (
+        asyncio.create_task(asyncio.to_thread(_fetch_coingecko_paxg_xau_sync))
+        if getattr(config, "COINGECKO_PAXG_ENABLED", False) else None
+    )
     ex = _get_exchange_async()
     _debug(f"  [SNAPSHOT:DEBUG] exchange={type(ex).__name__}, "
           f"urls.api={ex.urls.get('api', 'N/A') if hasattr(ex, 'urls') else 'N/A'}")
@@ -1321,6 +1448,18 @@ async def get_snapshot() -> Dict[str, Any]:
 
     jin10_quote = await jin10_task if jin10_task is not None else None
     _apply_jin10_xau(assets, jin10_quote, as_of_ms=ts)
+    oanda_quote = await oanda_task if oanda_task is not None else None
+    _attach_oanda_xau_candidate(assets, oanda_quote, as_of_ms=ts)
+    binance_paxg_quote = await binance_paxg_task if binance_paxg_task is not None else None
+    _attach_paxg_xau_candidate(
+        assets, binance_paxg_quote, source="binance_paxg", venue="Binance",
+        as_of_ms=ts,
+    )
+    coingecko_paxg_quote = await coingecko_paxg_task if coingecko_paxg_task is not None else None
+    _attach_paxg_xau_candidate(
+        assets, coingecko_paxg_quote, source="coingecko_paxg", venue="CoinGecko",
+        as_of_ms=ts,
+    )
 
     # ── 整体状态 ──
     total = len(_CORE_SYMBOLS)
@@ -1514,6 +1653,21 @@ def get_snapshot_sync() -> Dict[str, Any]:
         assets,
         _fetch_jin10_xau_sync() if getattr(config, "JIN10_ENABLED", False) else None,
         as_of_ms=ts,
+    )
+    _attach_oanda_xau_candidate(
+        assets,
+        _fetch_oanda_xau_sync() if getattr(config, "OANDA_ENABLED", False) else None,
+        as_of_ms=ts,
+    )
+    _attach_paxg_xau_candidate(
+        assets,
+        _fetch_binance_paxg_xau_sync() if getattr(config, "BINANCE_PAXG_ENABLED", False) else None,
+        source="binance_paxg", venue="Binance", as_of_ms=ts,
+    )
+    _attach_paxg_xau_candidate(
+        assets,
+        _fetch_coingecko_paxg_xau_sync() if getattr(config, "COINGECKO_PAXG_ENABLED", False) else None,
+        source="coingecko_paxg", venue="CoinGecko", as_of_ms=ts,
     )
 
     macro = {

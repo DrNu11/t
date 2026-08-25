@@ -24,6 +24,30 @@ def _fixture_get(url: str, timeout: int = 8):
     raise AssertionError(url)
 
 
+def _okx_fixture_get(url: str, timeout: int = 8):
+    asset = "BTC" if "BTC" in url else "ETH"
+    stamp = "1700000000000"
+    if "/mark-price" in url:
+        return {"code": "0", "data": [{"markPx": "101", "ts": stamp}]}
+    if "/index-tickers" in url:
+        return {"code": "0", "data": [{"idxPx": "100", "ts": stamp}]}
+    if "/funding-rate" in url:
+        return {"code": "0", "data": [{
+            "fundingRate": "0.0001", "fundingTime": stamp,
+            "nextFundingTime": "1700028800000", "ts": stamp,
+        }]}
+    if "/open-interest" in url:
+        return {"code": "0", "data": [{
+            "oi": "12345", "oiCcy": "123.45", "oiUsd": "987654",
+            "ts": stamp,
+        }]}
+    if "/long-short-account-ratio" in url:
+        return {"code": "0", "data": [[stamp, "1.2"]]}
+    if "/taker-volume" in url:
+        return {"code": "0", "data": [[stamp, "100", "200"]]}
+    raise AssertionError(f"unexpected {asset} URL: {url}")
+
+
 def test_layers_parse_and_do_not_invent_missing_etf(monkeypatch):
     monkeypatch.setattr("config.SOSOVALUE_ETF_URL", "")
     layers = macro_context.collect_layers(_fixture_get)
@@ -37,6 +61,26 @@ def test_layers_parse_and_do_not_invent_missing_etf(monkeypatch):
     assert "Fear&Greed 28" not in text  # candidate sentiment is stored but cannot enter AI
     assert layers["sentiment"][0]["decision_eligible"] is False
     assert "不得臆造" not in text or "btc_etf" in json.dumps(layers, ensure_ascii=False)
+
+
+def test_okx_is_primary_for_structure_and_taker_flow(monkeypatch):
+    monkeypatch.setattr("config.SOSOVALUE_ETF_URL", "")
+    structure = macro_context.fetch_structure(_okx_fixture_get)
+    usable_structure = [item for item in structure if item["status"] == "ok"]
+    assert len(usable_structure) == 10
+    assert {item["source"] for item in usable_structure} == {"okx"}
+    basis = next(item for item in structure if item["metric_key"] == "BTC.basis_bps")
+    assert round(basis["value"], 6) == 100.0
+    assert next(item for item in structure if item["metric_key"] == "BTC.oi")["value"] == 123.45
+
+    flow = macro_context.fetch_flow(_okx_fixture_get)
+    taker = [item for item in flow if item["metric_key"].endswith(".taker_buy_sell")]
+    assert len(taker) == 2
+    assert all(item["source"] == "okx" and item["value"] == 2.0 for item in taker)
+    governed = macro_context.apply_quality(
+        {"flow": taker}, observed_at=1_700_000_100,
+    )["flow"]
+    assert all(item["decision_eligible"] for item in governed)
 
 
 def test_all_down_does_not_fabricate():

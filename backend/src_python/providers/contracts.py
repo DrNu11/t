@@ -71,6 +71,7 @@ class MacroEvent:
     country: str = ""
     impact: Optional[int] = None
     time_period: str = ""
+    source_url: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

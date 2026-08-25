@@ -119,9 +119,58 @@ OPENROUTER_BASE_URL = os.getenv(
     "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
 ).rstrip("/")
 
-AI_MODEL_ROSTER = (
-    {"id": AIPING_MODEL, "label": "DeepSeek V4 Flash 0731 (Aiping)"},
+# OpenRouter AI-analysis channel.  Keep this separate from the legacy
+# OPENROUTER_* variables used by webhook translation/realtime_filter so a new
+# official key or endpoint cannot silently change those integrations.
+OPENROUTER_AI_API_KEY = os.getenv("OPENROUTER_AI_API_KEY", "").strip()
+OPENROUTER_AI_BASE_URL = os.getenv(
+    "OPENROUTER_AI_BASE_URL", "https://openrouter.ai/api/v1"
+).strip().rstrip("/")
+OPENROUTER_AI_JSON_MODE = _env_bool("OPENROUTER_AI_JSON_MODE", True)
+OPENROUTER_AI_MAX_CONCURRENCY = max(
+    1, int(os.getenv("OPENROUTER_AI_MAX_CONCURRENCY", "1"))
 )
+OPENROUTER_AI_BATCH_SIZE = max(
+    1, int(os.getenv("OPENROUTER_AI_BATCH_SIZE", "2"))
+)
+AI_TRANSIENT_MAX_RETRIES = max(
+    0, int(os.getenv("AI_TRANSIENT_MAX_RETRIES", "5"))
+)
+AI_TRANSIENT_RETRY_BASE_SECONDS = max(
+    15, int(os.getenv("AI_TRANSIENT_RETRY_BASE_SECONDS", "60"))
+)
+AI_TRANSIENT_RETRY_MAX_SECONDS = max(
+    AI_TRANSIENT_RETRY_BASE_SECONDS,
+    int(os.getenv("AI_TRANSIENT_RETRY_MAX_SECONDS", "900")),
+)
+OPENROUTER_AI_MODEL_IDS = tuple(
+    item.strip()
+    for item in os.getenv(
+        "OPENROUTER_AI_MODEL_IDS",
+        "stealth/ox-alpha,z-ai/glm-5.2:free,nvidia/nemotron-3.5-lightning:free",
+    ).split(",")
+    if item.strip()
+)
+
+_OPENROUTER_AI_MODEL_LABELS = {
+    "stealth/ox-alpha": "Ox Alpha (OpenRouter 免费)",
+    "z-ai/glm-5.2:free": "GLM 5.2 (OpenRouter 免费)",
+    "nvidia/nemotron-3.5-lightning:free": "Nemotron 3.5 Lightning (OpenRouter 免费)",
+}
+
+_AI_MODEL_ROSTER = [{"id": AIPING_MODEL, "label": "DeepSeek V4 Flash 0731 (Aiping)"}]
+if OPENROUTER_AI_API_KEY:
+    _AI_MODEL_ROSTER.extend(
+        {
+            "id": model_id,
+            "label": _OPENROUTER_AI_MODEL_LABELS.get(
+                model_id, f"{model_id} (OpenRouter)"
+            ),
+            "provider": "openrouter",
+        }
+        for model_id in OPENROUTER_AI_MODEL_IDS
+    )
+AI_MODEL_ROSTER = tuple(_AI_MODEL_ROSTER)
 DEFAULT_AI_MODEL_ID = AIPING_MODEL
 AI_MODEL_STATE_PATH = os.path.abspath(os.path.join(BASE_DIR, "runtime", "ai_model.json"))
 
@@ -206,6 +255,54 @@ JIN10_MARKET_TYPE = os.getenv("JIN10_MARKET_TYPE", "GOODS").strip()
 JIN10_MARKET_CODES = os.getenv("JIN10_MARKET_CODES", "XAUUSD").strip()
 JIN10_REQUEST_TIMEOUT = max(1.0, float(os.getenv("JIN10_REQUEST_TIMEOUT", "5")))
 JIN10_POLL_SECONDS = max(10, int(os.getenv("JIN10_POLL_SECONDS", "15")))
+# Optional real XAU/USD broker quote.  It is intentionally separate from the
+# OKX XAU swap used by market-structure analysis and is disabled by default.
+OANDA_ENABLED = _env_bool("OANDA_ENABLED", False)
+OANDA_API_TOKEN = os.getenv("OANDA_API_TOKEN", "").strip()
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
+OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxtrade.oanda.com").strip().rstrip("/")
+OANDA_INSTRUMENTS = os.getenv("OANDA_INSTRUMENTS", "XAU_USD").strip()
+OANDA_REQUEST_TIMEOUT = max(1.0, float(os.getenv("OANDA_REQUEST_TIMEOUT", "5")))
+# Free keyless gold cross-checks. Both are candidate-only and never replace
+# the canonical OKX XAU-USDT-SWAP structure/settlement instrument.
+BINANCE_PAXG_ENABLED = _env_bool("BINANCE_PAXG_ENABLED", False)
+BINANCE_PAXG_BASE_URL = os.getenv(
+    "BINANCE_PAXG_BASE_URL", "https://data-api.binance.vision"
+).strip().rstrip("/")
+BINANCE_PAXG_SYMBOL = os.getenv("BINANCE_PAXG_SYMBOL", "PAXGUSDT").strip().upper()
+BINANCE_PAXG_REQUEST_TIMEOUT = max(1.0, float(os.getenv("BINANCE_PAXG_REQUEST_TIMEOUT", "3")))
+COINGECKO_PAXG_ENABLED = _env_bool("COINGECKO_PAXG_ENABLED", False)
+COINGECKO_PAXG_BASE_URL = os.getenv("COINGECKO_PAXG_BASE_URL", "https://api.coingecko.com/api/v3").strip().rstrip("/")
+COINGECKO_PAXG_COIN_ID = os.getenv("COINGECKO_PAXG_COIN_ID", "pax-gold").strip()
+COINGECKO_PAXG_REQUEST_TIMEOUT = max(1.0, float(os.getenv("COINGECKO_PAXG_REQUEST_TIMEOUT", "5")))
+COINGECKO_PAXG_CACHE_SECONDS = max(1.0, float(os.getenv("COINGECKO_PAXG_CACHE_SECONDS", "60")))
+# Optional licensed calendar aggregator.  An explicit URL and credentials are
+# required; no guest/demo credentials are embedded in the project.
+TRADING_ECONOMICS_ENABLED = _env_bool("TRADING_ECONOMICS_ENABLED", False)
+TRADING_ECONOMICS_CREDENTIALS = os.getenv("TRADING_ECONOMICS_CREDENTIALS", "").strip()
+TRADING_ECONOMICS_CALENDAR_URL = os.getenv("TRADING_ECONOMICS_CALENDAR_URL", "").strip()
+TRADING_ECONOMICS_COUNTRIES = os.getenv("TRADING_ECONOMICS_COUNTRIES", "United States").strip()
+TRADING_ECONOMICS_REQUEST_TIMEOUT = max(1.0, float(os.getenv("TRADING_ECONOMICS_REQUEST_TIMEOUT", "8")))
+# Free official publisher schedules; no commercial credential is required.
+# The adapter combines original BLS/BEA/Fed/Census pages and fails closed if
+# one publisher blocks a request or changes its HTML shape.
+OFFICIAL_MACRO_CALENDAR_ENABLED = _env_bool("OFFICIAL_MACRO_CALENDAR_ENABLED", False)
+OFFICIAL_BLS_SCHEDULE_URL = os.getenv(
+    "OFFICIAL_BLS_SCHEDULE_URL",
+    "https://www.bls.gov/schedule/{year}/{month:02d}_sched_list.htm",
+).strip()
+OFFICIAL_BEA_SCHEDULE_URL = os.getenv(
+    "OFFICIAL_BEA_SCHEDULE_URL", "https://www.bea.gov/news/schedule"
+).strip()
+OFFICIAL_FED_FOMC_URL = os.getenv(
+    "OFFICIAL_FED_FOMC_URL",
+    "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+).strip()
+OFFICIAL_CENSUS_SCHEDULE_URL = os.getenv(
+    "OFFICIAL_CENSUS_SCHEDULE_URL",
+    "https://www.census.gov/economic-indicators/calendar-listview.html",
+).strip()
+OFFICIAL_MACRO_REQUEST_TIMEOUT = max(1.0, float(os.getenv("OFFICIAL_MACRO_REQUEST_TIMEOUT", "8")))
 ALLOW_LEGACY_DECISIONS = _env_bool("TRIDENT_ALLOW_LEGACY_DECISIONS", False)
 ALLOW_LEGACY_PRICE_FALLBACKS = _env_bool("TRIDENT_ALLOW_LEGACY_PRICE_FALLBACKS", False)
 # A disabled evidence gate is useful only for explicitly isolated research.
@@ -215,6 +312,23 @@ MACRO_CALENDAR_ENABLED = _env_bool("MACRO_CALENDAR_ENABLED", False)
 MACRO_CALENDAR_POLL_SECONDS = max(15, int(os.getenv("MACRO_CALENDAR_POLL_SECONDS", "60")))
 NEWS_SOURCE_POLL_SECONDS = max(10, int(os.getenv("NEWS_SOURCE_POLL_SECONDS", "15")))
 NEWS_SOURCE_PAGES = max(1, int(os.getenv("NEWS_SOURCE_PAGES", "6")))
+NEWS_DEFAULT_DAILY_TARGET = max(300, int(os.getenv("NEWS_DEFAULT_DAILY_TARGET", "300")))
+# FinancialJuice can rate-limit its public homepage/token bootstrap.  Back off
+# instead of hammering it every five seconds while the independent candidate
+# source watcher continues serving the live board.
+FJ_RECONNECT_MIN_SECONDS = max(5, int(os.getenv("FJ_RECONNECT_MIN_SECONDS", "30")))
+FJ_RECONNECT_MAX_SECONDS = max(
+    FJ_RECONNECT_MIN_SECONDS,
+    int(os.getenv("FJ_RECONNECT_MAX_SECONDS", "300")),
+)
+# Candidate feeds may be stored for the live news board.  They can optionally
+# be sent to the selected LLM for observation-only analysis; the separate
+# quality gate in the worker still forbids candidate rows from paper/live
+# positions and settled performance history.
+NEWS_CANDIDATE_DISPLAY_ENABLED = _env_bool("NEWS_CANDIDATE_DISPLAY_ENABLED", False)
+CANDIDATE_AI_ANALYSIS_ENABLED = _env_bool(
+    "TRIDENT_CANDIDATE_AI_ANALYSIS_ENABLED", False
+)
 EVENTS_LIST_MAX = max(200, int(os.getenv("EVENTS_LIST_MAX", "10000")))
 PAPER_INITIAL_EQUITY_USDT = max(0.0, float(os.getenv("PAPER_INITIAL_EQUITY_USDT", "10000")))
 
@@ -270,6 +384,7 @@ HERMES_SKILL_MIN_SAMPLE = max(1, int(os.getenv("HERMES_SKILL_MIN_SAMPLE", "8")))
 
 # 新闻之外的盘面/舆情/加息预期/资金流（失败标 unavailable，不造数）
 MACRO_CONTEXT_ENABLED = os.getenv("MACRO_CONTEXT_ENABLED", "1").strip() not in ("0", "false", "False")
+OKX_PUBLIC_API_BASE = os.getenv("OKX_PUBLIC_API_BASE", "https://www.okx.com").strip().rstrip("/")
 SOSOVALUE_ETF_URL = os.getenv("SOSOVALUE_ETF_URL", "").strip()
 
 # Asset-specific impact thresholds for forward-tracker verdict ruling

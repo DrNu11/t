@@ -22,6 +22,8 @@ import config
 import db
 import data_quality
 from providers.jin10 import get_jin10_provider
+from providers.official_macro import get_official_macro_calendar_provider
+from providers.trading_economics import get_trading_economics_provider
 
 HttpGet = Callable[[str, int], Any]
 
@@ -31,6 +33,13 @@ _BINANCE_FUTURES_SYMBOLS = (
     ("ETH", "ETHUSDT"),
 )
 _BINANCE_FAPI = "https://fapi.binance.com"
+_OKX_API = str(
+    getattr(config, "OKX_PUBLIC_API_BASE", "https://www.okx.com")
+).rstrip("/")
+_OKX_SWAP_SYMBOLS = (
+    ("BTC", "BTC-USDT-SWAP", "BTC-USDT"),
+    ("ETH", "ETH-USDT-SWAP", "ETH-USDT"),
+)
 _FNG_URL = "https://api.alternative.me/fng/?limit=1&format=json"
 _NYFED_EFFR = "https://markets.newyorkfed.org/api/rates/unsecured/effr/last/1.json"
 _YAHOO_ZQ = "https://query1.finance.yahoo.com/v8/finance/chart/ZQ=F?interval=1d&range=5d"
@@ -136,6 +145,36 @@ def _fail(category: str, source: str, metric_key: str, note: Any) -> Dict[str, A
     return _metric(category, source, metric_key, None, status="unavailable", extra=_error_payload(note))
 
 
+def _okx_first(body: Any) -> Any:
+    if not isinstance(body, dict) or str(body.get("code")) != "0":
+        raise ValueError(f"OKX error: {str((body or {}).get('msg') or 'invalid response')[:120]}")
+    rows = body.get("data") or []
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("OKX returned no data")
+    return rows[0]
+
+
+def _prefer_primary_rows(
+    primary: List[Dict[str, Any]], fallback: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Choose one provider row per metric, preferring usable primary data."""
+    primary_map = {str(item.get("metric_key")): item for item in primary}
+    fallback_map = {str(item.get("metric_key")): item for item in fallback}
+    keys = list(primary_map)
+    keys.extend(key for key in fallback_map if key not in primary_map)
+    selected = []
+    for key in keys:
+        preferred = primary_map.get(key)
+        alternate = fallback_map.get(key)
+        if preferred and preferred.get("status") == "ok" and preferred.get("value") is not None:
+            selected.append(preferred)
+        elif alternate is not None:
+            selected.append(alternate)
+        elif preferred is not None:
+            selected.append(preferred)
+    return selected
+
+
 def _upstream_time(item: Dict[str, Any]) -> Any:
     payload = item.get("payload") or {}
     if not isinstance(payload, dict):
@@ -195,7 +234,94 @@ def _observation_id(item: Dict[str, Any], observed_at: int) -> str:
     return f"{source}:{category}:{metric_key}:{clock}:{digest}"
 
 
-def fetch_structure(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
+def fetch_okx_structure(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for asset, swap_id, index_id in _OKX_SWAP_SYMBOLS:
+        try:
+            mark = _okx_first(get(
+                f"{_OKX_API}/api/v5/public/mark-price?instType=SWAP&instId={swap_id}",
+                _TIMEOUT,
+            ))
+            index = _okx_first(get(
+                f"{_OKX_API}/api/v5/market/index-tickers?instId={index_id}",
+                _TIMEOUT,
+            ))
+            mark_price = _num(mark.get("markPx"))
+            index_price = _num(index.get("idxPx"))
+            basis_bps = None
+            if mark_price is not None and index_price not in (None, 0):
+                basis_bps = (mark_price / index_price - 1.0) * 10000.0
+            rows.extend((
+                _metric(
+                    "structure", "okx", f"{asset}.mark", mark_price,
+                    unit="USDT", label=asset,
+                    extra={"instrument_id": swap_id, "upstream_time": mark.get("ts")},
+                ),
+                _metric(
+                    "structure", "okx", f"{asset}.basis_bps", basis_bps,
+                    unit="bp", label=asset,
+                    extra={"index_id": index_id, "upstream_time": mark.get("ts") or index.get("ts")},
+                ),
+            ))
+        except Exception as exc:
+            rows.append(_fail("structure", "okx", f"{asset}.premium", exc))
+
+        try:
+            funding = _okx_first(get(
+                f"{_OKX_API}/api/v5/public/funding-rate?instId={swap_id}",
+                _TIMEOUT,
+            ))
+            rate = _num(funding.get("fundingRate"))
+            rows.append(_metric(
+                "structure", "okx", f"{asset}.funding",
+                rate * 100 if rate is not None else None,
+                unit="%", label=asset,
+                extra={
+                    "instrument_id": swap_id,
+                    "funding_time": funding.get("fundingTime"),
+                    "next_funding_time": funding.get("nextFundingTime"),
+                    "upstream_time": funding.get("ts") or funding.get("fundingTime"),
+                },
+            ))
+        except Exception as exc:
+            rows.append(_fail("structure", "okx", f"{asset}.funding", exc))
+
+        try:
+            open_interest = _okx_first(get(
+                f"{_OKX_API}/api/v5/public/open-interest?instType=SWAP&instId={swap_id}",
+                _TIMEOUT,
+            ))
+            rows.append(_metric(
+                "structure", "okx", f"{asset}.oi",
+                _num(open_interest.get("oiCcy")), unit=asset, label=asset,
+                extra={
+                    "instrument_id": swap_id,
+                    "contracts": _num(open_interest.get("oi")),
+                    "oi_usd": _num(open_interest.get("oiUsd")),
+                    "upstream_time": open_interest.get("ts"),
+                },
+            ))
+        except Exception as exc:
+            rows.append(_fail("structure", "okx", f"{asset}.oi", exc))
+
+        try:
+            ratio = _okx_first(get(
+                f"{_OKX_API}/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy={asset}&period=1H",
+                _TIMEOUT,
+            ))
+            if not isinstance(ratio, list) or len(ratio) < 2:
+                raise ValueError("OKX long/short response malformed")
+            rows.append(_metric(
+                "structure", "okx", f"{asset}.ls_ratio",
+                _num(ratio[1]), unit="x", label=asset,
+                extra={"period": "1H", "upstream_time": ratio[0]},
+            ))
+        except Exception as exc:
+            rows.append(_fail("structure", "okx", f"{asset}.ls_ratio", exc))
+    return rows
+
+
+def _fetch_binance_structure(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for asset, symbol in _BINANCE_FUTURES_SYMBOLS:
         try:
@@ -249,6 +375,23 @@ def fetch_structure(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
         except Exception as exc:
             rows.append(_fail("structure", "binance_fapi", f"{asset}.ls_ratio", exc))
     return rows
+
+
+def fetch_structure(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
+    """Use OKX public derivatives data first, then fill gaps from Binance."""
+    primary = fetch_okx_structure(get)
+    usable = {
+        str(item.get("metric_key")) for item in primary
+        if item.get("status") == "ok" and item.get("value") is not None
+    }
+    expected = {
+        f"{asset}.{suffix}"
+        for asset, _swap_id, _index_id in _OKX_SWAP_SYMBOLS
+        for suffix in ("mark", "funding", "basis_bps", "oi", "ls_ratio")
+    }
+    if expected.issubset(usable):
+        return primary
+    return _prefer_primary_rows(primary, _fetch_binance_structure(get))
 
 
 def fetch_sentiment(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
@@ -347,9 +490,46 @@ def fetch_fed(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
     return rows
 
 
-def fetch_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
+def fetch_okx_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for asset, symbol in _BINANCE_FUTURES_SYMBOLS:
+    for asset, _swap_id, _index_id in _OKX_SWAP_SYMBOLS:
+        try:
+            item = _okx_first(get(
+                f"{_OKX_API}/api/v5/rubik/stat/taker-volume?ccy={asset}&instType=CONTRACTS&period=1H",
+                _TIMEOUT,
+            ))
+            if not isinstance(item, list) or len(item) < 3:
+                raise ValueError("OKX taker-volume response malformed")
+            sell = _num(item[1])
+            buy = _num(item[2])
+            ratio = buy / sell if buy is not None and sell not in (None, 0) else None
+            net = buy - sell if buy is not None and sell is not None else None
+            rows.append(_metric(
+                "flow", "okx", f"{asset}.taker_buy_sell",
+                ratio, unit="x", label=asset,
+                extra={
+                    "buyVol": buy,
+                    "sellVol": sell,
+                    "netVol": net,
+                    "period": "1H",
+                    "upstream_time": item[0],
+                },
+            ))
+        except Exception as exc:
+            rows.append(_fail("flow", "okx", f"{asset}.taker_buy_sell", exc))
+    return rows
+
+
+def fetch_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
+    primary_rows = fetch_okx_flow(get)
+    fallback_rows: List[Dict[str, Any]] = []
+    usable = {
+        str(item.get("metric_key")) for item in primary_rows
+        if item.get("status") == "ok" and item.get("value") is not None
+    }
+    expected = {f"{asset}.taker_buy_sell" for asset, _symbol in _BINANCE_FUTURES_SYMBOLS}
+    fallback_symbols = () if expected.issubset(usable) else _BINANCE_FUTURES_SYMBOLS
+    for asset, symbol in fallback_symbols:
         try:
             body = get(
                 f"{_BINANCE_FAPI}/futures/data/takerlongshortRatio?symbol={symbol}&period=1h&limit=1",
@@ -362,7 +542,7 @@ def fetch_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
             net = None
             if buy is not None and sell is not None:
                 net = buy - sell
-            rows.append(_metric(
+            fallback_rows.append(_metric(
                 "flow", "binance_taker", f"{asset}.taker_buy_sell",
                 ratio, unit="x", label=asset,
                 extra={
@@ -373,7 +553,9 @@ def fetch_flow(get: HttpGet = _default_get) -> List[Dict[str, Any]]:
                 },
             ))
         except Exception as exc:
-            rows.append(_fail("flow", "binance_taker", f"{asset}.taker_buy_sell", exc))
+            fallback_rows.append(_fail("flow", "binance_taker", f"{asset}.taker_buy_sell", exc))
+
+    rows = _prefer_primary_rows(primary_rows, fallback_rows)
 
     etf_url = str(getattr(config, "SOSOVALUE_ETF_URL", "") or "").strip()
     if not etf_url:
@@ -779,6 +961,100 @@ def sync_jin10_calendar() -> Dict[str, Any]:
             "status": "unavailable", "fetched": 0, "written": 0, **health,
             "reason": f"{type(exc).__name__}: {str(exc)[:160]}",
         }
+
+
+def sync_trading_economics_calendar(
+    *, start: str = "", end: str = ""
+) -> Dict[str, Any]:
+    """Fetch the optional licensed calendar supplement once.
+
+    Trading Economics rows are retained with ``decision_eligible=false`` until
+    the operator promotes the source after comparing it with the original
+    publisher.  This keeps the feed useful for display and audit without
+    silently turning an aggregator into an authoritative trading signal.
+    """
+    provider = get_trading_economics_provider()
+    health = provider.health()
+    if not provider.configured:
+        return {
+            "status": "disabled",
+            "written": 0,
+            "fetched": 0,
+            **health,
+            "reason": "trading_economics_not_configured",
+        }
+    try:
+        events = provider.fetch_macro(start=start, end=end)
+        written = persist_macro_events(events)
+        return {"status": "ok", "fetched": len(events), "written": written, **health}
+    except Exception as exc:
+        return {
+            "status": "unavailable", "fetched": 0, "written": 0, **health,
+            "reason": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+
+
+def sync_official_macro_calendar(
+    *, start: str = "", end: str = ""
+) -> Dict[str, Any]:
+    """Fetch free original-publisher release schedules.
+
+    BLS/BEA/Fed/Census are official calendars and therefore remain eligible as
+    schedule evidence.  The provider never invents release values: actual,
+    previous and consensus stay empty until a publisher release adapter
+    supplies them.
+    """
+    provider = get_official_macro_calendar_provider()
+    if not provider.configured:
+        return {
+            "status": "disabled",
+            "written": 0,
+            "fetched": 0,
+            **provider.health(),
+            "reason": "official_macro_calendar_not_configured",
+        }
+    try:
+        events = provider.fetch_macro(start=start, end=end)
+        written = persist_macro_events(events)
+        return {
+            "status": "ok" if events else "unavailable",
+            "fetched": len(events),
+            "written": written,
+            **provider.health(),
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable", "fetched": 0, "written": 0,
+            **provider.health(),
+            "reason": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+
+
+def sync_macro_calendars(*, start: str = "", end: str = "") -> Dict[str, Any]:
+    """Sync all explicitly configured calendar providers.
+
+    Jin10 remains a first-class provider and stays disabled without its
+    authorized key/URL.  The Trading Economics adapter is additive and does
+    not alter Jin10 configuration or event identity.
+    """
+    jin10 = sync_jin10_calendar()
+    trading_economics = sync_trading_economics_calendar(start=start, end=end)
+    official_macro = sync_official_macro_calendar(start=start, end=end)
+    statuses = {jin10.get("status"), trading_economics.get("status"), official_macro.get("status")}
+    if "ok" in statuses:
+        status = "ok"
+    elif statuses == {"disabled"}:
+        status = "disabled"
+    else:
+        status = "unavailable"
+    return {
+        "status": status,
+        "providers": {
+            "jin10": jin10,
+            "trading_economics": trading_economics,
+            "official_macro": official_macro,
+        },
+    }
 
 
 def list_macro_events(

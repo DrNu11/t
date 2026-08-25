@@ -14,7 +14,7 @@ import config
 import db
 
 SOURCE_KEYS = ("financialjuice", "tree_news", "techflow", "eastmoney", "blockbeats", "jin10")
-DEFAULT_DAILY_TARGET = 300
+DEFAULT_DAILY_TARGET = config.NEWS_DEFAULT_DAILY_TARGET
 
 _DEFAULT_SOURCES = {key: True for key in SOURCE_KEYS}
 

@@ -1,6 +1,7 @@
 """Replay statistics/reflection regression tests (offline SQLite)."""
 
 import asyncio
+import json
 
 import api_server
 import paper_trading
@@ -105,6 +106,54 @@ def test_stats_and_reflection_derive_legacy_verdicts_without_research_pollution(
     assert reflection["research_excluded"] == {
         "sample": 1, "wins": 1, "losses": 0,
     }
+
+
+def test_reflection_failure_diagnostics_require_observable_evidence(
+    temp_db, monkeypatch
+):
+    monkeypatch.setattr(api_server, "DB_PATH", api_server.config.DB_PATH)
+    run = _start_run(temp_db)
+    signal_id = _insert_trade(temp_db, run, action="BUY", pnl=-0.6)
+    context = {
+        "status": "partial",
+        "market_context_eligible": False,
+        "target_market_context_eligible": False,
+        "timestamp_mismatch": True,
+        "macro_context": {"ok": 1, "total": 13},
+        "assets": {
+            "BTC": {
+                "market_structure": {
+                    "aggregate": {"trend": "bearish"},
+                    "timeframes": {
+                        "15m": {"indicators": {"volume_ratio": 0.25}},
+                    },
+                },
+            },
+        },
+    }
+    temp_db.execute(
+        """UPDATE ai_decisions
+           SET decision_context=?, market_confirmation='negative',
+               mfe_pct=0.7, mae_pct=1.2
+           WHERE id=?""",
+        (json.dumps(context), signal_id),
+    )
+    temp_db.commit()
+
+    reflection = asyncio.run(api_server.get_replay_reflection(limit=20))
+    diagnostics = {
+        item["key"]: item for item in reflection["failure_diagnostics"]
+    }
+
+    assert diagnostics["data_gap"]["count"] == 1
+    assert diagnostics["low_liquidity_session"]["count"] == 1
+    assert diagnostics["ignored_contradictory_factor"]["count"] == 1
+    assert diagnostics["profit_not_locked"]["count"] == 1
+    assert diagnostics["entry_or_stop_timing"]["count"] == 1
+    assert diagnostics["unobservable_external_information"]["assessment"] == "not_assessable"
+    assert diagnostics["unobservable_external_information"]["count"] == 0
+    assert reflection["observable_loss_coverage"] == 1.0
+    assert reflection["method"] == "deterministic_evidence_backed_replay_review_v3"
 
 
 def test_legacy_untrackable_position_has_no_live_pnl_or_active_status():
